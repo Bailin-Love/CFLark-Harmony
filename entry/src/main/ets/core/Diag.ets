@@ -8,7 +8,7 @@
 import { connection } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { TcpProbe, TcpResult } from './Probe';
-import { IpUtil, CF_IPV6_RANGES } from './IpUtil';
+import { IpUtil, CF_IPV6_RANGES, CF_IPV4_RANGES } from './IpUtil';
 
 /** 一个 TCP 自检目标 */
 export interface DiagTcpTarget {
@@ -141,7 +141,64 @@ export class Diag {
     return out;
   }
 
-  /** 生成完整诊断文本 */
+  /** IPv4 自检：默认网络 + 固定 IPv4 + 各段随机 IPv4 */
+  static async runV4(): Promise<string> {
+    const lines: string[] = [];
+    lines.push('=== CFLark IPv4 诊断 ===');
+    lines.push('时间：' + new Date().toLocaleString());
+    lines.push('说明：自检使用 3000ms 超时、顺序执行（并发 1），不会修改扫描配置。');
+    lines.push('');
+    lines.push('--- 1. 默认网络信息 ---');
+    const netLines: string[] = Diag.netInfo();
+    for (let i = 0; i < netLines.length; i++) {
+      lines.push(netLines[i]);
+    }
+    lines.push('');
+    lines.push('--- 2. 固定 IPv4 地址 TCP 自检（3000ms）---');
+    const fixedTargets: DiagTcpTarget[] = [
+      { label: '固定1', ip: '104.16.132.229', port: 443, timeoutMs: 3000 },
+      { label: '固定2', ip: '1.1.1.1', port: 443, timeoutMs: 3000 }
+    ];
+    const fixedLines: DiagTcpLine[] = await Diag.tcpCheck(fixedTargets);
+    let fixedOk: number = 0;
+    for (let i = 0; i < fixedLines.length; i++) {
+      lines.push(Diag.fmtTcp(fixedLines[i]));
+      if (fixedLines[i].ok) {
+        fixedOk++;
+      }
+    }
+    lines.push('');
+    lines.push('--- 3. 各段随机 IPv4 地址 TCP 自检（每段 1 个，3000ms）---');
+    const randTargets: DiagTcpTarget[] = [];
+    for (let i = 0; i < CF_IPV4_RANGES.length; i++) {
+      const ips: string[] = IpUtil.sampleV4(CF_IPV4_RANGES[i], 1);
+      if (ips.length > 0) {
+        randTargets.push({ label: '随机' + (i + 1).toString(), ip: ips[0], port: 443, timeoutMs: 3000 });
+      }
+    }
+    const randLines: DiagTcpLine[] = await Diag.tcpCheck(randTargets);
+    let randOk: number = 0;
+    for (let i = 0; i < randLines.length; i++) {
+      lines.push(Diag.fmtTcp(randLines[i]));
+      if (randLines[i].ok) {
+        randOk++;
+      }
+    }
+    lines.push('');
+    lines.push('--- 4. 初步判断（依据本次结果，不代表最终结论）---');
+    if (fixedOk === 0) {
+      lines.push('固定 IPv4 全部失败：先看第 1 节是否有 IPv4 地址/默认路由/DNS，再看错误 stage/code。');
+      lines.push('若本机 IPv4 网络正常，则更可能是端口/防火墙/目标侧问题；可换 443 与 80 再试。');
+    } else if (randOk === 0) {
+      lines.push('固定 IPv4 可达，但随机 IPv4 全部失败：多为目标随机地址不响应或中间网络过滤，不代表 App 的 IPv4 socket 不可用。');
+    } else {
+      lines.push('固定与随机 IPv4 均可连（随机成功 ' + randOk.toString() + '/' + randLines.length.toString() + '）。');
+      lines.push('如正式扫描仍 0 通过，优先核对「端口 / 延迟上限 / 并发」等参数。');
+    }
+    return lines.join('\n');
+  }
+
+  /** 生成完整 IPv6 诊断文本 */
   static async run(): Promise<string> {
     const lines: string[] = [];
     lines.push('=== CFLark IPv6 诊断 ===');
