@@ -1,8 +1,8 @@
 # CFLark-Harmony · 鸿蒙 Cloudflare 节点优选应用（源码）
 
 > 从会话「鸿蒙 CF 节点优选应用开发」中提取的完整应用源码。
-> 提取对象：`C:\cfdev\cflark`（该会话最终交付工程，版本 1.3.3）。
-> 提取时间：2026-10-25（v1.3.3）。源码已通过 `devecocli build --build-mode release` 实际编译验证（BUILD SUCCESSFUL）。
+> 提取对象：`C:\cfdev\cflark`（该会话最终交付工程，版本 1.3.4）。
+> 提取时间：2026-10-25（v1.3.4）。源码已通过 `devecocli build --build-mode release` 实际编译验证（BUILD SUCCESSFUL）。
 
 ## 基本信息
 
@@ -10,7 +10,7 @@
 | --- | --- |
 | 应用名 | CFLark（全称 CFLark-Harmony） |
 | bundleName | `com.cflark.app` |
-| 版本 | versionName `1.3.3` / versionCode `1003003` |
+| 版本 | versionName `1.3.4` / versionCode `1003004` |
 | 目标 SDK | HarmonyOS API 26（target/compatible 均为 26.0.0） |
 | 设备 | phone / tablet / 2in1（手机、平板、PC 自适应） |
 | UI 框架 | ArkTS + ArkUI 声明式 UI（Stage 模型，单页面多页签） |
@@ -189,7 +189,7 @@ devecocli run
 - **顶部/底部边缘虚化（v1.3.2，v1.3.3 优化性能）：条带改为顶部 30 层、底部 24 层细条（层高=步进×1.6，最大模糊半径 16，指数衰减），并叠加与页面底色同色的渐变蒙版；视觉与原来一致，但渲染层数减少约 2/3，滚动/切页更顺。
 - **内容顶边延伸（v1.3.2）**：把 Tabs 内容区整体上移 1 个状态栏高度，并同步增大内容顶部留白，使滚动时内容能完整延伸到屏幕最顶部（消除顶部那条「画面没铺满」的空带接缝），静止时布局与原来一致。
 - **性能优化（v1.3.3）**：滚动回调不再写入 @State（改为阈值布尔，避免滚动时逐帧整页重建）；进度/日志/结果列表改为普通字段 + 80~120ms 批量刷新；顶部/底部虚化条带缓存且数量从 111/90 降到 30/24。
-- **版本记录**：1.3.1 加入材质/光感改造；1.3.2 重做边缘虚化并让内容顶边延伸；1.3.3 做运行性能优化。
+- **版本记录**：1.3.1 加入材质/光感改造；1.3.2 重做边缘虚化并让内容顶边延伸；1.3.3 做运行性能优化；1.3.4 在「关于」中加入 GitHub 项目主页 / 下载最新版本入口与免责条款。
 
 - **导航交互（q 弹）**：手指在悬浮导航上按住/滑过时，跟随柔光会带一点弹簧惯性与拖尾（真实物理步进，约 16ms 一帧）；切换页签时光会从旧页签弹到新页签再淡出；选中项本身只显示一层无边框的径向柔光。
 - **浅色背景**：浅色模式背景从纯白改为带灰蓝的雾白渐变，并叠一层很淡的主题色环境光，避免大面积纯白刺眼；卡片玻璃质感与文字对比不变。
@@ -205,28 +205,10 @@ devecocli run
 - 会话中的方案文档（功能规格、技术方案、UI 设计规格等）保存在工作区 `docs/` 目录；旧版 `CFLark-README.md` 为早期版本说明，其中页签数量与默认权重等信息已与当前源码不一致，请以本 README 为准。
 
 
-## 发布包（packages/）
+## 应用内 GitHub 入口与免责声明（v1.3.4）
 
-| 文件 | 说明 |
-| --- | --- |
-| `packages/CFLark-Harmony-1.3.3-release.hap` | 已签名 HAP 安装包（可 `hdc install` 或 DevEco Studio 安装） |
-| `packages/CFLark-Harmony-1.3.3-release.app.hap` | 已签名 App Pack 发布包。GitHub 对 `.app` 后缀支持不佳，这里在 `.app` 后再加 `.hap` 后缀；下载后去掉末尾的 `.hap`（即恢复为 `.app`）即可通过 AppGallery Connect / `hdc install` 安装 |
-
-对应 GitHub Release：`v1.3.3`（附件同上述两个包）。源码包也可从仓库 Tags/Release 的 `Source code` 下载。
-
-## 构建方式
-
-1. 安装 DevEco Studio 26（HarmonyOS API 26 SDK）。
-2. `File → Open` 本目录，等待 ohpm 同步。
-3. `Project Structure → Signing Configs` 勾选 *Automatically generate signature*（本仓库不包含任何签名证书/口令）。
-4. 构建：`Build → Build Hap(s)/APP(s)`；或命令行 `devecocli build --product default --build-mode release --assemble-type assembleApp`。
-
-## 安全与隐私
-
-- 本仓库**不包含**签名证书、证书口令、Cloudflare API Token、edgetunnel 后台密码或任何私有域名/服务器凭据。
-- 应用运行所需的凭据（edgetunnel 域名/密码、Cloudflare Account ID / KV 命名空间 ID / API Token）全部由使用者在应用「设置 → 订阅上传」中自行填写，仅保存在设备本地 Preferences 中。
-- 请勿在 Issue/PR 中粘贴真实 Token 或密码。
-
-## 免责声明
-
-本项目仅供学习与个人研究使用。请遵守所在地法律法规以及 Cloudflare 的服务条款；因使用本项目产生的任何后果由使用者自行承担。
+- 「设置 → 关于」新增两行入口：
+  - **GitHub 项目主页** → https://github.com/Bailin-Love/CFLark-Harmony
+  - **下载最新版本** → https://github.com/Bailin-Love/CFLark-Harmony/releases/latest
+  点击后通过系统 `openLink` 打开浏览器（失败时回退为隐式 Want 打开）。
+- 「关于」底部新增**免责条款**：本应用仅供学习与个人研究使用，与 Cloudflare 官方无关；请遵守所在地法律法规及 Cloudflare 服务条款，使用后果由使用者自行承担。

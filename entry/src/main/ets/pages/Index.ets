@@ -6,7 +6,7 @@
  *  - 顶部覆盖层用 onAreaChange 测高，内容区按 headerH 让位
  *  - 结果列表必须用 Scroll + Column + ForEach（List 的 layoutWeight 在 TabContent 里撑不满）
  */
-import { common, ConfigurationConstant, bundleManager } from '@kit.AbilityKit';
+import { common, ConfigurationConstant, bundleManager, Want } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { fileIo } from '@kit.CoreFileKit';
@@ -150,7 +150,7 @@ struct Index {
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
-  @State appVersion: string = '1.3.3';
+  @State appVersion: string = '1.3.4';
 
   // ---------- edgetunnel 订阅上传 ----------
   @State etEnabled: boolean = false;
@@ -2930,6 +2930,56 @@ struct Index {
       this.saveUi();
     })
   }
+  /** 打开外部链接：优先用系统 openLink，失败则退回隐式 Want */
+  private openExternal(url: string): void {
+    const ctx: common.UIAbilityContext = this.ctx as common.UIAbilityContext;
+    try {
+      ctx.openLink(url).catch((err: BusinessError) => {
+        this.addLog('打开浏览器失败（' + err.code + '），改用系统浏览器');
+        this.startBrowser(url);
+      });
+    } catch (e) {
+      this.startBrowser(url);
+    }
+  }
+
+  private startBrowser(url: string): void {
+    const ctx: common.UIAbilityContext = this.ctx as common.UIAbilityContext;
+    const want: Want = {
+      action: 'ohos.want.action.viewData',
+      entities: ['entity.system.browsable'],
+      uri: url
+    };
+    ctx.startAbility(want).catch((err: BusinessError) => {
+      this.addLog('无法打开链接：' + err.message);
+    });
+  }
+
+  @Builder AboutLink(label: string, sub: string, url: string) {
+    Row({ space: 10 }) {
+      Column({ space: 2 }) {
+        Text(label)
+          .fontSize(12)
+          .fontColor(this.txt())
+        Text(sub)
+          .fontSize(10)
+          .fontColor(this.txt3())
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      Text('↗')
+        .fontSize(13)
+        .fontColor(this.accent())
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+    .borderRadius(12)
+    .backgroundColor(this.accentSoft())
+    .margin({ top: 8 })
+    .onClick(() => {
+      this.openExternal(url);
+    })
+  }
   @Builder CardAbout() {
     Column() {
       this.CardTitle('关于', $r('sys.symbol.info_circle'))
@@ -2953,6 +3003,20 @@ struct Index {
         .fontColor(this.txt3())
         .lineHeight(17)
         .margin({ top: 8 })
+      this.AboutLink('GitHub 项目主页', '源码、Issue 与更新记录', 'https://github.com/Bailin-Love/CFLark-Harmony')
+      this.AboutLink('下载最新版本', 'GitHub Releases · HAP / APP', 'https://github.com/Bailin-Love/CFLark-Harmony/releases/latest')
+      Divider()
+        .color(this.cardBorderColor())
+        .margin({ top: 12, bottom: 8 })
+      Text('免责条款')
+        .fontSize(11)
+        .fontColor(this.txt2())
+        .margin({ top: 2 })
+      Text('本应用仅供学习与个人研究使用，与 Cloudflare 官方无关。请遵守所在地区法律法规及 Cloudflare 服务条款；因使用本应用（含节点测速、订阅上传等）产生的任何后果由使用者自行承担。')
+        .fontSize(10)
+        .fontColor(this.txt3())
+        .lineHeight(16)
+        .margin({ top: 6 })
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
