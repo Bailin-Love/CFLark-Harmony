@@ -275,6 +275,7 @@ export class Scanner {
     let timeouts: number = 0;
     let otherErrors: number = 0;
     let skipped: number = 0;
+    let speedLow: number = 0;
     const errSamples: string[] = [];
     const keep: Candidate[] = [];
     // 延迟达标的 IP 立刻并行去要数据中心，最后统一收尾
@@ -388,13 +389,125 @@ export class Scanner {
         keep.push(list[i]);
       }
     }
+    // 「合格速度」预检（第一轮末端、进入测速之前）：按延迟从低到高，
+    // 只挑出可能进入测速的 N 个节点做小幅估速；测不动或不达标的直接淘汰，
+    // 并顺延到后面的候选，保证「测速地址数」能凑满且都是可测速的节点。
+    if (cfg.minSpeedMbps > 0 && keep.length > 0) {
+      keep.sort((a: Candidate, b: Candidate): number => {
+        const la: number = a.minLatencyMs > 0 ? a.minLatencyMs : 1e9;
+        const lb: number = b.minLatencyMs > 0 ? b.minLatencyMs : 1e9;
+        return la - lb;
+      });
+      const regionMode: boolean = cfg.speedScope === SpeedScope.PER_REGION;
+      const per: number = Math.max(1, Math.min(20, cfg.speedPerRegion));
+      const need: Map<string, number> = new Map<string, number>();
+      let quota: number = 0;
+      if (regionMode) {
+        for (let i = 0; i < keep.length; i++) {
+          const k: string = keep[i].colo.length > 0 ? keep[i].colo.toUpperCase() : 'UNK';
+          const n0: number | undefined = need.get(k);
+          if (n0 === undefined) {
+            need.set(k, per);
+            quota += per;
+          }
+        }
+      } else {
+        quota = Math.min(Math.max(1, cfg.speedCount), keep.length);
+      }
+      const gateWindow: number = Math.min(2500, Math.max(1600, Math.floor(cfg.speedWindowMs * 2 / 3)));
+      const gateConc: number = 2;
+      // 不设硬性上限：一直从低延迟往下测，直到凑满配额或候选耗尽。
+      // 但若明显异常（检测很多但几乎不达标/耗时过长），中止并提示排查网络。
+      const gateSoftLimit: number = Math.max(24, quota * 4);
+      const gateElapsedLimitMs: number = 90000;
+      const gateStartAt: number = Date.now();
+      hooks.onPhase(1, '第一阶段 · 合格速度预检（目标 ' + quota.toString() + ' 个，窗口 ' +
+        gateWindow.toString() + 'ms）');
+      hooks.onLog('合格速度预检：TCP 通过 ' + keep.length.toString() + ' 个，目标测速 ' +
+        quota.toString() + ' 个，单次窗口 ' + gateWindow.toString() + 'ms，合格速度 ' +
+        cfg.minSpeedMbps.toString() + ' MB/s');
+      const probeOne = async (c: Candidate): Promise<boolean> => {
+        const pt: SpeedTarget = {
+          ip: c.ip,
+          port: c.port,
+          host: DEFAULT_TRACE_HOST,
+          url: 'https://' + DEFAULT_TRACE_HOST + SPEED_PATH,
+          timeoutMs: Math.min(cfg.traceTimeoutMs, 3000),
+          windowMs: gateWindow,
+          maxBytes: 2 * 1024 * 1024
+        };
+        const r = await SpeedTest.run(pt);
+        return r.ok && r.avgMbps >= cfg.minSpeedMbps;
+      };
+      const qualified: Candidate[] = [];
+      let taken: number = 0;
+      let idx: number = 0;
+      while (qualified.length < quota && idx < keep.length) {
+        const batch: Candidate[] = [];
+        while (batch.length < gateConc && idx < keep.length) {
+          const c: Candidate = keep[idx];
+          idx++;
+          if (regionMode) {
+            const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
+            const n0: number | undefined = need.get(k);
+            const n: number = n0 === undefined ? 0 : n0;
+            if (n <= 0) {
+              continue;
+            }
+          }
+          batch.push(c);
+        }
+        if (batch.length === 0) {
+          break;
+        }
+        if (taken >= gateSoftLimit && qualified.length * 10 < taken) {
+          hooks.onLog('合格速度预检提前中止：已检测 ' + taken.toString() + ' 个，仅合格 ' +
+            qualified.length.toString() + ' 个（达标率过低，疑似网络异常或「合格速度」设置过高），请检查网络或调低合格速度');
+          break;
+        }
+        if ((Date.now() - gateStartAt) > gateElapsedLimitMs && qualified.length < quota) {
+          hooks.onLog('合格速度预检超时中止：已用 ' + Math.round((Date.now() - gateStartAt) / 1000).toString() +
+            ' 秒，已检测 ' + taken.toString() + ' 个，合格 ' + qualified.length.toString() +
+            ' 个（疑似网络异常或整体速度偏低），请检查网络或调低合格速度');
+          break;
+        }
+        const rs: boolean[] = await Promise.all(batch.map((c: Candidate): Promise<boolean> => probeOne(c)));
+        taken += batch.length;
+        for (let i = 0; i < batch.length; i++) {
+          const c: Candidate = batch[i];
+          if (rs[i]) {
+            qualified.push(c);
+            if (regionMode) {
+              const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
+              const n0: number | undefined = need.get(k);
+              need.set(k, (n0 === undefined ? 1 : n0) - 1);
+            }
+          } else {
+            c.verdict = Verdict.FAILED;
+            c.remark = '合格速度不达标';
+            speedLow++;
+          }
+        }
+        hooks.onProgress(taken, keep.length, qualified.length, speedLow);
+      }
+      hooks.onLog('合格速度预检完成：检测 ' + taken.toString() + ' 个，合格 ' +
+        qualified.length.toString() + ' 个进入测速，淘汰 ' + speedLow.toString() + ' 个');
+      if (qualified.length === 0) {
+        hooks.onLog('合格速度预检后没有剩余节点，跳过测速');
+      }
+      keep.splice(0, keep.length);
+      for (let i = 0; i < qualified.length; i++) {
+        keep.push(qualified[i]);
+      }
+    }
     const coloOk: number = keep.length;
-    const dropped: number = passed - keep.length;
+    const coloDropped: number = Math.max(0, passed - speedLow - keep.length);
     hooks.onLog('第一阶段完成：候选 ' + list.length.toString() + ' 个；TCP 成功 ' + passed.toString() +
       ' 个（延迟达标）；延迟超限 ' + overLimit.toString() + ' 个；连接超时 ' + timeouts.toString() +
+      ' 个；合格速度未达标 ' + speedLow.toString() +
       ' 个；其他错误 ' + otherErrors.toString() + ' 个；取消/未执行 ' + skipped.toString() +
       ' 个；最终通过 ' + keep.length.toString() + ' 个（拿到 colo ' + coloOk.toString() + ' 个）' +
-      (dropped > 0 ? ('，排除 ' + dropped.toString() + ' 个无法完成 HTTPS 探测的') : ''));
+      (coloDropped > 0 ? ('，另有 ' + coloDropped.toString() + ' 个无法完成 HTTPS 探测') : ''));
     if (errSamples.length > 0) {
       hooks.onLog('连接错误示例：' + errSamples.join('；'));
     }
@@ -518,56 +631,6 @@ export class Scanner {
       hooks.onLog('按延迟从低到高，只测前 ' + cap.toString() + ' 个地址');
     }
     let targets: Candidate[] = pool.slice(0, cap);
-    // 「合格速度」预检：正式下载测速之前，先用小窗口/小流量快速估速，
-    // 低于门槛的节点直接拦在测速之外（不进入测速页面、不计入结果）。
-    if (cfg.minSpeedMbps > 0 && targets.length > 0) {
-      const probeWindow: number = Math.min(800, Math.max(300, Math.floor(cfg.speedWindowMs / 3)));
-      const probeConc: number = Math.min(4, Math.max(1, cfg.speedConcurrency));
-      hooks.onPhase(3, '测速前预检（合格速度 ' + cfg.minSpeedMbps.toString() + ' MB/s）');
-      hooks.onLog('测速前预检：' + targets.length.toString() + ' 个候选，单次窗口 ' +
-        probeWindow.toString() + 'ms，合格速度 ' + cfg.minSpeedMbps.toString() + ' MB/s');
-      const keep: boolean[] = [];
-      for (let i = 0; i < targets.length; i++) {
-        keep.push(true);
-      }
-      let dropped: number = 0;
-      await Scanner.pool<void>(targets.length, probeConc, token, async (index: number): Promise<void> => {
-        if (token.isCancelled()) {
-          return;
-        }
-        const c: Candidate = targets[index];
-        const pt: SpeedTarget = {
-          ip: c.ip,
-          port: c.port,
-          host: DEFAULT_TRACE_HOST,
-          url: 'https://' + DEFAULT_TRACE_HOST + SPEED_PATH,
-          timeoutMs: Math.min(cfg.traceTimeoutMs, 3000),
-          windowMs: probeWindow,
-          maxBytes: 2 * 1024 * 1024
-        };
-        const r = await SpeedTest.run(pt);
-        if (r.ok && r.avgMbps >= cfg.minSpeedMbps) {
-          c.speedMbps = r.avgMbps;
-        } else {
-          keep[index] = false;
-          dropped++;
-        }
-      });
-      const filtered: Candidate[] = [];
-      for (let i = 0; i < targets.length; i++) {
-        if (keep[i]) {
-          filtered.push(targets[i]);
-        }
-      }
-      hooks.onLog('预检完成：淘汰 ' + dropped.toString() + ' 个低于合格速度的节点，进入正式测速 ' +
-        filtered.length.toString() + ' 个');
-      targets = filtered;
-      if (targets.length === 0) {
-        hooks.onPhase(4, '完成');
-        hooks.onLog('测速前预检后没有剩余节点，跳过正式测速');
-        return;
-      }
-    }
     hooks.onSpeedInit(targets);
     // 下载测速固定走 speed.cloudflare.com 的 /__down 端点：用户自己的域名一般没有这个路径，
     // 绑上去只会 404，表现就是「只显示延迟、没有 MB/s」。域名只用于可用性校验，不参与测速下载。
@@ -669,11 +732,12 @@ export class Scanner {
 
     // colo 已在上一步与 ping 并行完成，这里不再串行跑一轮
     hooks.onPhase(4, '第一轮完成');
-    Ranker.apply(list, cfg);
-    hooks.onResult(list);
-    const ok = Ranker.countPassed(list);
+    const gated: Candidate[] = passedPing;
+    Ranker.apply(gated, cfg);
+    hooks.onResult(gated);
+    const ok = Ranker.countPassed(gated);
     hooks.onLog('第一轮完成：' + list.length.toString() + ' 个候选，通过 ' + ok.toString() + ' 个');
-    return list;
+    return gated;
   }
 
   /** 第二阶段：只对给定候选做下载测速（就地写入结果） */
