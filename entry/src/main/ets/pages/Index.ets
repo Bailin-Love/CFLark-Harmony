@@ -52,6 +52,8 @@ struct Index {
   private navVelPct: number = 0;
   private navTargetPct: number = 50;
   private navDrag: boolean = false;
+  private navDownX: number = -1;
+  private navMoved: boolean = false;
   private navTimer: number = -1;
   /** 0=深色 1=浅色 2=跟随系统 */
   @State themeMode: number = ThemeMode.SYSTEM;
@@ -150,7 +152,7 @@ struct Index {
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
-  @State appVersion: string = '1.3.4';
+  @State appVersion: string = '1.3.5';
 
   // ---------- edgetunnel 订阅上传 ----------
   @State etEnabled: boolean = false;
@@ -1665,17 +1667,17 @@ struct Index {
   /** 宽柔光带：中心为触摸位置 */
   private glowBand(): Array<[ResourceColor, number]> {
     const p: number = Math.max(0.06, Math.min(0.94, this.navGlowPct / 100));
-    const spread: number = 0.32 + 0.12 * this.navStretch;
+    const spread: number = 0.24 + 0.09 * this.navStretch;
     const lo: number = Math.max(0.0, p - spread);
     const hi: number = Math.min(1.0, p + spread);
-    return [[this.accentRgba(0.0), 0.0], [this.accentRgba(0.12), lo], [this.accentRgba(0.30), p],
-      [this.accentRgba(0.12), hi], [this.accentRgba(0.0), 1.0]];
+    return [[this.accentRgba(0.0), 0.0], [this.accentRgba(0.10), lo], [this.accentRgba(0.28), p],
+      [this.accentRgba(0.10), hi], [this.accentRgba(0.0), 1.0]];
   }
 
   /** 窄亮芯 */
   private glowCore(): Array<[ResourceColor, number]> {
     const p: number = Math.max(0.04, Math.min(0.96, this.navGlowPct / 100));
-    const spread: number = 0.09 + 0.08 * this.navStretch;
+    const spread: number = 0.075 + 0.05 * this.navStretch;
     const lo: number = Math.max(0.0, p - spread);
     const hi: number = Math.min(1.0, p + spread);
     return [[this.accentRgba(0.0), 0.0], [this.accentRgba(0.44), lo], [this.accentRgba(0.44), p],
@@ -1699,7 +1701,7 @@ struct Index {
       this.navPosPct = 98;
       this.navVelPct = 0;
     }
-    this.navStretch = Math.min(1, Math.abs(this.navVelPct) / 38);
+    this.navStretch = Math.min(1, Math.abs(this.navVelPct) / 46);
     this.navGlowPct = this.navPosPct;
   }
 
@@ -1719,7 +1721,7 @@ struct Index {
     this.navStretch = 0;
   }
 
-  /** 底部导航触摸：扫光跟随手指，带弹簧回弹 */
+  /** 底部导航触摸：只有拖动才显示跟手扫光（轻点不触发） */
   private onNavTouch(e: TouchEvent): void {
     if (e.touches.length === 0) {
       return;
@@ -1727,24 +1729,39 @@ struct Index {
     const t: TouchObject = e.touches[0];
     const lx: number = t.windowX - this.navStackLeft();
     const pct: number = Math.max(2, Math.min(98, lx / this.navStackWidth() * 100));
-    if (e.type === TouchType.Down || e.type === TouchType.Move) {
-      if (!this.navGlowOn) {
-        this.navPosPct = pct;
+    if (e.type === TouchType.Down) {
+      this.navDownX = lx;
+      this.navMoved = false;
+      this.navDrag = false;
+      this.stopNavTimer();
+      this.navStretch = 0;
+    } else if (e.type === TouchType.Move) {
+      if (!this.navMoved) {
+        if (this.navDownX < 0 || Math.abs(lx - this.navDownX) < 8) {
+          return;
+        }
+        this.navMoved = true;
+        this.navDrag = true;
+        this.navPosPct = (this.curTab + 0.5) / 4 * 100;
         this.navVelPct = 0;
+        this.navGlowOn = true;
       }
       this.navTargetPct = pct;
-      this.navDrag = true;
-      this.navGlowOn = true;
       this.ensureNavTimer();
     } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
       this.navDrag = false;
-      this.navTargetPct = (this.curTab + 0.5) / 4 * 100;
-      setTimeout(() => {
-        if (!this.navDrag) {
-          this.navGlowOn = false;
-          this.stopNavTimer();
-        }
-      }, 700);
+      this.navMoved = false;
+      this.navDownX = -1;
+      if (this.navGlowOn) {
+        setTimeout(() => {
+          if (!this.navDrag) {
+            this.navGlowOn = false;
+            this.stopNavTimer();
+          }
+        }, 120);
+      } else {
+        this.stopNavTimer();
+      }
     }
   }
 
@@ -1810,7 +1827,7 @@ struct Index {
       .onTouch((e: TouchEvent) => {
         this.onNavTouch(e);
       })
-      .scale({ x: 1 + 0.022 * this.navStretch, y: 1 - 0.014 * this.navStretch })
+      .scale({ x: 1 + 0.014 * this.navStretch, y: 1 - 0.009 * this.navStretch })
     }
     .width('100%')
     .padding({ left: 24, right: 24 })
@@ -1901,18 +1918,13 @@ struct Index {
     if (this.showBackTop) {
       this.showBackTop = false;
     }
-    // 光从旧页签弹簧滑到新页签，松手后回弹
-    this.navPosPct = (this.curTab + 0.5) / 4 * 100;
+    // 点击切页不扫光：光带只在拖动时出现
+    this.navGlowOn = false;
+    this.stopNavTimer();
+    this.navPosPct = (index + 0.5) / 4 * 100;
     this.navVelPct = 0;
-    this.navTargetPct = (index + 0.5) / 4 * 100;
-    this.navGlowOn = true;
-    this.ensureNavTimer();
-    setTimeout(() => {
-      if (!this.navDrag) {
-        this.navGlowOn = false;
-        this.stopNavTimer();
-      }
-    }, 900);
+    this.navTargetPct = this.navPosPct;
+    this.navStretch = 0;
     animateTo({ duration: 200, curve: Curve.EaseInOut }, () => {
       this.curTab = index;
     });
