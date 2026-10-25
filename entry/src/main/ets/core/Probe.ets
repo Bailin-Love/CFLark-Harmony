@@ -112,7 +112,8 @@ export class TcpProbe {
         finish(false, -1, -2);
       });
 
-      const addr: socket.NetAddress = { address: ip, port: port };
+      const isV6: boolean = ip.indexOf(':') >= 0;
+      const addr: socket.NetAddress = { address: ip, family: isV6 ? 2 : 1, port: port };
       const opts: socket.TCPConnectOptions = { address: addr, timeout: timeoutMs };
       sock.connect(opts).then(() => {
         // 有的实现 connect 后再触发 connect 事件，这里只兜底超时
