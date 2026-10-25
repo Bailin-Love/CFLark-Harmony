@@ -253,15 +253,17 @@ export class IpUtil {
       }
       const last: number[] = IpUtil.cidrV6Last(cidr);
       const lastText: string = IpUtil.bytesToV6(last);
-      lines.push('[采样自检] ' + cidr + ' prefix=' + prefix.toString() + ' base=' + baseText +
-        ' baseInCidr=' + IpUtil.inCidrV6(baseText, cidr).toString() + ' 样本越界=' + bad.toString() +
-        ' last=' + lastText + ' lastInCidr=' + IpUtil.inCidrV6(lastText, cidr).toString() +
-        (bad === 0 && IpUtil.inCidrV6(baseText, cidr) && IpUtil.inCidrV6(lastText, cidr) ? ' PASS' : ' FAIL'));
+      const pass: boolean = bad === 0 && IpUtil.inCidrV6(baseText, cidr) && IpUtil.inCidrV6(lastText, cidr);
+      lines.push('[采样自检] ' + cidr + '  prefix=' + prefix.toString());
+      lines.push('  基准 base=' + baseText + '  baseInCidr=' + IpUtil.inCidrV6(baseText, cidr).toString());
+      lines.push('  样本数=' + samples.length.toString() + '  样本越界=' + bad.toString());
+      lines.push('  末地址 last=' + lastText + '  lastInCidr=' + IpUtil.inCidrV6(lastText, cidr).toString());
+      lines.push('  结果=' + (pass ? 'PASS' : 'FAIL'));
     }
     const boundA: string = '2a06:98c7:ffff:ffff:ffff:ffff:ffff:ffff';
     const boundB: string = '2a06:98c8::';
-    lines.push('[边界] ' + boundA + ' 属于 2a06:98c0::/29 = ' + IpUtil.inCidrV6(boundA, '2a06:98c0::/29').toString());
-    lines.push('[边界] ' + boundB + ' 属于 2a06:98c0::/29 = ' + IpUtil.inCidrV6(boundB, '2a06:98c0::/29').toString());
+    lines.push('[边界] ' + boundA + ' 属于 2a06:98c0::/29 = ' + IpUtil.inCidrV6(boundA, '2a06:98c0::/29').toString() + '（应为 true）');
+    lines.push('[边界] ' + boundB + ' 属于 2a06:98c0::/29 = ' + IpUtil.inCidrV6(boundB, '2a06:98c0::/29').toString() + '（应为 false）');
     return lines;
   }
 
