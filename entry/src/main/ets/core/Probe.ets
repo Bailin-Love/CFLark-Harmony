@@ -29,7 +29,18 @@ export function isTlsPort(port: number): boolean {
 export interface TcpResult {
   ok: boolean;
   rttMs: number;
+  /** 兼容旧字段：0=成功；-1=超时；-2=Socket error；-3=connect 被 reject；-900=Socket 构造失败 */
   errorCode: number;
+  /** 原始错误码（BusinessError.code 或系统返回码），没有则为 -1 */
+  rawErrorCode: number;
+  /** 原始错误消息，没有则为 '' */
+  errorMessage: string;
+  /** 从发起连接到结束的耗时（ms，失败也统计） */
+  elapsedMs: number;
+  /** 实际使用的地址族：1=IPv4，2=IPv6 */
+  family: number;
+  /** 结束阶段：ok / timeout / socket_error / connect_reject / create_fail */
+  stage: string;
 }
 
 /** trace 请求参数 */
@@ -58,18 +69,39 @@ export interface TraceResult {
 /** TCP 握手探测 */
 export class TcpProbe {
   /**
-   * 连一次并返回握手耗时。
+   * 连一次并返回握手耗时与失败诊断。
    * 注意：TCPSocket 连接超时时 reject 的错误码是 2301115（Operation in progress），
-   * 不是专用超时码，所以必须自己用 setTimeout 兜底。
+   * 不是专用超时码，所以必须自己用 setTimeout 兜底；原始错误码/消息会原样带回 TcpResult。
    */
   static pingOnce(ip: string, port: number, timeoutMs: number): Promise<TcpResult> {
     return new Promise<TcpResult>((resolve: (r: TcpResult) => void) => {
-      let settled: boolean = false;
       const started: number = Date.now();
-      let sock: socket.TCPSocket | undefined = undefined;
+      let settled: boolean = false;
       let timer: number = -1;
+      let sock: socket.TCPSocket | undefined = undefined;
+      let rawCode: number = -1;
+      let rawMsg: string = '';
+      const isV6: boolean = ip.indexOf(':') >= 0;
+      const family: number = isV6 ? 2 : 1;
 
-      const finish = (ok: boolean, rtt: number, code: number): void => {
+      const readError = (e: Object | undefined | null): void => {
+        if (e === undefined || e === null) {
+          return;
+        }
+        try {
+          const be: BusinessError = e as BusinessError;
+          if (be.code !== undefined && be.code !== null) {
+            rawCode = be.code;
+          }
+          if (be.message !== undefined && be.message !== null) {
+            rawMsg = be.message;
+          }
+        } catch (err) {
+          rawMsg = '错误对象解析失败';
+        }
+      };
+
+      const finish = (ok: boolean, rtt: number, code: number, stage: string): void => {
         if (settled) {
           return;
         }
@@ -78,48 +110,70 @@ export class TcpProbe {
           clearTimeout(timer);
           timer = -1;
         }
-        if (sock !== undefined) {
-          const s: socket.TCPSocket = sock;
+        const s: socket.TCPSocket | undefined = sock;
+        sock = undefined;
+        if (s !== undefined) {
+          // 清理异常不能覆盖已经得到的连接结果
           try {
             s.off('connect');
             s.off('error');
-          } catch (e) {
+          } catch (err) {
             // 忽略清理异常
           }
-          s.close().then(() => {
-          }).catch(() => {
-          });
+          try {
+            s.close().then(() => {
+            }).catch(() => {
+            });
+          } catch (err) {
+            // 忽略清理异常
+          }
         }
-        const r: TcpResult = { ok: ok, rttMs: rtt, errorCode: code };
+        const r: TcpResult = {
+          ok: ok,
+          rttMs: rtt,
+          errorCode: code,
+          rawErrorCode: rawCode,
+          errorMessage: rawMsg,
+          elapsedMs: Date.now() - started,
+          family: family,
+          stage: stage
+        };
         resolve(r);
       };
 
       try {
         sock = socket.constructTCPSocketInstance();
       } catch (e) {
-        finish(false, -1, -900);
+        readError(e as Object);
+        finish(false, -1, -900, 'create_fail');
         return;
       }
 
       timer = setTimeout(() => {
-        finish(false, -1, -1);
+        finish(false, -1, -1, 'timeout');
       }, timeoutMs);
 
       sock.on('connect', () => {
-        finish(true, Date.now() - started, 0);
+        finish(true, Date.now() - started, 0, 'ok');
       });
-      sock.on('error', () => {
-        finish(false, -1, -2);
+      sock.on('error', (err: BusinessError) => {
+        readError(err);
+        finish(false, -1, -2, 'socket_error');
       });
 
-      const isV6: boolean = ip.indexOf(':') >= 0;
-      const addr: socket.NetAddress = { address: ip, family: isV6 ? 2 : 1, port: port };
+      const addr: socket.NetAddress = { address: ip, family: family, port: port };
       const opts: socket.TCPConnectOptions = { address: addr, timeout: timeoutMs };
-      sock.connect(opts).then(() => {
-        // 有的实现 connect 后再触发 connect 事件，这里只兜底超时
-      }).catch(() => {
-        finish(false, -1, -3);
-      });
+      try {
+        sock.connect(opts).then(() => {
+          // 正常情况下由 'connect' 事件结算；这里只做兜底（不额外提前结算）
+        }).catch((err: BusinessError) => {
+          readError(err);
+          finish(false, -1, -3, 'connect_reject');
+        });
+      } catch (e) {
+        readError(e as Object);
+        finish(false, -1, -3, 'connect_reject');
+      }
     });
   }
 }
