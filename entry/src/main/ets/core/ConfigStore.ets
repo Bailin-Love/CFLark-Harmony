@@ -129,17 +129,51 @@ export class ConfigStore {
 
   static load(): ScanConfig {
     const d: ScanConfig = defaultScanConfig();
-    d.domain = ConfigStore.str('domain', '');
+    d.mode = ConfigStore.str('scan_mode', '0') === '1' ? ScanMode.CUSTOM : ScanMode.OFFICIAL;
+    d.ipVersion = ConfigStore.str('scan_ipver', '4') === '6' ? IpVersion.V6 : IpVersion.V4;
+    d.port = ConfigStore.num('scan_port', d.port);
+    d.sampleCount = ConfigStore.num('scan_samples', d.sampleCount);
+    d.customText = ConfigStore.str('scan_custom', d.customText);
+    d.pingTimes = ConfigStore.num('scan_ping_times', d.pingTimes);
+    d.latencyLimitMs = ConfigStore.num('scan_latency', d.latencyLimitMs);
+    d.scanConcurrency = ConfigStore.num('scan_concurrency', d.scanConcurrency);
+    d.enableSpeed = ConfigStore.str('scan_enable_speed', '1') === '1';
+    const sc: number = ConfigStore.num('scan_speed_scope', d.speedScope);
+    d.speedScope = sc === 1 ? SpeedScope.REGION : (sc === 2 ? SpeedScope.PER_REGION : SpeedScope.ALL);
+    d.speedCount = ConfigStore.num('scan_speed_count', d.speedCount);
+    d.speedPerRegion = ConfigStore.num('scan_speed_per', d.speedPerRegion);
+    d.speedRounds = ConfigStore.num('scan_speed_rounds', d.speedRounds);
+    d.speedWindowMs = ConfigStore.num('scan_speed_window', d.speedWindowMs);
+    d.domain = ConfigStore.str('domain', d.domain);
+    d.regionCode = ConfigStore.str('scan_region', d.regionCode);
     return d;
   }
 
-  /** 保存配置：只持久化测速域名，其余参数每次启动走默认值 */
+  /**
+   * 保存扫描参数：扫描参数、候选来源、端口、IP 版本、测速域名、地区码
+   * 全部持久化，避免每次打开 App 都要重新填写。
+   */
   static async save(c: ScanConfig): Promise<void> {
     const st = ConfigStore.store;
     if (st === undefined) {
       return;
     }
+    st.putSync('scan_mode', c.mode === ScanMode.CUSTOM ? '1' : '0');
+    st.putSync('scan_ipver', c.ipVersion === IpVersion.V6 ? '6' : '4');
+    st.putSync('scan_port', c.port);
+    st.putSync('scan_samples', c.sampleCount);
+    st.putSync('scan_custom', c.customText);
+    st.putSync('scan_ping_times', c.pingTimes);
+    st.putSync('scan_latency', c.latencyLimitMs);
+    st.putSync('scan_concurrency', c.scanConcurrency);
+    st.putSync('scan_enable_speed', c.enableSpeed ? '1' : '0');
+    st.putSync('scan_speed_scope', c.speedScope);
+    st.putSync('scan_speed_count', c.speedCount);
+    st.putSync('scan_speed_per', c.speedPerRegion);
+    st.putSync('scan_speed_rounds', c.speedRounds);
+    st.putSync('scan_speed_window', c.speedWindowMs);
     st.putSync('domain', c.domain);
+    st.putSync('scan_region', c.regionCode);
     await st.flush();
   }
   /**
