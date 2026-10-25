@@ -85,6 +85,7 @@ export function defaultScanConfig(): ScanConfig {
     speedWindowMs: 3000,
     speedConcurrency: 1,
     speedGapMs: 300,
+    minSpeedMbps: 0.1,
     domain: '',
     regionCode: '',
     delayWeight: 0.1,
@@ -144,6 +145,7 @@ export class ConfigStore {
     d.speedPerRegion = ConfigStore.num('scan_speed_per', d.speedPerRegion);
     d.speedRounds = ConfigStore.num('scan_speed_rounds', d.speedRounds);
     d.speedWindowMs = ConfigStore.num('scan_speed_window', d.speedWindowMs);
+    d.minSpeedMbps = ConfigStore.num('scan_min_speed', d.minSpeedMbps);
     d.domain = ConfigStore.str('domain', d.domain);
     d.regionCode = ConfigStore.str('scan_region', d.regionCode);
     return d;
@@ -172,6 +174,7 @@ export class ConfigStore {
     st.putSync('scan_speed_per', c.speedPerRegion);
     st.putSync('scan_speed_rounds', c.speedRounds);
     st.putSync('scan_speed_window', c.speedWindowMs);
+    st.putSync('scan_min_speed', c.minSpeedMbps);
     st.putSync('domain', c.domain);
     st.putSync('scan_region', c.regionCode);
     await st.flush();
