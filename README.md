@@ -82,6 +82,38 @@ CFLark-Harmony/
    - **edgetunnel 订阅上传**：支持「登录上传」（域名 + 密码）与「Cloudflare API 直传」（Account ID + KV 命名空间 ID + API Token）两种方式；支持覆盖/追加、自定义保留行位置、自动/手动上传与日志。
    - 关于页与版本号。
 
+## 应用截图
+
+> 以下截图来自 CFLark v1.3.5（手机端 1320×2232 浅色主题 / 平板端 2560×1600 深色主题）。
+
+<p align="center">
+  <img src="docs/screenshots/phone_01_scan.jpg" width="220" alt="手机端 · 扫描首页" />
+  <img src="docs/screenshots/phone_03_filter.jpg" width="220" alt="手机端 · 筛选结果" />
+  <img src="docs/screenshots/phone_04_speed_results.jpg" width="220" alt="手机端 · 测速结果" />
+  <img src="docs/screenshots/phone_05_settings_upload.jpg" width="220" alt="手机端 · 订阅上传" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/tablet_01_scan.jpg" width="440" alt="平板端 · 扫描首页与运行日志" />
+  <img src="docs/screenshots/tablet_04_filter.jpg" width="440" alt="平板端 · 地区筛选" />
+</p>
+
+<details>
+<summary>更多截图（平板设置页 / 扫描进行中 / 主题与材质）</summary>
+
+<p align="center">
+  <img src="docs/screenshots/tablet_05_settings.jpg" width="640" alt="平板端 · 三栏设置页" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/tablet_02_scan_running.jpg" width="440" alt="平板端 · 扫描进行中" />
+  <img src="docs/screenshots/tablet_03_speed_results.jpg" width="440" alt="平板端 · 测速结果" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/phone_02_scan_running.jpg" width="220" alt="手机端 · 扫描进行中" />
+  <img src="docs/screenshots/phone_06_settings_material.jpg" width="220" alt="手机端 · 主题与材质" />
+</p>
+
+</details>
 ## 订阅上传的两种方式
 
 EdgeTunnel.ets 提供两条写入 edgetunnel ADD.txt（Workers KV 键，即后台「自定义节点」内容）的路径：
