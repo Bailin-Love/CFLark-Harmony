@@ -146,6 +146,8 @@ struct Index {
   @State speedCountText: string = '3';
   @State speedRoundsText: string = '1';
   @State speedWindowText: string = '3000';
+  /** 合格速度（MB/s），低于该值的测速结果会被淘汰，默认 0.1 */
+  @State minSpeedText: string = '0.1';
   @State enableSpeed: boolean = true;
   @State speedScope: number = SpeedScope.ALL;
   @State speedPerRegionText: string = '3';
@@ -156,7 +158,7 @@ struct Index {
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
-  @State appVersion: string = '1.3.6';
+  @State appVersion: string = '1.3.7';
   /** IPv6 网络诊断：运行状态与结果文本 */
   @State diagBusy: boolean = false;
   @State diagText: string = '';
@@ -182,7 +184,9 @@ struct Index {
   @State etCfNamespace: string = '';
   @State etCfToken: string = '';
   /** 每次最多上传的结果数：0=全部 */
-  @State etTopN: number = 0;
+  /** 每次最多上传的结果数（0=全部），默认前 3 */
+  @State etTopN: number = 3;
+  @State etTopNText: string = '3';
 
   private token: CancellationToken = new CancellationToken();
   /** 扫描参数持久化防抖计时器 */
@@ -419,6 +423,7 @@ struct Index {
     this.speedCountText = c.speedCount.toString();
     this.speedRoundsText = c.speedRounds.toString();
     this.speedWindowText = c.speedWindowMs.toString();
+    this.minSpeedText = c.minSpeedMbps.toString();
     this.enableSpeed = c.enableSpeed;
     this.speedScope = c.speedScope;
     this.speedPerRegionText = c.speedPerRegion.toString();
@@ -467,6 +472,35 @@ struct Index {
     this.addLog('已恢复默认渐变背景');
     this.toast('已恢复默认背景');
   }
+  /** 进度条左侧文案：同时显示成功/失败数，避免「整数进度」看不出失败 */
+  progressLabel(): string {
+    if (this.total <= 0) {
+      return '就绪';
+    }
+    let s: string = this.done.toString() + '/' + this.total.toString();
+    if (this.passed + this.failed > 0) {
+      s += ' · 通过 ' + this.passed.toString() + ' · 未通过 ' + this.failed.toString();
+    }
+    return s;
+  }
+
+  floatOf(s: string, def: number): number {
+    const v: number = parseFloat(s);
+    if (isNaN(v)) {
+      return def;
+    }
+    return v;
+  }
+
+  /** 合格速度门槛（MB/s），0 表示不淘汰 */
+  minSpeedValue(): number {
+    const v: number = this.floatOf(this.minSpeedText, 0.1);
+    if (v <= 0) {
+      return 0;
+    }
+    return Math.min(100, v);
+  }
+
   intOf(s: string, def: number): number {
     const v: number = parseInt(s, 10);
     if (isNaN(v)) {
@@ -499,6 +533,7 @@ struct Index {
       speedRounds: Math.max(1, Math.min(3, this.intOf(this.speedRoundsText, d.speedRounds))),
       speedUrl: d.speedUrl,
       speedWindowMs: Math.max(1000, Math.min(10000, this.intOf(this.speedWindowText, d.speedWindowMs))),
+      minSpeedMbps: Math.max(0, Math.min(100, this.floatOf(this.minSpeedText, d.minSpeedMbps))),
       speedConcurrency: d.speedConcurrency,
       speedGapMs: d.speedGapMs,
       domain: DnsService.normalize(this.domain),
@@ -1220,7 +1255,7 @@ struct Index {
 
       // 状态文字 + 进度条放在按钮下方
       Row({ space: 10 }) {
-        Text(this.total > 0 ? (this.done.toString() + '/' + this.total.toString()) : '就绪')
+        Text(this.progressLabel())
           .fontSize(12)
           .fontColor(this.txt3())
           .flexShrink(0)
@@ -2206,6 +2241,40 @@ struct Index {
     .height('100%')
   }
   /** 运行 IPv6 网络诊断（设置页「网络诊断」卡片触发） */
+  /** IPv4 自检 */
+  async runIpv4Diag(): Promise<void> {
+    if (this.diagBusy) {
+      return;
+    }
+    this.diagBusy = true;
+    this.diagText = '正在诊断 IPv4，请稍候…';
+    try {
+      const text: string = await Diag.runV4();
+      this.diagText = text;
+      this.addLog('IPv4 网络诊断完成');
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      this.diagText = '诊断失败：' + (err.message !== undefined ? err.message : '未知错误');
+    } finally {
+      this.diagBusy = false;
+    }
+  }
+
+  /** 复制诊断结果到剪贴板 */
+  copyDiag(): void {
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.diagText);
+      pasteboard.getSystemPasteboard().setData(data).then(() => {
+        this.toast('诊断结果已复制');
+      }).catch((e: BusinessError) => {
+        this.toast('复制失败：' + e.message);
+      });
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      this.toast('复制失败：' + err.message);
+    }
+  }
+
   async runIpv6Diag(): Promise<void> {
     if (this.diagBusy) {
       return;
@@ -2547,24 +2616,24 @@ struct Index {
             this.latencyText = v;
             this.scheduleScanSave();
           })
-      }
-      .width('100%')
-      .margin({ top: 8 })
-      Row() {
-        Text(this.latencyHint)
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .layoutWeight(1)
         Text('应用建议')
-          .fontSize(11)
+          .fontSize(12)
           .fontColor(this.accent())
-          .padding({ left: 8, right: 2, top: 4, bottom: 4 })
+          .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+          .backgroundColor(this.soft())
+          .borderRadius(9)
+          .margin({ left: 8 })
           .onClick(() => {
             this.applySuggestedParams();
           })
       }
       .width('100%')
-      .margin({ top: 6 })
+      .margin({ top: 8 })
+      Text(this.latencyHint)
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 6 })
       this.FieldRow('Ping 次数', this.pingText, (v: string) => {
         this.pingText = v;
         this.scheduleScanSave();
@@ -2574,6 +2643,31 @@ struct Index {
         .fontSize(11)
         .fontColor(this.txt3())
         .margin({ top: 8 })
+        Row() {
+          Text('合格速度 MB/s')
+            .fontSize(13)
+            .fontColor(this.txt2())
+            .width(110)
+          TextInput({ text: this.minSpeedText })
+            .layoutWeight(1)
+            .height(40)
+            .fontSize(13)
+            .fontColor(this.txt())
+            .backgroundColor(this.inputBg())
+            .borderRadius(10)
+            .onChange((v: string) => {
+              this.minSpeedText = v;
+              this.scheduleScanSave();
+            })
+        }
+        .width('100%')
+        .margin({ top: 8 })
+
+        Text('测速结果低于该速度的直接淘汰（默认 0.1 MB/s，0 = 不淘汰）；只影响测速结果、导出与上传，不影响测速本身耗时。')
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .margin({ top: 8 })
+
     }
     .width('100%')
     .padding(16)
@@ -3194,7 +3288,18 @@ struct Index {
         .fontColor(this.txt3())
         .lineHeight(16)
         .margin({ top: 8 })
-      Row() {
+      Row({ space: 10 }) {
+        Text(this.diagBusy ? '诊断中…' : '运行 IPv4 自检')
+          .fontSize(13)
+          .fontColor(this.diagBusy ? this.txt3() : this.accent())
+          .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+          .backgroundColor(this.soft())
+          .borderRadius(9)
+          .onClick(() => {
+            if (!this.diagBusy) {
+              this.runIpv4Diag();
+            }
+          })
         Text(this.diagBusy ? '诊断中…' : '运行 IPv6 自检')
           .fontSize(13)
           .fontColor(this.diagBusy ? this.txt3() : this.accent())
@@ -3207,20 +3312,35 @@ struct Index {
             }
           })
         Blank()
-        if (this.diagText.length > 0) {
+      }
+      .width('100%')
+      .margin({ top: 12 })
+
+      if (this.diagText.length > 0) {
+        Row({ space: 10 }) {
+          Text('复制结果')
+            .fontSize(12)
+            .fontColor(this.accent())
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+            .backgroundColor(this.soft())
+            .borderRadius(8)
+            .onClick(() => {
+              this.copyDiag();
+            })
           Text('清空')
             .fontSize(12)
             .fontColor(this.txt3())
-            .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .backgroundColor(this.soft())
             .borderRadius(8)
             .onClick(() => {
               this.diagText = '';
             })
+          Blank()
         }
+        .width('100%')
+        .margin({ top: 8 })
       }
-      .width('100%')
-      .margin({ top: 12 })
 
       if (this.diagText.length > 0) {
         Scroll() {
@@ -3230,6 +3350,7 @@ struct Index {
             .lineHeight(15)
             .width('100%')
             .textAlign(TextAlign.Start)
+            .copyOption(CopyOptions.LocalDevice)
         }
         .width('100%')
         .height(230)
@@ -3263,10 +3384,10 @@ struct Index {
               .layoutWeight(1)
               Column({ space: 14 }) {
                 this.CardAppearanceBackground()
+                this.CardAppearanceMaterial()
               }
               .layoutWeight(1)
               Column({ space: 14 }) {
-                this.CardAppearanceMaterial()
                 this.CardAbout()
                 this.CardDiag()
               }
@@ -3506,13 +3627,20 @@ struct Index {
           .fontSize(13)
           .fontColor(this.txt2())
           .width(90)
-        Row({ space: 8 }) {
-          this.EtTopChip('全部', 0)
-          this.EtTopChip('前3', 3)
-          this.EtTopChip('前5', 5)
-          this.EtTopChip('前10', 10)
-        }
-        .layoutWeight(1)
+        TextInput({ text: this.etTopNText, placeholder: '3' })
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .fontColor(this.txt())
+          .backgroundColor(this.soft())
+          .borderRadius(10)
+          .type(InputType.Number)
+          .onChange((v: string) => {
+            this.etTopNText = v;
+            const n: number = this.intOf(v, 0);
+            this.etTopN = Math.max(0, Math.min(999, n));
+            this.saveEtConfig();
+          })
       }
       .width('100%')
       .margin({ top: 10 })
@@ -3889,7 +4017,7 @@ struct Index {
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .layoutWeight(1)
-              Text(this.total > 0 ? (this.done.toString() + '/' + this.total.toString()) : '就绪')
+              Text(this.progressLabel())
                 .fontSize(12)
                 .fontColor(this.txt3())
             }
@@ -3999,13 +4127,13 @@ struct Index {
     if (this.speedScope === SpeedScope.PER_REGION) {
       return n > 0
         ? '当前「全部地区」测速：每个地区最多上传排序最靠前的 ' + n.toString()
-          + ' 个；默认「全部」。只影响上传，不影响测速和结果列表。'
+          + ' 个（默认 3，0=全部）。只影响上传，不影响测速和结果列表。'
         : '当前「全部地区」测速：不限制上传数量（「全部」）。只影响上传，不影响测速和结果列表。';
     }
     const scopeName: string = this.speedScope === SpeedScope.REGION ? '地区测速' : '完全测速';
     return n > 0
       ? '当前「' + scopeName + '」：所有地区合计最多上传排序最靠前的 ' + n.toString()
-        + ' 个；默认「全部」。只影响上传，不影响测速和结果列表。'
+        + ' 个（默认 3，0=全部）。只影响上传，不影响测速和结果列表。'
       : '当前「' + scopeName + '」：不限制上传数量（「全部」）。只影响上传，不影响测速和结果列表。';
   }
 
@@ -4144,6 +4272,7 @@ struct Index {
     this.etCfNamespace = cfg.cfNamespaceId;
     this.etCfToken = cfg.cfApiToken;
     this.etTopN = cfg.topN;
+    this.etTopNText = cfg.topN.toString();
   }
 
   /**
@@ -4280,7 +4409,12 @@ struct Index {
         ping.push(c);
       }
       if (c.stage === Stage.SPEED) {
-        speed.push(c);
+        // 合格速度：低于门槛的测速结果直接剔除（失败的仍保留以说明原因）
+        if (c.verdict === Verdict.SPEEDED && c.speedMbps < this.minSpeedValue()) {
+          // 淘汰，不进入结果列表
+        } else {
+          speed.push(c);
+        }
       }
     }
     ping.sort((a: Candidate, b: Candidate) => Ranker.delayOf(a) - Ranker.delayOf(b));
