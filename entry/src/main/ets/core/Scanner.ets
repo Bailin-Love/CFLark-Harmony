@@ -517,7 +517,57 @@ export class Scanner {
       cap = Math.min(Math.max(1, cfg.speedCount), pool.length);
       hooks.onLog('按延迟从低到高，只测前 ' + cap.toString() + ' 个地址');
     }
-    const targets: Candidate[] = pool.slice(0, cap);
+    let targets: Candidate[] = pool.slice(0, cap);
+    // 「合格速度」预检：正式下载测速之前，先用小窗口/小流量快速估速，
+    // 低于门槛的节点直接拦在测速之外（不进入测速页面、不计入结果）。
+    if (cfg.minSpeedMbps > 0 && targets.length > 0) {
+      const probeWindow: number = Math.min(800, Math.max(300, Math.floor(cfg.speedWindowMs / 3)));
+      const probeConc: number = Math.min(4, Math.max(1, cfg.speedConcurrency));
+      hooks.onPhase(3, '测速前预检（合格速度 ' + cfg.minSpeedMbps.toString() + ' MB/s）');
+      hooks.onLog('测速前预检：' + targets.length.toString() + ' 个候选，单次窗口 ' +
+        probeWindow.toString() + 'ms，合格速度 ' + cfg.minSpeedMbps.toString() + ' MB/s');
+      const keep: boolean[] = [];
+      for (let i = 0; i < targets.length; i++) {
+        keep.push(true);
+      }
+      let dropped: number = 0;
+      await Scanner.pool<void>(targets.length, probeConc, token, async (index: number): Promise<void> => {
+        if (token.isCancelled()) {
+          return;
+        }
+        const c: Candidate = targets[index];
+        const pt: SpeedTarget = {
+          ip: c.ip,
+          port: c.port,
+          host: DEFAULT_TRACE_HOST,
+          url: 'https://' + DEFAULT_TRACE_HOST + SPEED_PATH,
+          timeoutMs: Math.min(cfg.traceTimeoutMs, 3000),
+          windowMs: probeWindow,
+          maxBytes: 2 * 1024 * 1024
+        };
+        const r = await SpeedTest.run(pt);
+        if (r.ok && r.avgMbps >= cfg.minSpeedMbps) {
+          c.speedMbps = r.avgMbps;
+        } else {
+          keep[index] = false;
+          dropped++;
+        }
+      });
+      const filtered: Candidate[] = [];
+      for (let i = 0; i < targets.length; i++) {
+        if (keep[i]) {
+          filtered.push(targets[i]);
+        }
+      }
+      hooks.onLog('预检完成：淘汰 ' + dropped.toString() + ' 个低于合格速度的节点，进入正式测速 ' +
+        filtered.length.toString() + ' 个');
+      targets = filtered;
+      if (targets.length === 0) {
+        hooks.onPhase(4, '完成');
+        hooks.onLog('测速前预检后没有剩余节点，跳过正式测速');
+        return;
+      }
+    }
     hooks.onSpeedInit(targets);
     // 下载测速固定走 speed.cloudflare.com 的 /__down 端点：用户自己的域名一般没有这个路径，
     // 绑上去只会 404，表现就是「只显示延迟、没有 MB/s」。域名只用于可用性校验，不参与测速下载。
