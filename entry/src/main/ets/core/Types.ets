@@ -217,6 +217,8 @@ export interface ScanConfig {
   speedConcurrency: number;
   /** 测速间隔（ms） */
   speedGapMs: number;
+  /** 合格速度（MB/s）：测速结果低于该值会被淘汰，0 = 不淘汰 */
+  minSpeedMbps: number;
 
   /** 测速阶段使用的域名（Host / SNI）；留空则用 traceHost */
   domain: string;
