@@ -22,6 +22,7 @@ import { Exporter, ExportFormat, defaultExportOptions } from '../core/Exporter';
 import { Geo } from '../core/Geo';
 import { DnsService } from '../core/DnsService';
 import { FileSaver } from '../core/FileSaver';
+import { Diag } from '../core/Diag';
 import { picker } from '@kit.CoreFileKit';
 import { connection, http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
@@ -134,8 +135,11 @@ struct Index {
   @State port: number = 443;
   @State customText: string = '';
   @State sampleText: string = '2000';
+  @State cfgRev: number = 0;
   @State concurrencyText: string = defaultScanConcurrency().toString();
   @State latencyText: string = '220';
+  /** 延迟上限建议提示（随 IPv4/IPv6 变化） */
+  @State latencyHint: string = '建议：IPv4 延迟上限 220ms（CloudFlareScan 默认）';
   @State bgPath: string = '';
   /** 底部胶囊拖动时的指尖 x（-1 表示未触摸） */
   @State pingText: string = '2';
@@ -152,7 +156,10 @@ struct Index {
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
-  @State appVersion: string = '1.3.5';
+  @State appVersion: string = '1.3.6';
+  /** IPv6 网络诊断：运行状态与结果文本 */
+  @State diagBusy: boolean = false;
+  @State diagText: string = '';
 
   // ---------- edgetunnel 订阅上传 ----------
   @State etEnabled: boolean = false;
@@ -178,6 +185,8 @@ struct Index {
   @State etTopN: number = 0;
 
   private token: CancellationToken = new CancellationToken();
+  /** 扫描参数持久化防抖计时器 */
+  private scanSaveTimer: number = -1;
   /** 首帧展开动画是否已播放（保证只播一次） */
   private entranceDone: boolean = false;
   /** 网络提示定时器句柄，-1 表示无待执行任务 */
@@ -415,6 +424,9 @@ struct Index {
     this.speedPerRegionText = c.speedPerRegion.toString();
     this.domain = c.domain;
     this.regionCode = c.regionCode;
+    this.latencyHint = this.ipVersion === IpVersion.V6
+      ? '建议：IPv6 延迟上限 1500ms（可达地址 RTT 常在 1000ms+；IPv6 超时自动使用 3000ms）'
+      : '建议：IPv4 延迟上限 220ms（CloudFlareScan 默认）';
     this.bgPath = ConfigStore.bgPath();
   }
 
@@ -473,8 +485,8 @@ struct Index {
       customText: this.customText,
       pingTimes: Math.max(1, Math.min(5, this.intOf(this.pingText, d.pingTimes))),
       pingIntervalMs: d.pingIntervalMs,
-      pingTimeoutMs: d.pingTimeoutMs,
-      latencyLimitMs: Math.max(50, Math.min(1000, this.intOf(this.latencyText, d.latencyLimitMs))),
+      pingTimeoutMs: this.ipVersion === IpVersion.V6 ? 3000 : d.pingTimeoutMs,
+      latencyLimitMs: Math.max(50, Math.min(3000, this.intOf(this.latencyText, d.latencyLimitMs))),
       scanConcurrency: Math.max(1, Math.min(maxScanConcurrency(), this.intOf(this.concurrencyText, d.scanConcurrency))),
       traceHost: d.traceHost,
       tracePath: d.tracePath,
@@ -496,6 +508,46 @@ struct Index {
       resultLimit: d.resultLimit
     };
     return c;
+  }
+
+  /** 参数变更后稍后持久化，避免每次输入都写盘 */
+  private scheduleScanSave(): void {
+    if (this.scanSaveTimer >= 0) {
+      clearTimeout(this.scanSaveTimer);
+    }
+    this.scanSaveTimer = setTimeout(() => {
+      this.scanSaveTimer = -1;
+      ConfigStore.save(this.buildConfig());
+    }, 500);
+  }
+
+  /** 切换 IPv4/IPv6 时更新建议值；若当前仍是另一协议的默认值，则自动跟随 */
+  private maybeAutoSuggest(v6: boolean): void {
+    this.latencyHint = v6
+      ? '建议：IPv6 延迟上限 1500ms（可达地址 RTT 常在 1000ms+；IPv6 超时自动使用 3000ms）'
+      : '建议：IPv4 延迟上限 220ms（CloudFlareScan 默认）';
+    const cur: number = this.intOf(this.latencyText, -1);
+    if (v6 && (cur === 220 || cur <= 0)) {
+      this.latencyText = '1500';
+      this.cfgRev++;
+    } else if (!v6 && cur === 1500) {
+      this.latencyText = '220';
+      this.cfgRev++;
+    }
+    this.scheduleScanSave();
+  }
+
+  /** 一键应用当前 IP 版本的建议参数 */
+  private applySuggestedParams(): void {
+    const v6: boolean = this.ipVersion === IpVersion.V6;
+    this.sampleText = v6 ? '3000' : '2000';
+    this.cfgRev++;
+    this.concurrencyText = defaultScanConcurrency().toString();
+    this.latencyText = v6 ? '1500' : '220';
+    this.scheduleScanSave();
+    this.toast(v6
+      ? '已应用 IPv6 建议参数：采样 3000、并发 16、延迟上限 1500ms、超时 3000ms'
+      : '已应用 IPv4 建议参数：采样 2000、并发 16、延迟上限 220ms');
   }
 
   /** 滚动回调：只在跨越阈值时改 @State，避免滚动过程中每帧重建整个页面 */
@@ -2153,6 +2205,25 @@ struct Index {
     .width('100%')
     .height('100%')
   }
+  /** 运行 IPv6 网络诊断（设置页「网络诊断」卡片触发） */
+  async runIpv6Diag(): Promise<void> {
+    if (this.diagBusy) {
+      return;
+    }
+    this.diagBusy = true;
+    this.diagText = '正在诊断，请稍候…';
+    try {
+      const text: string = await Diag.run();
+      this.diagText = text;
+      this.addLog('IPv6 网络诊断完成，详情见「设置 → 网络诊断」');
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      this.diagText = '诊断失败：' + (err.message !== undefined ? err.message : '未知错误');
+    } finally {
+      this.diagBusy = false;
+    }
+  }
+
   @Builder CardTitle(title: string, icon: Resource) {
     Row() {
       SymbolGlyph(icon)
@@ -2175,6 +2246,7 @@ struct Index {
         .fontColor(this.txt2())
         .width(110)
       TextInput({ text: value })
+        .id('fr-' + label + '-' + this.cfgRev.toString())
         .layoutWeight(1)
         .height(40)
         .fontSize(13)
@@ -2261,6 +2333,7 @@ struct Index {
             .borderRadius(9)
             .onClick(() => {
               this.mode = ScanMode.OFFICIAL;
+              this.scheduleScanSave();
             })
           Text('自定义')
             .fontSize(12)
@@ -2273,6 +2346,7 @@ struct Index {
             .margin({ left: 6 })
             .onClick(() => {
               this.mode = ScanMode.CUSTOM;
+              this.scheduleScanSave();
             })
         }
         .layoutWeight(1)
@@ -2296,6 +2370,7 @@ struct Index {
             .borderRadius(9)
             .onClick(() => {
               this.ipVersion = IpVersion.V4;
+              this.maybeAutoSuggest(false);
             })
           Text('IPv6')
             .fontSize(12)
@@ -2308,6 +2383,7 @@ struct Index {
             .margin({ left: 6 })
             .onClick(() => {
               this.ipVersion = IpVersion.V6;
+              this.maybeAutoSuggest(true);
             })
         }
         .layoutWeight(1)
@@ -2342,6 +2418,7 @@ struct Index {
           .placeholderColor(this.txt3())
           .onChange((v: string) => {
             this.customText = v;
+            this.scheduleScanSave();
           })
       }
     }
@@ -2371,6 +2448,7 @@ struct Index {
             .margin({ right: index === PORT_OPTIONS.length - 1 ? 0 : 5 })
             .onClick(() => {
               this.port = p;
+              this.scheduleScanSave();
             })
         }, (p: number, index: number) => p.toString())
       }
@@ -2394,15 +2472,37 @@ struct Index {
   @Builder CardParam() {
     Column() {
       this.CardTitle('快速筛选参数', $r('sys.symbol.line_3_horizontal'))
-      this.FieldRow('采样数', this.sampleText, (v: string) => {
-        this.sampleText = v;
-      })
+      Row() {
+        Text('采样数')
+          .fontSize(13)
+          .fontColor(this.txt2())
+          .width(110)
+        TextInput({ text: this.sampleText })
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .fontColor(this.txt())
+          .backgroundColor(this.inputBg())
+          .borderRadius(10)
+          .type(InputType.Number)
+          .onChange((v: string) => {
+            this.sampleText = v;
+            this.scheduleScanSave();
+          })
+      }
+      .width('100%')
+      .margin({ top: 8 })
+      Text('建议：IPv4 2000；IPv6 随机地址命中率低，建议 3000~5000，或改用域名 AAAA 采样。')
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .margin({ top: 6 })
       Row() {
         Text('并发线程')
           .fontSize(13)
           .fontColor(this.txt2())
           .width(110)
         TextInput({ text: this.concurrencyText })
+          .id('conc-' + this.cfgRev.toString())
           .layoutWeight(1)
           .height(40)
           .fontSize(13)
@@ -2419,6 +2519,7 @@ struct Index {
             } else {
               this.concurrencyText = v;
             }
+            this.scheduleScanSave();
           })
       }
       .width('100%')
@@ -2429,14 +2530,47 @@ struct Index {
         .fontSize(11)
         .fontColor(this.txt3())
         .margin({ top: 6 })
-      this.FieldRow('延迟上限 ms', this.latencyText, (v: string) => {
-        this.latencyText = v;
-      })
+      Row() {
+        Text('延迟上限 ms')
+          .fontSize(13)
+          .fontColor(this.txt2())
+          .width(110)
+        TextInput({ text: this.latencyText })
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .fontColor(this.txt())
+          .backgroundColor(this.inputBg())
+          .borderRadius(10)
+          .type(InputType.Number)
+          .onChange((v: string) => {
+            this.latencyText = v;
+            this.scheduleScanSave();
+          })
+      }
+      .width('100%')
+      .margin({ top: 8 })
+      Row() {
+        Text(this.latencyHint)
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .layoutWeight(1)
+        Text('应用建议')
+          .fontSize(11)
+          .fontColor(this.accent())
+          .padding({ left: 8, right: 2, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.applySuggestedParams();
+          })
+      }
+      .width('100%')
+      .margin({ top: 6 })
       this.FieldRow('Ping 次数', this.pingText, (v: string) => {
         this.pingText = v;
+        this.scheduleScanSave();
       })
       Text('每个 IP 连 ' + this.pingText + ' 次 TCP 取最小值；最小值超过 ' + this.latencyText +
-        'ms 的直接淘汰。参考 CloudFlareScan：ping 2 次、上限 220ms。')
+        'ms 的直接淘汰。IPv4 参考 CloudFlareScan（2 次、220ms）；IPv6 建议延迟上限 1500ms、超时自动 3000ms。')
         .fontSize(11)
         .fontColor(this.txt3())
         .margin({ top: 8 })
@@ -2463,6 +2597,7 @@ struct Index {
           .selectedColor(this.accent())
           .onChange((on: boolean) => {
             this.enableSpeed = on;
+            this.scheduleScanSave();
           })
       }
       .width('100%')
@@ -2485,6 +2620,7 @@ struct Index {
             .borderRadius(9)
             .onClick(() => {
               this.speedScope = SpeedScope.ALL;
+              this.scheduleScanSave();
             })
           Text('地区测速')
             .fontSize(12)
@@ -2497,6 +2633,7 @@ struct Index {
             .margin({ left: 6 })
             .onClick(() => {
               this.speedScope = SpeedScope.REGION;
+              this.scheduleScanSave();
             })
           Text('全部地区')
             .fontSize(12)
@@ -2509,6 +2646,7 @@ struct Index {
             .margin({ left: 6 })
             .onClick(() => {
               this.speedScope = SpeedScope.PER_REGION;
+              this.scheduleScanSave();
             })
         }
         .width('100%')
@@ -2517,6 +2655,7 @@ struct Index {
         if (this.speedScope === SpeedScope.ALL) {
           this.FieldRow('测速地址数', this.speedCountText, (v: string) => {
             this.speedCountText = v;
+            this.scheduleScanSave();
           })
           Text('第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 3，范围 1~99）；上传数量可在「设置 → 订阅上传」里限制。')
             .fontSize(11)
@@ -2527,6 +2666,7 @@ struct Index {
         if (this.speedScope === SpeedScope.REGION) {
           this.FieldRow('测速地址数', this.speedCountText, (v: string) => {
             this.speedCountText = v;
+            this.scheduleScanSave();
           })
           Row() {
             Text('地区码')
@@ -2543,6 +2683,7 @@ struct Index {
               .placeholderColor(this.txt3())
               .onChange((v: string) => {
                 this.regionCode = v;
+                this.scheduleScanSave();
               })
           }
           .width('100%')
@@ -2556,6 +2697,7 @@ struct Index {
         if (this.speedScope === SpeedScope.PER_REGION) {
           this.FieldRow('每地区数量', this.speedPerRegionText, (v: string) => {
             this.speedPerRegionText = v;
+            this.scheduleScanSave();
           })
           Text('按 colo 分组，每个地区各取延迟最低的前几个测速，覆盖所有地区。')
             .fontSize(11)
@@ -2577,6 +2719,7 @@ struct Index {
             .borderRadius(10)
             .onChange((v: string) => {
               this.speedRoundsText = v;
+              this.scheduleScanSave();
             })
         }
         .width('100%')
@@ -2596,6 +2739,7 @@ struct Index {
             .borderRadius(10)
             .onChange((v: string) => {
               this.speedWindowText = v;
+              this.scheduleScanSave();
             })
         }
         .width('100%')
@@ -2625,6 +2769,7 @@ struct Index {
           .placeholderColor(this.txt3())
           .onChange((v: string) => {
             this.domain = v;
+            this.scheduleScanSave();
           })
       }
       .width('100%')
@@ -3041,6 +3186,71 @@ struct Index {
     .margin({ bottom: 12 })
   }
 
+  @Builder CardDiag() {
+    Column() {
+      this.CardTitle('网络诊断', $r('sys.symbol.info_circle'))
+      Text('用于区分「应用 Socket 问题 / 运营商路由问题 / 随机地址不可达 / 超时过短 / 延迟门槛过严」。自检固定使用 3000ms 超时、顺序执行，不会修改扫描配置。')
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .lineHeight(16)
+        .margin({ top: 8 })
+      Row() {
+        Text(this.diagBusy ? '诊断中…' : '运行 IPv6 自检')
+          .fontSize(13)
+          .fontColor(this.diagBusy ? this.txt3() : this.accent())
+          .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+          .backgroundColor(this.soft())
+          .borderRadius(9)
+          .onClick(() => {
+            if (!this.diagBusy) {
+              this.runIpv6Diag();
+            }
+          })
+        Blank()
+        if (this.diagText.length > 0) {
+          Text('清空')
+            .fontSize(12)
+            .fontColor(this.txt3())
+            .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+            .backgroundColor(this.soft())
+            .borderRadius(8)
+            .onClick(() => {
+              this.diagText = '';
+            })
+        }
+      }
+      .width('100%')
+      .margin({ top: 12 })
+
+      if (this.diagText.length > 0) {
+        Scroll() {
+          Text(this.diagText)
+            .fontSize(10)
+            .fontColor(this.txt2())
+            .lineHeight(15)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+        }
+        .width('100%')
+        .height(230)
+        .margin({ top: 10 })
+        .padding(10)
+        .backgroundColor(this.soft())
+        .borderRadius(10)
+        .scrollBar(BarState.Auto)
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(16)
+    .backgroundBlurStyle(this.cardBlurStyle(), { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+  }
+
   @Builder SettingsPage() {
     Column() {
       Scroll(this.settingsScroller) {
@@ -3058,6 +3268,7 @@ struct Index {
               Column({ space: 14 }) {
                 this.CardAppearanceMaterial()
                 this.CardAbout()
+                this.CardDiag()
               }
               .layoutWeight(1)
             }
@@ -3069,6 +3280,7 @@ struct Index {
               this.CardAppearanceMaterial()
               this.CardAppearanceBackground()
               this.CardAbout()
+              this.CardDiag()
             }
             .width('100%')
           }
