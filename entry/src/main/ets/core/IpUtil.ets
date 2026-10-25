@@ -111,63 +111,197 @@ export class IpUtil {
     return out;
   }
 
-  /** 在 IPv6 CIDR 内随机采样 n 个地址（保留前缀，随机后 64 位） */
+  /** 在 IPv6 CIDR 内随机采样 n 个地址（严格保留前缀位，只随机前缀之后的位） */
   static sampleV6(cidr: string, n: number): string[] {
-    const idx: number = cidr.indexOf('/');
-    const base: string = idx >= 0 ? cidr.substring(0, idx) : cidr;
-    const prefix: number = idx >= 0 ? Number(cidr.substring(idx + 1)) : 128;
-    // 只处理 /32 及以内的常见 CF 段
-    const groups: string[] = IpUtil.expandV6(base);
+    const base: number[] = IpUtil.cidrV6ToBytes(cidr);
+    const prefix: number = IpUtil.cidrV6Prefix(cidr);
     const out: string[] = [];
+    if (base.length !== 16 || prefix < 0) {
+      return out;
+    }
     for (let i = 0; i < n; i++) {
-      const g: string[] = groups.slice(0);
-      const suffixGroups: number = Math.floor((128 - prefix) / 16);
-      for (let k = 0; k < suffixGroups; k++) {
-        const pos: number = 7 - k;
-        if (pos >= 0) {
-          g[pos] = IpUtil.randHex16();
+      const b: number[] = base.slice(0);
+      for (let bi = 0; bi < 16; bi++) {
+        const start: number = bi * 8;
+        if (start >= prefix) {
+          b[bi] = Math.floor(Math.random() * 256);
+        } else if (start + 8 > prefix) {
+          const keep: number = prefix - start;
+          const mask: number = (0xFF << (8 - keep)) & 0xFF;
+          b[bi] = (b[bi] & mask) | (Math.floor(Math.random() * 256) & (0xFF ^ mask));
         }
       }
-      out.push(g.join(':'));
+      out.push(IpUtil.bytesToV6(b));
     }
     return out;
   }
 
-  /** 把 IPv6 简写展开为 8 组 */
-  static expandV6(ip: string): string[] {
-    const parts: string[] = ip.split(':');
-    const out: string[] = [];
-    let emptyIdx: number = -1;
-    for (let i = 0; i < parts.length; i++) {
-      if (parts[i] === '') {
-        emptyIdx = i;
-        break;
+  /** IPv6 文本 -> 16 字节数组（非法返回空数组） */
+  static ipv6ToBytes(s: string): number[] {
+    const groups: string[] = IpUtil.expandV6(s);
+    if (groups.length !== 8) {
+      return [];
+    }
+    const out: number[] = [];
+    for (let i = 0; i < 8; i++) {
+      const v: number = parseInt(groups[i], 16);
+      if (isNaN(v) || v < 0 || v > 0xFFFF) {
+        return [];
+      }
+      out.push((v >> 8) & 0xFF);
+      out.push(v & 0xFF);
+    }
+    return out;
+  }
+
+  /** 16 字节数组 -> IPv6 文本 */
+  static bytesToV6(b: number[]): string {
+    if (b.length !== 16) {
+      return '';
+    }
+    const groups: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const v: number = ((b[i * 2] & 0xFF) << 8) | (b[i * 2 + 1] & 0xFF);
+      groups.push(v.toString(16));
+    }
+    return groups.join(':');
+  }
+
+  /** IPv6 CIDR 的基础地址字节 */
+  static cidrV6ToBytes(cidr: string): number[] {
+    const idx: number = cidr.indexOf('/');
+    const base: string = idx >= 0 ? cidr.substring(0, idx) : cidr;
+    return IpUtil.ipv6ToBytes(base);
+  }
+
+  /** IPv6 CIDR 的前缀长度；非法返回 -1 */
+  static cidrV6Prefix(cidr: string): number {
+    const idx: number = cidr.indexOf('/');
+    const p: number = idx >= 0 ? Number(cidr.substring(idx + 1)) : 128;
+    if (isNaN(p) || p < 0 || p > 128) {
+      return -1;
+    }
+    return p;
+  }
+
+  /** 按前缀比较两个 IPv6 字节数组 */
+  static prefixEqualV6(a: number[], b: number[], prefix: number): boolean {
+    const full: number = Math.floor(prefix / 8);
+    for (let i = 0; i < full; i++) {
+      if (a[i] !== b[i]) {
+        return false;
       }
     }
-    if (emptyIdx >= 0) {
-      const head: string[] = parts.slice(0, emptyIdx);
-      const tail: string[] = parts.slice(emptyIdx + 1);
+    const rem: number = prefix % 8;
+    if (rem === 0) {
+      return true;
+    }
+    const mask: number = (0xFF << (8 - rem)) & 0xFF;
+    return (a[full] & mask) === (b[full] & mask);
+  }
+
+  /** IPv6 是否落在指定 CIDR 内（按真实前缀位比较，支持 /29 等非字节对齐前缀） */
+  static inCidrV6(ip: string, cidr: string): boolean {
+    const a: number[] = IpUtil.ipv6ToBytes(ip);
+    const b: number[] = IpUtil.cidrV6ToBytes(cidr);
+    const prefix: number = IpUtil.cidrV6Prefix(cidr);
+    if (a.length !== 16 || b.length !== 16 || prefix < 0) {
+      return false;
+    }
+    return IpUtil.prefixEqualV6(a, b, prefix);
+  }
+
+  /** IPv6 CIDR 的最后一个地址字节（用于边界测试） */
+  static cidrV6Last(cidr: string): number[] {
+    const b: number[] = IpUtil.cidrV6ToBytes(cidr);
+    const prefix: number = IpUtil.cidrV6Prefix(cidr);
+    if (b.length !== 16 || prefix < 0) {
+      return [];
+    }
+    for (let bi = 0; bi < 16; bi++) {
+      const start: number = bi * 8;
+      if (start >= prefix) {
+        b[bi] = 0xFF;
+      } else if (start + 8 > prefix) {
+        const keep: number = prefix - start;
+        const mask: number = (0xFF << (8 - keep)) & 0xFF;
+        b[bi] = (b[bi] & mask) | (0xFF ^ mask);
+      }
+    }
+    return b;
+  }
+
+  /** 采样/前缀自检：返回可直接打印的检查行（不依赖网络） */
+  static selfCheckV6(): string[] {
+    const lines: string[] = [];
+    const cases: string[] = ['2400:cb00::/32', '2606:4700::/32', '2a06:98c0::/29'];
+    for (let i = 0; i < cases.length; i++) {
+      const cidr: string = cases[i];
+      const base: number[] = IpUtil.cidrV6ToBytes(cidr);
+      const prefix: number = IpUtil.cidrV6Prefix(cidr);
+      if (base.length !== 16 || prefix < 0) {
+        lines.push('[采样自检] ' + cidr + ' 解析失败 FAIL');
+        continue;
+      }
+      const baseText: string = IpUtil.bytesToV6(base);
+      const samples: string[] = IpUtil.sampleV6(cidr, 20);
+      let bad: number = 0;
+      for (let k = 0; k < samples.length; k++) {
+        if (!IpUtil.inCidrV6(samples[k], cidr)) {
+          bad++;
+        }
+      }
+      const last: number[] = IpUtil.cidrV6Last(cidr);
+      const lastText: string = IpUtil.bytesToV6(last);
+      lines.push('[采样自检] ' + cidr + ' prefix=' + prefix.toString() + ' base=' + baseText +
+        ' baseInCidr=' + IpUtil.inCidrV6(baseText, cidr).toString() + ' 样本越界=' + bad.toString() +
+        ' last=' + lastText + ' lastInCidr=' + IpUtil.inCidrV6(lastText, cidr).toString() +
+        (bad === 0 && IpUtil.inCidrV6(baseText, cidr) && IpUtil.inCidrV6(lastText, cidr) ? ' PASS' : ' FAIL'));
+    }
+    const boundA: string = '2a06:98c7:ffff:ffff:ffff:ffff:ffff:ffff';
+    const boundB: string = '2a06:98c8::';
+    lines.push('[边界] ' + boundA + ' 属于 2a06:98c0::/29 = ' + IpUtil.inCidrV6(boundA, '2a06:98c0::/29').toString());
+    lines.push('[边界] ' + boundB + ' 属于 2a06:98c0::/29 = ' + IpUtil.inCidrV6(boundB, '2a06:98c0::/29').toString());
+    return lines;
+  }
+
+  /** 把 IPv6 简写展开为 8 组（正确处理开头/结尾/中间的 ::；不支持内嵌 IPv4） */
+  static expandV6(ip: string): string[] {
+    const s: string = ip.trim();
+    if (s.indexOf('.') >= 0) {
+      return [];
+    }
+    const out: string[] = [];
+    const dbl: number = s.indexOf('::');
+    if (dbl < 0) {
+      const all: string[] = s.split(':');
+      for (let i = 0; i < all.length; i++) {
+        out.push(all[i]);
+      }
+    } else {
+      const headText: string = s.substring(0, dbl);
+      const tailText: string = s.substring(dbl + 2);
+      const head: string[] = headText.length > 0 ? headText.split(':') : [];
+      const tail: string[] = tailText.length > 0 ? tailText.split(':') : [];
       for (let i = 0; i < head.length; i++) {
         out.push(head[i]);
       }
       const fill: number = 8 - head.length - tail.length;
+      if (fill < 0) {
+        return [];
+      }
       for (let i = 0; i < fill; i++) {
         out.push('0');
       }
       for (let i = 0; i < tail.length; i++) {
         out.push(tail[i]);
       }
-    } else {
-      for (let i = 0; i < parts.length; i++) {
-        out.push(parts[i]);
-      }
-      while (out.length < 8) {
-        out.push('0');
-      }
+    }
+    if (out.length !== 8) {
+      return [];
     }
     return out;
   }
-
   /** 随机 16 位十六进制串 */
   static randHex16(): string {
     let s: string = '';
@@ -192,14 +326,10 @@ export class IpUtil {
     return false;
   }
 
-  /** 判断 IPv6 是否落在 Cloudflare 官方段内（按前缀比较） */
+  /** 判断 IPv6 是否落在 Cloudflare 官方段内（按真实前缀位比较，支持 /29） */
   static isCfV6(ip: string): boolean {
-    const g: string[] = IpUtil.expandV6(ip);
     for (let i = 0; i < CF_IPV6_RANGES.length; i++) {
-      const idx: number = CF_IPV6_RANGES[i].indexOf('/');
-      const base: string = CF_IPV6_RANGES[i].substring(0, idx);
-      const bg: string[] = IpUtil.expandV6(base);
-      if (bg[0].toLowerCase() === g[0].toLowerCase() && bg[1].toLowerCase() === g[1].toLowerCase()) {
+      if (IpUtil.inCidrV6(ip, CF_IPV6_RANGES[i])) {
         return true;
       }
     }
@@ -239,3 +369,4 @@ export class IpUtil {
     return a;
   }
 }
+
