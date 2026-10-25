@@ -263,7 +263,7 @@ export class Scanner {
     });
   }
 
-  /** 阶段一：TCP 快速筛选 */
+  /** 阶段一：TCP 快速筛选（按真实结果分类统计，不把超时/错误混成「TCP 不通」） */
   static async stagePing(cfg: ScanConfig, list: Candidate[], hooks: ScanHooks,
     token: CancellationToken): Promise<Candidate[]> {
     hooks.onPhase(1, '第一阶段 · TCP 筛选 + 数据中心（TCP ' + cfg.pingTimes.toString() + ' 次，上限 ' +
@@ -271,7 +271,11 @@ export class Scanner {
     hooks.onLog('候选 IP 共 ' + list.length.toString() + ' 个，开始第一轮 TCP 延迟筛选');
     let done: number = 0;
     let passed: number = 0;
-    let failed: number = 0;
+    let overLimit: number = 0;
+    let timeouts: number = 0;
+    let otherErrors: number = 0;
+    let skipped: number = 0;
+    const errSamples: string[] = [];
     const keep: Candidate[] = [];
     // 延迟达标的 IP 立刻并行去要数据中心，最后统一收尾
     const coloTasks: Promise<void>[] = [];
@@ -280,18 +284,37 @@ export class Scanner {
       const c: Candidate = list[index];
       const pings: number[] = [];
       let recv: number = 0;
+      let timeoutCount: number = 0;
+      let errorCount: number = 0;
+      let lastCode: number = -1;
+      let lastMsg: string = '';
+      let lastStage: string = '';
+      let cancelled: boolean = false;
       for (let k = 0; k < cfg.pingTimes; k++) {
         if (token.isCancelled()) {
+          cancelled = true;
           break;
         }
         const r: TcpResult = await TcpProbe.pingOnce(c.ip, c.port, cfg.pingTimeoutMs);
+        lastStage = r.stage;
+        lastCode = r.rawErrorCode;
+        lastMsg = r.errorMessage;
         if (r.ok && r.rttMs > 0) {
           pings.push(r.rttMs);
           recv++;
+        } else if (r.stage === 'timeout') {
+          timeoutCount++;
+        } else {
+          errorCount++;
         }
         if (k < cfg.pingTimes - 1) {
           await Scanner.sleep(cfg.pingIntervalMs);
         }
+      }
+      if (cancelled) {
+        skipped++;
+        hooks.onSpeedTick(index, c, true);
+        return;
       }
       c.stage = Stage.PING;
       c.pingSent = cfg.pingTimes;
@@ -317,12 +340,22 @@ export class Scanner {
       }
       if (recv === 0) {
         c.verdict = Verdict.FAILED;
-        c.remark = 'TCP 不通';
-        failed++;
+        if (timeoutCount > 0 && errorCount === 0) {
+          c.remark = '连接超时';
+          timeouts++;
+        } else {
+          const codeText: string = lastCode >= 0 ? (' code=' + lastCode.toString()) : '';
+          const msgText: string = lastMsg.length > 0 ? (' ' + lastMsg) : '';
+          c.remark = '连接失败（' + lastStage + codeText + '）';
+          otherErrors++;
+          if (errSamples.length < 3) {
+            errSamples.push(c.ip + ' ' + lastStage + codeText + msgText);
+          }
+        }
       } else if (c.minLatencyMs >= cfg.latencyLimitMs) {
         c.verdict = Verdict.SLOW;
         c.remark = '延迟超限';
-        failed++;
+        overLimit++;
       } else {
         c.verdict = Verdict.PASS;
         passed++;
@@ -331,7 +364,7 @@ export class Scanner {
       hooks.onSpeedTick(index, c, true);
       done++;
       if (done % 10 === 0 || done === list.length) {
-        hooks.onProgress(done, list.length, passed, failed);
+        hooks.onProgress(done, list.length, passed, timeouts + otherErrors + overLimit);
       }
     });
 
@@ -340,16 +373,22 @@ export class Scanner {
     // 后面下载测速必然失败，效果未知，直接在第一阶段就排除，
     // 不让它进入「筛选」和「测速」两个界面。
     for (let i = 0; i < list.length; i++) {
-      if (list[i].stage === Stage.PING && list[i].verdict === Verdict.PASS &&
-        list[i].colo.length > 0) {
+      // 注意：fetchColo 成功后会把 stage 改成 COLO，所以这里不能再要求 stage === PING，
+      // 否则所有拿到 colo 的节点都会被漏掉（表现为「拿到 colo 0 个」）。
+      if (list[i].verdict === Verdict.PASS && list[i].colo.length > 0) {
         keep.push(list[i]);
       }
     }
-    let coloOk: number = keep.length;
+    const coloOk: number = keep.length;
     const dropped: number = passed - keep.length;
-    hooks.onLog('第一阶段完成：' + list.length.toString() + ' 个候选，通过 ' +
-      passed.toString() + ' 个，拿到 colo ' + coloOk.toString() + ' 个' +
+    hooks.onLog('第一阶段完成：候选 ' + list.length.toString() + ' 个；TCP 成功 ' + passed.toString() +
+      ' 个（延迟达标）；延迟超限 ' + overLimit.toString() + ' 个；连接超时 ' + timeouts.toString() +
+      ' 个；其他错误 ' + otherErrors.toString() + ' 个；取消/未执行 ' + skipped.toString() +
+      ' 个；最终通过 ' + keep.length.toString() + ' 个（拿到 colo ' + coloOk.toString() + ' 个）' +
       (dropped > 0 ? ('，排除 ' + dropped.toString() + ' 个无法完成 HTTPS 探测的') : ''));
+    if (errSamples.length > 0) {
+      hooks.onLog('连接错误示例：' + errSamples.join('；'));
+    }
     return keep;
   }
 
