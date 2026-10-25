@@ -307,6 +307,15 @@ export class Scanner {
         } else {
           errorCount++;
         }
+        // 第一次就超时：对不可达地址再试没有意义，直接放弃剩余重试，
+        // 第一轮耗时可近似减半（这是最常走的失败分支）。
+        if (r.stage === 'timeout') {
+          break;
+        }
+        // 第一次延迟已明显低于门槛（≤ 门槛 60%）：无需再重试，直接省一次连接
+        if (r.ok && r.rttMs > 0 && r.rttMs <= cfg.latencyLimitMs * 0.6) {
+          break;
+        }
         if (k < cfg.pingTimes - 1) {
           await Scanner.sleep(cfg.pingIntervalMs);
         }
@@ -317,7 +326,7 @@ export class Scanner {
         return;
       }
       c.stage = Stage.PING;
-      c.pingSent = cfg.pingTimes;
+      c.pingSent = recv + timeoutCount + errorCount;
       c.pingRecv = recv;
       c.lossRate = cfg.pingTimes > 0 ? (cfg.pingTimes - recv) / cfg.pingTimes : 1;
       if (recv > 0) {
