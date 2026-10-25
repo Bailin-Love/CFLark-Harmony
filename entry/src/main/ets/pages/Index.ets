@@ -143,7 +143,7 @@ struct Index {
   @State bgPath: string = '';
   /** 底部胶囊拖动时的指尖 x（-1 表示未触摸） */
   @State pingText: string = '2';
-  @State speedCountText: string = '3';
+  @State speedCountText: string = '10';
   @State speedRoundsText: string = '1';
   @State speedWindowText: string = '3000';
   /** 合格速度（MB/s），低于该值的测速结果会被淘汰，默认 0.1 */
@@ -748,11 +748,20 @@ struct Index {
       if (this.pingList.length === 0) {
         // 一个都没通过：明确告诉用户，而不是给一片空白
         const v6: boolean = c.ipVersion === IpVersion.V6;
+        const lowCount: number = list.filter((x: Candidate) => x.remark === '合格速度不达标').length;
         this.phaseText = v6 ? 'IPv6 无可用节点' : '没有可用节点';
         this.addLog(v6
-          ? '第一轮没有通过的节点。若当前网络不支持 IPv6，或该网段不可达，都会是这个结果。'
-          : '第一轮没有通过的节点。请检查网络连接，或调高「延迟上限」。');
-        this.toast(v6 ? '当前网络可能不支持 IPv6，未发现可用节点' : '没有可用节点，请检查网络或调高延迟上限');
+          ? (lowCount > 0
+            ? '第一轮没有通过的节点：其中 ' + lowCount.toString() +
+              ' 个因合格速度未达标被淘汰，可调低「合格速度」；若仍无结果，请检查网络是否支持 IPv6。'
+            : '第一轮没有通过的节点。若当前网络不支持 IPv6，或该网段不可达，都会是这个结果。')
+          : (lowCount > 0
+            ? '第一轮没有通过的节点：其中 ' + lowCount.toString() +
+              ' 个因合格速度未达标被淘汰，可调低「合格速度」或设为 0；其余请检查网络连接或调高「延迟上限」。'
+            : '第一轮没有通过的节点。请检查网络连接，或调高「延迟上限」。'));
+        this.toast(lowCount > 0
+          ? ('没有可用节点：' + lowCount.toString() + ' 个低于合格速度门槛')
+          : (v6 ? '当前网络可能不支持 IPv6，未发现可用节点' : '没有可用节点，请检查网络或调高延迟上限'));
         this.curTab = 1;
         return;
       }
@@ -2663,7 +2672,7 @@ struct Index {
         .width('100%')
         .margin({ top: 8 })
 
-        Text('低于该速度的节点会在正式测速前被淘汰（默认 0.1 MB/s，0 = 不淘汰）；预检使用小窗口快速估速，会增加少量首轮耗时。')
+        Text('低于该速度的节点会在第一轮 TCP 初筛后从延迟最低的开始逐个检测并淘汰，直到凑够「测速地址数」个达标节点；若大量节点都不达标会提前中止并提示检查网络（默认 0.1 MB/s，0 = 不淘汰）。')
           .fontSize(11)
           .fontColor(this.txt3())
           .margin({ top: 8 })
@@ -2751,7 +2760,7 @@ struct Index {
             this.speedCountText = v;
             this.scheduleScanSave();
           })
-          Text('第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 3，范围 1~99）；上传数量可在「设置 → 订阅上传」里限制。')
+          Text('第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 10，范围 1~99）；上传数量可在「设置 → 订阅上传」里限制。')
             .fontSize(11)
             .fontColor(this.txt3())
             .margin({ top: 8 })
@@ -2782,7 +2791,7 @@ struct Index {
           }
           .width('100%')
           .margin({ top: 8 })
-          Text('只测这个地区，同样按延迟从低到高取前 N 个（默认 3；HKG / LAX / NRT 这类三字码）。')
+          Text('只测这个地区，同样按延迟从低到高取前 N 个（默认 10；HKG / LAX / NRT 这类三字码）。')
             .fontSize(11)
             .fontColor(this.txt3())
             .margin({ top: 8 })
