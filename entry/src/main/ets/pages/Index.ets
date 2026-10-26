@@ -161,7 +161,7 @@ struct Index {
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
-  @State appVersion: string = '1.3.8';
+  @State appVersion: string = '1.3.9';
   /** IPv6 网络诊断：运行状态与结果文本 */
   @State diagBusy: boolean = false;
   @State diagText: string = '';
@@ -542,7 +542,7 @@ struct Index {
       speedConcurrency: d.speedConcurrency,
       speedGapMs: d.speedGapMs,
       domain: DnsService.normalize(this.domain),
-      domainSampling: this.domainSampling,
+      domainSampling: true,
       regionCode: this.regionCode.trim().toUpperCase(),
       delayWeight: d.delayWeight,
       speedWeight: d.speedWeight,
@@ -2941,7 +2941,7 @@ struct Index {
       .width('100%')
       .margin({ top: 10 })
 
-      Text('域名只在测速阶段作为 Host / SNI 使用；留空则用 speed.cloudflare.com。')
+      Text('域名用于测速 Host/SNI 校验，并自动解析其 A（IPv4）/AAAA（IPv6）记录并入候选；留空则用 speed.cloudflare.com。')
         .fontSize(11)
         .fontColor(this.txt3())
         .margin({ top: 8 })
@@ -3305,27 +3305,6 @@ struct Index {
             this.keepAlive = v;
             AppBackground.enabled = v;
             ConfigStore.saveKeepAlive(v);
-          })
-      }
-      .width('100%')
-      .margin({ top: 14 })
-      .alignItems(VerticalAlign.Center)
-      Row() {
-        Column({ space: 3 }) {
-          Text('域名解析采样')
-            .fontSize(14)
-            .fontColor(this.txt())
-          Text('开启后按当前 IP 版本解析测速域名的 A/AAAA 记录并并入候选，提高命中率')
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .lineHeight(16)
-        }
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Start)
-        Toggle({ type: ToggleType.Switch, isOn: this.domainSampling })
-          .selectedColor(this.accent())
-          .onChange((v: boolean) => {
-            this.domainSampling = v;
           })
       }
       .width('100%')

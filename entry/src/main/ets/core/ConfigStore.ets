@@ -94,7 +94,7 @@ export function defaultScanConfig(): ScanConfig {
     speedGapMs: 300,
     minSpeedMbps: 0.1,
     domain: '',
-    domainSampling: false,
+    domainSampling: true,
     regionCode: '',
     delayWeight: 0.1,
     speedWeight: 0.9,
