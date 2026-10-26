@@ -9,6 +9,7 @@
  *  - 排名权重：延迟 0.3 / 速度 0.7
  */
 import { preferences } from '@kit.ArkData';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { EdgeTunnelConfig, defaultEdgeTunnelConfig } from './EdgeTunnel';
 import { common } from '@kit.AbilityKit';
 import { ScanConfig, ScanMode, IpVersion, SpeedScope } from './Types';
@@ -49,16 +50,22 @@ export enum ThemeMode {
 
 /** 第一轮并发上限：按设备形态分档，避免低端机开太猛反而更慢 */
 export function maxScanConcurrency(): number {
-  // 移动设备（手机 / 平板）并发上限统一 200；电脑（2in1）同样 200。
-  // 超过这个值只会在弱网下制造大量超时并让设备发热，收益为负。
-  return 200;
+  // 按设备形态分档：手机 120、平板 200、电脑(2in1) 300。
+  // 超过上限只会在弱网下制造大量超时并让设备发热，收益为负。
+  const t: string = deviceInfo.deviceType;
+  if (t === '2in1' || t === 'pc') {
+    return 300;
+  }
+  if (t === 'tablet') {
+    return 200;
+  }
+  return 120;
 }
 
 /** 默认并发 = 上限的 80% */
 export function defaultScanConcurrency(): number {
-  // 默认并发 16：实测在移动网络下 16 路已经能把 2000 个候选压在 1~2 分钟内，
-  // 再高只会让延迟测量被排队放大、设备发热，用户可手动上调到上限 200。
-  return 16;
+  // 默认并发 20：2000 个候选大约 1 分钟内跑完，同时避免排队放大延迟与过度发热。
+  return 20;
 }
 export function defaultScanConfig(): ScanConfig {
   const c: ScanConfig = {
@@ -70,7 +77,7 @@ export function defaultScanConfig(): ScanConfig {
     pingTimes: 2,
     pingIntervalMs: 50,
     pingTimeoutMs: 1000,
-    latencyLimitMs: 220,
+    latencyLimitMs: 300,
     scanConcurrency: defaultScanConcurrency(),
     traceHost: DEFAULT_TRACE_HOST,
     tracePath: DEFAULT_TRACE_PATH,
@@ -78,7 +85,7 @@ export function defaultScanConfig(): ScanConfig {
     traceTimeoutMs: 3000,
     enableSpeed: true,
     speedScope: SpeedScope.ALL,
-    speedCount: 3,
+    speedCount: 10,
     speedPerRegion: 3,
     speedRounds: 1,
     speedUrl: 'https://speed.cloudflare.com/__down?bytes=50000000',
@@ -87,6 +94,7 @@ export function defaultScanConfig(): ScanConfig {
     speedGapMs: 300,
     minSpeedMbps: 0.1,
     domain: '',
+    domainSampling: false,
     regionCode: '',
     delayWeight: 0.1,
     speedWeight: 0.9,
@@ -147,6 +155,7 @@ export class ConfigStore {
     d.speedWindowMs = ConfigStore.num('scan_speed_window', d.speedWindowMs);
     d.minSpeedMbps = ConfigStore.num('scan_min_speed', d.minSpeedMbps);
     d.domain = ConfigStore.str('domain', d.domain);
+    d.domainSampling = ConfigStore.str('domain_sampling', '0') === '1';
     d.regionCode = ConfigStore.str('scan_region', d.regionCode);
     return d;
   }
@@ -176,6 +185,7 @@ export class ConfigStore {
     st.putSync('scan_speed_window', c.speedWindowMs);
     st.putSync('scan_min_speed', c.minSpeedMbps);
     st.putSync('domain', c.domain);
+    st.putSync('domain_sampling', c.domainSampling ? '1' : '0');
     st.putSync('scan_region', c.regionCode);
     await st.flush();
   }
@@ -267,6 +277,23 @@ static ui(): UiConfig {
     await st.put('ui_theme_color', c.themeColor);
     await st.put('ui_bg_blur', c.bgBlur);
     await st.put('ui_bg_bright', c.bgBright);
+    await st.flush();
+  }
+
+  static keepAlive(): boolean {
+    const st: preferences.Preferences | undefined = ConfigStore.store;
+    if (st === undefined) {
+      return false;
+    }
+    return (st.getSync('keep_alive', '0') as string) === '1';
+  }
+
+  static async saveKeepAlive(v: boolean): Promise<void> {
+    const st: preferences.Preferences | undefined = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    await st.put('keep_alive', v ? '1' : '0');
     await st.flush();
   }
 

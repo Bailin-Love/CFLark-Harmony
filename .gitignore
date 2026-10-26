@@ -11,12 +11,3 @@
 **/.test
 /.appanalyzer
 /.cache
-# 证书与密钥材料
-*.p12
-*.p7b
-*.cer
-*.key
-*.jks
-*.keystore
-.env
-

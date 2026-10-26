@@ -184,6 +184,8 @@ export interface ScanConfig {
   port: number;
   sampleCount: number;
   customText: string;
+  /** 是否用测速域名做 A/AAAA 解析采样并并入候选 */
+  domainSampling: boolean;
 
   // 阶段一：TCP 快速筛选
   pingTimes: number;

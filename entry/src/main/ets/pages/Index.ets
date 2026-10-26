@@ -15,6 +15,7 @@ import { uiMaterial } from '@kit.ArkUI';
 import { BarStyle } from '../entryability/EntryAbility';
 import { Candidate, ScanConfig, ScanMode, IpVersion, Verdict, Stage, DomainInfo, SpeedScope } from '../core/Types';
 import { ConfigStore, ThemeMode, UiConfig, defaultUiConfig, defaultScanConfig, PORT_OPTIONS, maxScanConcurrency, defaultScanConcurrency } from '../core/ConfigStore';
+import { AppBackground } from '../core/AppBackground';
 import { Scanner, ScanHooks, CancellationToken } from '../core/Scanner';
 import { Ranker } from '../core/Ranker';
 import { EdgeTunnel, EdgeTunnelConfig, defaultEdgeTunnelConfig, UploadPayload, UploadResult } from '../core/EdgeTunnel';
@@ -137,9 +138,9 @@ struct Index {
   @State sampleText: string = '2000';
   @State cfgRev: number = 0;
   @State concurrencyText: string = defaultScanConcurrency().toString();
-  @State latencyText: string = '220';
+  @State latencyText: string = '300';
   /** 延迟上限建议提示（随 IPv4/IPv6 变化） */
-  @State latencyHint: string = '建议：IPv4 延迟上限 220ms（CloudFlareScan 默认）';
+  @State latencyHint: string = '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）';
   @State bgPath: string = '';
   /** 底部胶囊拖动时的指尖 x（-1 表示未触摸） */
   @State pingText: string = '2';
@@ -152,16 +153,19 @@ struct Index {
   @State speedScope: number = SpeedScope.ALL;
   @State speedPerRegionText: string = '3';
   @State domain: string = '';
+  @State keepAlive: boolean = false;
+  @State domainSampling: boolean = false;
   @State regionCode: string = '';
   @State domainInfoText: string = '';
   @State resolving: boolean = false;
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
-  @State appVersion: string = '1.3.7';
+  @State appVersion: string = '1.3.8';
   /** IPv6 网络诊断：运行状态与结果文本 */
   @State diagBusy: boolean = false;
   @State diagText: string = '';
+  private diagWatchdog: number = -1;
 
   // ---------- edgetunnel 订阅上传 ----------
   @State etEnabled: boolean = false;
@@ -428,10 +432,11 @@ struct Index {
     this.speedScope = c.speedScope;
     this.speedPerRegionText = c.speedPerRegion.toString();
     this.domain = c.domain;
+    this.domainSampling = c.domainSampling;
+    this.keepAlive = ConfigStore.keepAlive();
+    AppBackground.enabled = this.keepAlive;
     this.regionCode = c.regionCode;
-    this.latencyHint = this.ipVersion === IpVersion.V6
-      ? '建议：IPv6 延迟上限 1500ms（可达地址 RTT 常在 1000ms+；IPv6 超时自动使用 3000ms）'
-      : '建议：IPv4 延迟上限 220ms（CloudFlareScan 默认）';
+    this.latencyHint = '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）';
     this.bgPath = ConfigStore.bgPath();
   }
 
@@ -537,6 +542,7 @@ struct Index {
       speedConcurrency: d.speedConcurrency,
       speedGapMs: d.speedGapMs,
       domain: DnsService.normalize(this.domain),
+      domainSampling: this.domainSampling,
       regionCode: this.regionCode.trim().toUpperCase(),
       delayWeight: d.delayWeight,
       speedWeight: d.speedWeight,
@@ -558,16 +564,9 @@ struct Index {
 
   /** 切换 IPv4/IPv6 时更新建议值；若当前仍是另一协议的默认值，则自动跟随 */
   private maybeAutoSuggest(v6: boolean): void {
-    this.latencyHint = v6
-      ? '建议：IPv6 延迟上限 1500ms（可达地址 RTT 常在 1000ms+；IPv6 超时自动使用 3000ms）'
-      : '建议：IPv4 延迟上限 220ms（CloudFlareScan 默认）';
-    const cur: number = this.intOf(this.latencyText, -1);
-    if (v6 && (cur === 220 || cur <= 0)) {
-      this.latencyText = '1500';
-      this.cfgRev++;
-    } else if (!v6 && cur === 1500) {
-      this.latencyText = '220';
-      this.cfgRev++;
+    this.latencyHint = '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）';
+    if (v6) {
+      this.latencyHint = this.latencyHint;
     }
     this.scheduleScanSave();
   }
@@ -575,14 +574,14 @@ struct Index {
   /** 一键应用当前 IP 版本的建议参数 */
   private applySuggestedParams(): void {
     const v6: boolean = this.ipVersion === IpVersion.V6;
-    this.sampleText = v6 ? '3000' : '2000';
+    this.sampleText = v6 ? '5000' : '2000';
     this.cfgRev++;
     this.concurrencyText = defaultScanConcurrency().toString();
-    this.latencyText = v6 ? '1500' : '220';
+    this.latencyText = '300';
     this.scheduleScanSave();
     this.toast(v6
-      ? '已应用 IPv6 建议参数：采样 3000、并发 16、延迟上限 1500ms、超时 3000ms'
-      : '已应用 IPv4 建议参数：采样 2000、并发 16、延迟上限 220ms');
+      ? '已应用建议参数：采样 5000、并发 20、延迟上限 300ms（IPv4/IPv6 同一上限）'
+      : '已应用建议参数：采样 2000、并发 20、延迟上限 300ms（IPv4/IPv6 同一上限）');
   }
 
   /** 滚动回调：只在跨越阈值时改 @State，避免滚动过程中每帧重建整个页面 */
@@ -622,6 +621,9 @@ struct Index {
   }
 
   addLog(msg: string): void {
+    if (this.logs.length > 400) {
+      this.logs = this.logs.slice(this.logs.length - 200);
+    }
     const d: Date = new Date();
     const p = (n: number): string => n < 10 ? '0' + n.toString() : n.toString();
     this.logBuf.push(p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + ' ' + msg);
@@ -696,6 +698,7 @@ struct Index {
     });
     this.token.reset();
     this.scanning = true;
+    AppBackground.hold('scan');
     this.results = [];
     this.pingList = [];
     this.speedList = [];
@@ -739,6 +742,7 @@ struct Index {
         this.scanning = false;
         this.phaseText = '已停止';
         this.addLog('已停止：不再继续后续阶段');
+        AppBackground.release('scan');
         return;
       }
       this.results = list;
@@ -763,27 +767,32 @@ struct Index {
           ? ('没有可用节点：' + lowCount.toString() + ' 个低于合格速度门槛')
           : (v6 ? '当前网络可能不支持 IPv6，未发现可用节点' : '没有可用节点，请检查网络或调高延迟上限'));
         this.curTab = 1;
+        AppBackground.release('scan');
         return;
       }
       const scope: number = c.speedScope;
       if (!c.enableSpeed) {
         this.addLog('第一轮筛选完成（测速已关闭），可在「筛选」页查看地区分布');
         this.curTab = 1;
+        AppBackground.release('scan');
         return;
       }
       if (scope === SpeedScope.REGION) {
         // 地区测速需要用户先看地区码再决定，停在筛选页
         this.addLog('第一轮筛选完成，请填地区码后点「开始测速」，或在扫描页改选「完全测速 / 全部地区」');
         this.curTab = 1;
+        AppBackground.release('scan');
         return;
       }
       // 完全测速 / 全部地区：一气呵成，直接进入第二轮
       this.addLog('第一轮筛选完成，自动继续测速…');
       this.curTab = 2;
       this.startSpeedTest();
+      AppBackground.release('scan');
     }).catch((e: BusinessError) => {
       this.scanning = false;
       this.phaseText = '出错';
+      AppBackground.release('scan');
       this.addLog('扫描异常：' + e.message);
     });
   }
@@ -810,6 +819,7 @@ struct Index {
     this.total = 0;
     this.doneRaw = 0;
     this.totalRaw = 0;
+    AppBackground.hold('speed');
     // 换地区/换模式重测时，必须清空上一轮的速度结果，否则会残留别的地区的节点
     this.speedList = [];
     this.phaseText = '准备测速';
@@ -861,6 +871,7 @@ struct Index {
         this.scanning = false;
         this.phaseText = '已停止';
         this.addLog('已停止测速');
+        AppBackground.release('speed');
         return;
       }
       this.scanning = false;
@@ -877,9 +888,11 @@ struct Index {
           this.uploadEdgeTunnel(true);
         }
       }
+      AppBackground.release('speed');
     }).catch((e: BusinessError) => {
       this.scanning = false;
       this.phaseText = '测速出错';
+      AppBackground.release('speed');
       this.addLog('测速异常：' + e.message);
     });
   }
@@ -890,6 +903,8 @@ struct Index {
     this.scanning = false;
     this.phaseText = '已停止';
     this.addLog('用户停止了扫描');
+    AppBackground.release('scan');
+    AppBackground.release('speed');
   }
 
   async doExport(fmt: ExportFormat): Promise<void> {
@@ -1112,7 +1127,6 @@ struct Index {
         .width('100%')
         .height('100%')
         // v1.3.2：Tabs 整体上移 1 个状态栏高度，让滚动内容能延伸到屏幕最顶端（contentTop 同步补偿）
-        .offset({ x: 0, y: -px2vp(this.statusBarPx) })
         .barHeight(0)
         .barBackgroundColor(Color.Transparent)
         .barBackgroundBlurStyle(BlurStyle.NONE)
@@ -1141,18 +1155,18 @@ struct Index {
           }, (item: BlurStrip, i: number) => 'top' + i.toString())
         }
         .width('100%')
-        .height(132.0)
+        .height(118.0)
         .zIndex(2)
         .hitTestBehavior(HitTestMode.None)
         // 顶部柔和底色蒙版：与页面底色同色，盖住残余条带
         if (this.bgPath.length === 0) {
           Column()
             .width('100%')
-            .height(132.0)
+            .height(118.0)
             .linearGradient({
               angle: 180,
-              colors: [[this.blurScrim(0.86), 0.0], [this.blurScrim(0.50), 0.55],
-                [this.blurScrim(0.0), 1.0]]
+              colors: [[this.blurScrim(0.90), 0.0], [this.blurScrim(0.62), 0.30],
+                [this.blurScrim(0.30), 0.62], [this.blurScrim(0.0), 1.0]]
             })
             .zIndex(3)
             .hitTestBehavior(HitTestMode.None)
@@ -1169,7 +1183,6 @@ struct Index {
     .padding({ top: 0 })
       .opacity(this.pageOpacity)
     .scale({ x: this.pageScale, y: this.pageScale })
-      // 底部渐变虚化：76 层细条（层高 2.5×步进、重叠 60%），指数增强，过渡更细腻
       Stack({ alignContent: Alignment.TopStart }) {
         ForEach(this.bottomBlurStrips(), (item: BlurStrip, i: number) => {
           Row()
@@ -1191,7 +1204,7 @@ struct Index {
           .height(106.7)
           .linearGradient({
             angle: 180,
-            colors: [[this.blurScrim(0.0), 0.0], [this.blurScrim(0.50), 0.45],
+            colors: [[this.blurScrim(0.0), 0.0], [this.blurScrim(0.45), 0.50],
               [this.blurScrim(0.90), 0.90], [this.blurScrim(0.90), 1.0]]
           })
           .zIndex(3)
@@ -1317,7 +1330,7 @@ struct Index {
     if (e === 1) {
       return this.matType === 1 ? uiMaterial.ImmersiveStyle.THICK : uiMaterial.ImmersiveStyle.REGULAR;
     }
-    return uiMaterial.ImmersiveStyle.THIN;
+    return this.matType === 1 ? uiMaterial.ImmersiveStyle.REGULAR : uiMaterial.ImmersiveStyle.THIN;
   }
 
   /** 材质类型/等级名称，用于设置页状态提示 */
@@ -1338,7 +1351,7 @@ struct Index {
     if (this.matType === 2) {
       return '无材质';
     }
-    return '自适应';
+    return '系统沉浸';
   }
 
   private matLevelName(): string {
@@ -1522,14 +1535,16 @@ struct Index {
   /** 渐变虚化条带数据 */
   private topBlurStrips(): BlurStrip[] {
     if (!TOP_STRIPS_READY) {
-      const n: number = 30;
-      const area: number = 132;
+      const n: number = 44;
+      const area: number = 118;
       const step: number = area / n;
       const out: BlurStrip[] = [];
       for (let i = 0; i < n; i++) {
         const t: number = (i + 0.5) / n;
-        const blur: number = 16 * Math.pow(1 - t, 1.1) + 0.2;
-        out.push(new BlurStrip(i * step, step * 1.6, blur));
+        const blur: number = 15 * Math.pow(1 - t, 1.25) + 0.2;
+        const jy: number = ((i * 7919) % 7 - 3) * 0.05;
+        const jh: number = ((i * 104729) % 5 - 2) * 0.04;
+        out.push(new BlurStrip(i * step + jy, step * 2.0 + jh, blur));
       }
       TOP_STRIPS_CACHE = out;
       TOP_STRIPS_READY = true;
@@ -2039,9 +2054,9 @@ struct Index {
    */
   private contentTop(): number {
     if (this.winW >= 900) {
-      return 2 * px2vp(this.statusBarPx) + 86;
+      return px2vp(this.statusBarPx) + 86;
     }
-    const base: number = 2 * px2vp(this.statusBarPx) + 70;
+    const base: number = px2vp(this.statusBarPx) + 70;
     const need: number = this.headerH + 12;
     return need > base ? need : base;
   }
@@ -2256,6 +2271,7 @@ struct Index {
       return;
     }
     this.diagBusy = true;
+    this.armDiagWatchdog();
     this.diagText = '正在诊断 IPv4，请稍候…';
     try {
       const text: string = await Diag.runV4();
@@ -2265,6 +2281,7 @@ struct Index {
       const err: BusinessError = e as BusinessError;
       this.diagText = '诊断失败：' + (err.message !== undefined ? err.message : '未知错误');
     } finally {
+      this.disarmDiagWatchdog();
       this.diagBusy = false;
     }
   }
@@ -2289,7 +2306,8 @@ struct Index {
       return;
     }
     this.diagBusy = true;
-    this.diagText = '正在诊断，请稍候…';
+    this.armDiagWatchdog();
+    this.diagText = '正在诊断 IPv6，请稍候…';
     try {
       const text: string = await Diag.run();
       this.diagText = text;
@@ -2298,7 +2316,25 @@ struct Index {
       const err: BusinessError = e as BusinessError;
       this.diagText = '诊断失败：' + (err.message !== undefined ? err.message : '未知错误');
     } finally {
+      this.disarmDiagWatchdog();
       this.diagBusy = false;
+    }
+  }
+
+  private armDiagWatchdog(): void {
+    this.disarmDiagWatchdog();
+    this.diagWatchdog = setTimeout(() => {
+      if (this.diagBusy) {
+        this.diagBusy = false;
+        this.diagText = this.diagText + '\n\n（诊断超时，按钮已恢复。请检查网络后重试）';
+      }
+    }, 120000);
+  }
+
+  private disarmDiagWatchdog(): void {
+    if (this.diagWatchdog >= 0) {
+      clearTimeout(this.diagWatchdog);
+      this.diagWatchdog = -1;
     }
   }
 
@@ -2549,7 +2585,25 @@ struct Index {
 
   @Builder CardParam() {
     Column() {
-      this.CardTitle('快速筛选参数', $r('sys.symbol.line_3_horizontal'))
+      Row() {
+        SymbolGlyph($r('sys.symbol.line_3_horizontal'))
+          .fontSize(16)
+          .fontColor([this.txt2()])
+          .margin({ right: 8 })
+        Text('快速筛选参数')
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.txt())
+        Blank()
+        Text('应用建议')
+          .fontSize(12)
+          .fontColor(this.accent())
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .backgroundColor(this.soft())
+          .borderRadius(9)
+          .onClick(() => { this.applySuggestedParams(); })
+      }
+      .width('100%')
       Row() {
         Text('采样数')
           .fontSize(13)
@@ -2603,8 +2657,8 @@ struct Index {
       .width('100%')
       .margin({ top: 8 })
 
-      Text('并发上限 ' + maxScanConcurrency().toString() +
-        '。超过 200 会自动改回 200；过高会导致设备发热卡死。')
+      Text('并发上限：手机 120 / 平板 200 / 电脑 300（当前设备上限 ' + maxScanConcurrency().toString() +
+        '）。超过会自动改回上限；过高会导致设备发热卡死。')
         .fontSize(11)
         .fontColor(this.txt3())
         .margin({ top: 6 })
@@ -2625,16 +2679,6 @@ struct Index {
             this.latencyText = v;
             this.scheduleScanSave();
           })
-        Text('应用建议')
-          .fontSize(12)
-          .fontColor(this.accent())
-          .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-          .backgroundColor(this.soft())
-          .borderRadius(9)
-          .margin({ left: 8 })
-          .onClick(() => {
-            this.applySuggestedParams();
-          })
       }
       .width('100%')
       .margin({ top: 8 })
@@ -2648,7 +2692,7 @@ struct Index {
         this.scheduleScanSave();
       })
       Text('每个 IP 连 ' + this.pingText + ' 次 TCP 取最小值；最小值超过 ' + this.latencyText +
-        'ms 的直接淘汰。IPv4 参考 CloudFlareScan（2 次、220ms）；IPv6 建议延迟上限 1500ms、超时自动 3000ms。')
+        'ms 的直接淘汰。IPv4 与 IPv6 使用同一延迟上限（建议 260~320ms，默认 300ms；两次 ping 下 220ms 会明显偏严）。')
         .fontSize(11)
         .fontColor(this.txt3())
         .margin({ top: 8 })
@@ -3026,7 +3070,7 @@ struct Index {
         .width('100%')
         .margin({ top: 16, bottom: 8 })
       Row({ space: 8 }) {
-        this.OptChip('自适应', 'matType', 0, () => {
+        this.OptChip('系统沉浸', 'matType', 0, () => {
           this.matType = 0;
           this.saveUi();
         })
@@ -3240,6 +3284,65 @@ struct Index {
       this.openExternal(url);
     })
   }
+  @Builder CardRuntime() {
+    Column() {
+      this.CardTitle('运行', $r('sys.symbol.gearshape'))
+      Row() {
+        Column({ space: 3 }) {
+          Text('后台保持运行')
+            .fontSize(14)
+            .fontColor(this.txt())
+          Text('开启后扫描/测速/上传期间切到后台不中断；关闭则使用系统默认行为')
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .lineHeight(16)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Toggle({ type: ToggleType.Switch, isOn: this.keepAlive })
+          .selectedColor(this.accent())
+          .onChange((v: boolean) => {
+            this.keepAlive = v;
+            AppBackground.enabled = v;
+            ConfigStore.saveKeepAlive(v);
+          })
+      }
+      .width('100%')
+      .margin({ top: 14 })
+      .alignItems(VerticalAlign.Center)
+      Row() {
+        Column({ space: 3 }) {
+          Text('域名解析采样')
+            .fontSize(14)
+            .fontColor(this.txt())
+          Text('开启后按当前 IP 版本解析测速域名的 A/AAAA 记录并并入候选，提高命中率')
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .lineHeight(16)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Toggle({ type: ToggleType.Switch, isOn: this.domainSampling })
+          .selectedColor(this.accent())
+          .onChange((v: boolean) => {
+            this.domainSampling = v;
+          })
+      }
+      .width('100%')
+      .margin({ top: 14 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(16)
+    .backgroundBlurStyle(this.cardBlurStyle(), { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+  }
+
   @Builder CardAbout() {
     Column() {
       this.CardTitle('关于', $r('sys.symbol.info_circle'))
@@ -3397,6 +3500,7 @@ struct Index {
               }
               .layoutWeight(1)
               Column({ space: 14 }) {
+                this.CardRuntime()
                 this.CardAbout()
                 this.CardDiag()
               }
@@ -3409,6 +3513,7 @@ struct Index {
               this.CardUpload()
               this.CardAppearanceMaterial()
               this.CardAppearanceBackground()
+              this.CardRuntime()
               this.CardAbout()
               this.CardDiag()
             }
@@ -4345,6 +4450,7 @@ struct Index {
       return;
     }
     this.etBusy = true;
+    AppBackground.hold('upload');
     this.etStatus = '准备上传…';
     const how: string = auto ? '自动' : '手动';
     const modeText: string = cfg.mode === 'append' ? '追加' : '覆盖';
@@ -4357,6 +4463,7 @@ struct Index {
       this.etStatus = msg;
     }).then((res: UploadResult) => {
       this.etBusy = false;
+      AppBackground.release('upload');
       this.etStatus = '上传成功（' + res.totalLines.toString() + ' 行）';
       const costText: string = res.way === 'api'
         ? ('读取 ' + res.readMs.toString() + 'ms，写入 ' + res.writeMs.toString() + 'ms')
@@ -4370,6 +4477,7 @@ struct Index {
       this.toast('订阅上传成功，共 ' + res.totalLines.toString() + ' 行');
     }).catch((e: BusinessError) => {
       this.etBusy = false;
+      AppBackground.release('upload');
       const msg: string = this.etErrText(e);
       this.etStatus = '上传失败：' + msg;
       this.addLog('edgetunnel 上传失败：' + msg);

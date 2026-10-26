@@ -18,6 +18,7 @@ import { Candidate, ScanConfig, ScanMode, IpVersion, Stage, Verdict, SpeedScope 
 import { IpUtil, CidrV4, CF_IPV4_RANGES, CF_IPV6_RANGES } from './IpUtil';
 import { TcpProbe, TcpResult, TraceProbe, TraceResult } from './Probe';
 import { SpeedTest, SpeedTarget } from './SpeedTest';
+import { DnsService } from './DnsService';
 import { Ranker } from './Ranker';
 
 export const DEFAULT_TRACE_HOST: string = 'speed.cloudflare.com';
@@ -721,6 +722,29 @@ export class Scanner {
     if (list.length === 0) {
       hooks.onLog('没有可用候选');
       return [];
+    }
+
+    // 域名解析采样：开启后用测速域名解析（IPv4 取 A，IPv6 取 AAAA）并并入候选
+    if (cfg.domainSampling && cfg.domain.length > 0) {
+      try {
+        const info = await DnsService.resolve(cfg.domain);
+        const seeds: string[] = [];
+        for (let i = 0; i < info.ips.length; i++) {
+          const ipIsV6: boolean = IpUtil.isV6(info.ips[i]);
+          if (cfg.ipVersion === IpVersion.V6 ? ipIsV6 : !ipIsV6) {
+            seeds.push(info.ips[i] + ':' + cfg.port.toString());
+          }
+        }
+        if (seeds.length > 0) {
+          list = list.concat(Scanner.customCandidates(seeds.join('\n'), cfg.port));
+          list = Scanner.dedupe(list);
+          hooks.onLog('域名采样：' + cfg.domain + ' 解析到 ' + seeds.length.toString() + ' 个地址，已并入候选');
+        } else {
+          hooks.onLog('域名采样：' + cfg.domain + ' 无可用记录（A/AAAA）');
+        }
+      } catch (e) {
+        hooks.onLog('域名采样失败：域名解析异常');
+      }
     }
 
     const passedPing: Candidate[] = await Scanner.stagePing(cfg, list, hooks, token);

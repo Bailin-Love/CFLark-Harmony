@@ -42,15 +42,22 @@ export class SpeedTest {
     let bytes: number = 0;
     let stopped: boolean = false;
     let endAt: number = 0;
+    // 首字节时间：用「首字节→结束」的有效下载时长算速度，
+    // 避免 TLS 握手/建连时间被摊进小窗口，导致预检低估。
+    let firstAt: number = 0;
 
     const finish = (ok: boolean, err: string): SpeedResult => {
       let elapsed: number = endAt > 0 ? endAt - started : Date.now() - started;
       if (elapsed <= 0) {
         elapsed = t.windowMs;
       }
+      let active: number = firstAt > 0 ? (endAt > 0 ? endAt - firstAt : Date.now() - firstAt) : elapsed;
+      if (active <= 0) {
+        active = elapsed;
+      }
       let avg: number = 0;
-      if (ok && elapsed > 0) {
-        avg = bytes / elapsed * 1000 / 1024 / 1024;
+      if (ok && active > 0) {
+        avg = bytes / active * 1000 / 1024 / 1024;
       }
       const r: SpeedResult = {
         ok: ok,
@@ -82,7 +89,10 @@ export class SpeedTest {
             return;
           }
           const now: number = Date.now();
-          bytes += buf.byteLength;
+          if (firstAt === 0) {
+        firstAt = Date.now();
+      }
+      bytes += buf.byteLength;
           if (now - started >= t.windowMs || bytes >= t.maxBytes) {
             stopped = true;
             endAt = now;

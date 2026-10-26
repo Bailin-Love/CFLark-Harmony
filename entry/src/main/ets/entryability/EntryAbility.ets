@@ -1,5 +1,6 @@
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { AppBackground } from '../core/AppBackground';
 import { window } from '@kit.ArkUI';
 import { ConfigStore } from '../core/ConfigStore';
 import { preferences } from '@kit.ArkData';
@@ -52,27 +53,24 @@ export class BarStyle {
       hilog.error(DOMAIN, 'testTag', 'setWindowLayoutFullScreen failed: %{public}s', e.message);
     });
 
-    // 1.5) 隐藏顶部状态栏（鸿蒙原生 API；个别系统版本会忽略，忽略即可）
-    // 状态栏保持显示（仅透明底、图标可见）
+    const winDark0: boolean = AppStorage.get<boolean>('initialDark') ?? true;
 
-    // 2) 系统栏透明化
+    // 2) 状态栏/导航栏全部透明：底部安全区不再画系统底色，露出页面背景
     win.setWindowSystemBarProperties({
       statusBarColor: '#00FFFFFF',
-      statusBarContentColor: dark ? '#FFFFFF' : '#000000',
       navigationBarColor: '#00000000',
-      navigationBarContentColor: dark ? '#FFFFFF' : '#000000'
-    }).catch((e: BusinessError) => {
-      hilog.error(DOMAIN, 'testTag', 'setWindowSystemBarProperties failed: %{public}s', e.message);
+      statusBarContentColor: winDark0 ? '#FFFFFF' : '#000000',
+      navigationBarContentColor: winDark0 ? '#FFFFFF' : '#000000'
     });
 
-    // 3) 隐藏底部导航指示器（小白条）：拿不到或不支持时忽略即可
-    win.setSpecificSystemBarEnabled('navigationIndicator', false).catch((e: BusinessError) => {
-      hilog.warn(DOMAIN, 'testTag', 'hide navigationIndicator ignored: %{public}s', e.message);
+    // 3) 正常显示手势指示条（不再隐藏，避免用户以为手势条消失）
+    win.setSpecificSystemBarEnabled('navigationIndicator', true).catch((e: BusinessError) => {
+      hilog.warn(DOMAIN, 'testTag', 'show navigationIndicator ignored: %{public}s', e.message);
     });
 
-    // 4) 窗口底色与页面渐变末尾一致，避免最底一帧出现色差
+    // 4) 窗口底色与页面底色一致，透明系统栏下露出的就是页面底色
     try {
-      win.setWindowBackgroundColor(dark ? '#0C0D12' : '#FFFFFF');
+      win.setWindowBackgroundColor(winDark0 ? '#0B0B12' : '#F3F5FA');
     } catch (e) {
       hilog.error(DOMAIN, 'testTag', 'setWindowBackgroundColor failed: %{public}s', JSON.stringify(e));
     }
@@ -81,6 +79,7 @@ export class BarStyle {
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    AppBackground.init(this.context);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {

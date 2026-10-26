@@ -1,11 +1,24 @@
 {
   app: {
-    // 说明：原工程的 signingConfigs（本机证书路径 + 加密口令）已移除，避免泄露本机签名材料。
-    // 在 DevEco Studio 中打开本工程后，Project Structure → Signing Configs 勾选
-    // “Automatically generate signature”（或粘贴你自己的签名配置）即可构建、装机。
+    signingConfigs: [
+      {
+        name: 'default',
+        type: 'HarmonyOS',
+        material: {
+          certpath: 'C:\\Users\\龍\\.ohos\\config\\default_cflark_tF67Xst4ygu47eVSkf5AN6F7q9wEM9saHvzwYG3Ogc=.cer',
+          keyAlias: 'debugKey',
+          keyPassword: '0000001a6414c78b7db48bae30bc0fc467660f56780a953557f72f41c18a94843e5a3130ca19a2de6375',
+          profile: 'C:\\Users\\龍\\.ohos\\config\\default_cflark_tF67Xst4ygu47eVSkf5AN6F7q9wEM9saHvzwYG3Ogc=.p7b',
+          signAlg: 'SHA256withECDSA',
+          storeFile: 'C:\\Users\\龍\\.ohos\\config\\default_cflark_tF67Xst4ygu47eVSkf5AN6F7q9wEM9saHvzwYG3Ogc=.p12',
+          storePassword: '0000001a6414c78b7db48bae30bc0fc467660f56780a953557f72f41c18a94843e5a3130ca19a2de6375',
+        },
+      },
+    ],
     products: [
       {
         name: 'default',
+        signingConfig: 'default',
         targetSdkVersion: '26.0.0',
         compatibleSdkVersion: '26.0.0',
         runtimeOS: 'HarmonyOS',
