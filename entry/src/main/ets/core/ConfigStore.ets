@@ -39,6 +39,20 @@ export function defaultUiConfig(): UiConfig {
 export const DEFAULT_TRACE_HOST: string = 'speed.cloudflare.com';
 export const DEFAULT_TRACE_PATH: string = '/cdn-cgi/trace';
 export const PORT_OPTIONS: number[] = [443, 2053, 2083, 2087, 2096, 8443];
+
+/** 内置优选库（均由第三方持续维护、可直接拉取的纯文本 CIDR 列表） */
+export interface LibSource {
+  label: string;
+  url: string;
+  note: string;
+}
+
+export const LIB_SOURCES: LibSource[] = [
+  { label: 'CF官方 IPv6', url: 'https://www.cloudflare.com/ips-v6', note: 'Cloudflare 官方发布的 IPv6 段，随官方更新' },
+  { label: 'CF官方 IPv4', url: 'https://www.cloudflare.com/ips-v4', note: 'Cloudflare 官方发布的 IPv4 段，随官方更新' },
+  { label: '社区 IPv6库', url: 'https://www.baipiao.eu.org/cloudflare/ips-v6', note: '社区维护的 Cloudflare IPv6 段列表' },
+  { label: '社区 IPv4库', url: 'https://www.baipiao.eu.org/cloudflare/ips-v4', note: '社区维护的 Cloudflare IPv4 段列表' }
+];
 const STORE_NAME: string = 'cflark_store';
 
 /** 主题模式：深色 / 浅色 / 跟随系统 */
@@ -64,15 +78,15 @@ export function maxScanConcurrency(): number {
 
 /** 默认并发 = 上限的 80% */
 export function defaultScanConcurrency(): number {
-  // 默认并发 20：2000 个候选大约 1 分钟内跑完，同时避免排队放大延迟与过度发热。
-  return 20;
+  // 默认并发 30：3000 个候选大约 1 分钟内跑完，同时避免排队放大延迟与过度发热。
+  return 30;
 }
 export function defaultScanConfig(): ScanConfig {
   const c: ScanConfig = {
     mode: ScanMode.OFFICIAL,
     ipVersion: IpVersion.V4,
     port: 443,
-    sampleCount: 2000,
+    sampleCount: 3000,
     customText: '',
     pingTimes: 2,
     pingIntervalMs: 50,
@@ -89,7 +103,7 @@ export function defaultScanConfig(): ScanConfig {
     speedPerRegion: 3,
     speedRounds: 1,
     speedUrl: 'https://speed.cloudflare.com/__down?bytes=50000000',
-    speedWindowMs: 3000,
+    speedWindowMs: 6000,
     speedConcurrency: 1,
     speedGapMs: 300,
     minSpeedMbps: 0.1,

@@ -136,6 +136,85 @@ export class IpUtil {
     return out;
   }
 
+  /** IPv6 CIDR 内可用的 /48 块数量（前缀长于 48 时视为 1 个块） */
+  static v6Block48Count(cidr: string): number {
+    const prefix: number = IpUtil.cidrV6Prefix(cidr);
+    if (prefix < 0) {
+      return 0;
+    }
+    if (prefix >= 48) {
+      return 1;
+    }
+    return Math.pow(2, 48 - prefix);
+  }
+
+  /**
+   * 显式分层采样：每个 /48 块里只保留 1 个地址（不重复），
+   * 不足 n 时先覆盖尽可能多的 /48，再回到随机主机位补齐。
+   */
+  static sampleV6Layered(cidr: string, n: number): string[] {
+    const out: string[] = [];
+    const base: number[] = IpUtil.cidrV6ToBytes(cidr);
+    const prefix: number = IpUtil.cidrV6Prefix(cidr);
+    if (base.length !== 16 || prefix < 0 || n <= 0) {
+      return out;
+    }
+    const blocks: number = IpUtil.v6Block48Count(cidr);
+    const picked: number[] = [];
+    const used: Set<number> = new Set<number>();
+    const target: number = Math.min(n, blocks);
+    let guard: number = 0;
+    while (picked.length < target && guard < target * 20 + 100) {
+      guard++;
+      const idx: number = Math.floor(Math.random() * blocks);
+      if (used.has(idx)) {
+        continue;
+      }
+      used.add(idx);
+      picked.push(idx);
+    }
+    for (let k = 0; k < picked.length; k++) {
+      const b: number[] = base.slice(0);
+      const idx: number = picked[k];
+      // prefix..48 位写入块索引
+      if (prefix < 48) {
+        for (let bit = prefix; bit < 48; bit++) {
+          const byteIdx: number = Math.floor(bit / 8);
+          const bitPos: number = 7 - (bit % 8);
+          const v: number = Math.floor(idx / Math.pow(2, 47 - bit)) & 1;
+          if (v === 1) {
+            b[byteIdx] = b[byteIdx] | (1 << bitPos);
+          } else {
+            b[byteIdx] = b[byteIdx] & ((0xFF ^ (1 << bitPos)) & 0xFF);
+          }
+        }
+      }
+      // /48 之后随机（保证每个 /48 内地址不同，但仍在同一 /48）
+      for (let byteIdx = 6; byteIdx < 16; byteIdx++) {
+        b[byteIdx] = Math.floor(Math.random() * 256);
+      }
+      out.push(IpUtil.bytesToV6(b));
+    }
+    // 覆盖完所有 /48 后仍有剩余需求：再随机补齐
+    let extra: number = n - out.length;
+    while (extra > 0) {
+      const b: number[] = base.slice(0);
+      for (let bi = 0; bi < 16; bi++) {
+        const start: number = bi * 8;
+        if (start >= prefix) {
+          b[bi] = Math.floor(Math.random() * 256);
+        } else if (start + 8 > prefix) {
+          const keep: number = prefix - start;
+          const mask: number = (0xFF << (8 - keep)) & 0xFF;
+          b[bi] = (b[bi] & mask) | (Math.floor(Math.random() * 256) & (0xFF ^ mask));
+        }
+      }
+      out.push(IpUtil.bytesToV6(b));
+      extra--;
+    }
+    return out;
+  }
+
   /** IPv6 文本 -> 16 字节数组（非法返回空数组） */
   static ipv6ToBytes(s: string): number[] {
     const groups: string[] = IpUtil.expandV6(s);

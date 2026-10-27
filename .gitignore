@@ -11,3 +11,8 @@
 **/.test
 /.appanalyzer
 /.cache
+# ---- 回退用忽略项（大文件/生成物，不入库）
+/shots/
+/tmp-*/
+*.log
+*_files/

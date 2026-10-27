@@ -13,6 +13,16 @@ export class BarStyle {
   private static win: window.Window | undefined = undefined;
 
   /** 在 loadContent 成功回调里调用 */
+  static setKeepScreenOn(on: boolean): void {
+    const w = BarStyle.win;
+    if (!w) {
+      return;
+    }
+    w.setWindowKeepScreenOn(on).catch((e: BusinessError) => {
+      hilog.warn(DOMAIN, 'testTag', 'setWindowKeepScreenOn failed: %{public}s', e.message);
+    });
+  }
+
   static attach(stage: window.WindowStage): void {
     try {
       BarStyle.win = stage.getMainWindowSync();

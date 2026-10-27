@@ -123,6 +123,8 @@ export interface Candidate {
 
   verdict: Verdict;
   remark: string;
+  /** 失败原因分类（timeout/refused/quality/colo 等，用于日志与调试） */
+  failReason: string;
 }
 
 /** trace 探测的原始结果 */

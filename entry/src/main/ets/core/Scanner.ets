@@ -16,6 +16,7 @@
  */
 import { Candidate, ScanConfig, ScanMode, IpVersion, Stage, Verdict, SpeedScope } from './Types';
 import { IpUtil, CidrV4, CF_IPV4_RANGES, CF_IPV6_RANGES } from './IpUtil';
+import { CF_IPV6_POOL_48 } from './V6Pool';
 import { TcpProbe, TcpResult, TraceProbe, TraceResult } from './Probe';
 import { SpeedTest, SpeedTarget } from './SpeedTest';
 import { DnsService } from './DnsService';
@@ -45,6 +46,17 @@ export class ScanHooks {
   onSpeedTick: (index: number, c: Candidate, done: boolean) => void =
     (index: number, c: Candidate, done: boolean) => {
     };
+  /** 质量预检开始：target=目标达标数，candidates=参与预检的候选数 */
+  onPrecheckStart: (target: number, candidates: number) => void = (target: number, candidates: number) => {
+  };
+  /** 质量预检进度：checked=已检测，qualified=已达标，inflight=在测数，target=目标达标数 */
+  onPrecheckTick: (checked: number, qualified: number, inflight: number, target: number) => void =
+    (checked: number, qualified: number, inflight: number, target: number) => {
+    };
+  /** 质量预检结束：done=true 时结果已定，exhausted=候选不足/提前中止 */
+  onPrecheckDone: (qualified: number, checked: number, exhausted: boolean, target: number) => void =
+    (qualified: number, checked: number, exhausted: boolean, target: number) => {
+    };
 }
 
 /** 取消令牌 */
@@ -64,7 +76,20 @@ export class CancellationToken {
   }
 }
 
+/** 质量预检结果：list=达标节点；quota/target 为目标数；checked 为实际检测数 */
+export class PrecheckResult {
+  list: Candidate[] = [];
+  quota: number = 0;
+  checked: number = 0;
+  qualified: number = 0;
+  exhausted: boolean = false;
+  cancelled: boolean = false;
+}
+
 export class Scanner {
+  /** 上一次 customCandidates 解析跳过的行数（用于日志提示） */
+  static lastParseSkipped: number = 0;
+
   static makeCandidate(ip: string, port: number, version: number): Candidate {
     const c: Candidate = {
       ip: ip,
@@ -89,7 +114,8 @@ export class Scanner {
       speedScore: 0,
       finalScore: 0,
       verdict: Verdict.UNKNOWN,
-      remark: ''
+      remark: '',
+      failReason: ''
     };
     return c;
   }
@@ -118,7 +144,8 @@ export class Scanner {
       speedScore: c.speedScore,
       finalScore: c.finalScore,
       verdict: c.verdict,
-      remark: c.remark
+      remark: c.remark,
+      failReason: c.failReason
     };
     return r;
   }
@@ -131,13 +158,30 @@ export class Scanner {
     });
   }
 
+  /** 最近一次官方 IPv6 分层采样可用 /48 块总数（仅用于日志展示） */
+  static lastLayeredBlock48: number = 0;
+
   /** 官方 IP 段候选：每个 /24 随机取 1 个，对齐 CFData-WEB 的 getRandomIPv4s */
   static officialCandidates(cfg: ScanConfig): Candidate[] {
     const out: Candidate[] = [];
     if (cfg.ipVersion === IpVersion.V6) {
+      // 官方 IPv6：优先用社区维护的 /48 池（实测命中率远高于 /32 随机 /48），
+      // 池为空时退回官方 /32 段分层采样。
+      const usePool: boolean = CF_IPV6_POOL_48.length > 0;
+      if (usePool) {
+        Scanner.lastLayeredBlock48 = CF_IPV6_POOL_48.length;
+        const per: number = Math.max(1, Math.ceil(cfg.sampleCount / CF_IPV6_POOL_48.length));
+        for (let i = 0; i < CF_IPV6_POOL_48.length; i++) {
+          const ips: string[] = IpUtil.sampleV6Layered(CF_IPV6_POOL_48[i], per);
+          for (let j = 0; j < ips.length; j++) {
+            out.push(Scanner.makeCandidate(ips[j], cfg.port, 6));
+          }
+        }
+        return out;
+      }
       const per: number = Math.max(1, Math.ceil(cfg.sampleCount / CF_IPV6_RANGES.length));
       for (let i = 0; i < CF_IPV6_RANGES.length; i++) {
-        const ips: string[] = IpUtil.sampleV6(CF_IPV6_RANGES[i], per);
+        const ips: string[] = IpUtil.sampleV6Layered(CF_IPV6_RANGES[i], per);
         for (let j = 0; j < ips.length; j++) {
           out.push(Scanner.makeCandidate(ips[j], cfg.port, 6));
         }
@@ -167,8 +211,9 @@ export class Scanner {
   }
 
   /** 自定义候选：支持 CIDR / ip:port / [v6]:port / 纯 IPv6，一行一个，# 开头是注释 */
-  static customCandidates(text: string, defaultPort: number): Candidate[] {
+  static customCandidates(text: string, defaultPort: number, perCidr: number = 20): Candidate[] {
     const out: Candidate[] = [];
+    let skipped: number = 0;
     const lines: string[] = text.split('\n');
     for (let i = 0; i < lines.length; i++) {
       let raw: string = lines[i].trim();
@@ -180,11 +225,25 @@ export class Scanner {
         raw = raw.substring(0, hash).trim();
       }
       if (raw.indexOf('/') > 0) {
-        const r: CidrV4 = IpUtil.parseCidrV4(raw);
-        if (r.count <= 0) {
+        if (raw.indexOf(':') > 0) {
+          // IPv6 CIDR：/48 等分层列表（社区优选库就是这种格式）
+          const prefix: number = IpUtil.cidrV6Prefix(raw);
+          if (prefix < 0 || prefix > 128) {
+            skipped++;
+            continue;
+          }
+          const ips6: string[] = IpUtil.sampleV6(raw, perCidr);
+          for (let k6 = 0; k6 < ips6.length; k6++) {
+            out.push(Scanner.makeCandidate(ips6[k6], defaultPort, 6));
+          }
           continue;
         }
-        const ips: string[] = IpUtil.sampleV4(raw, 20);
+        const r: CidrV4 = IpUtil.parseCidrV4(raw);
+        if (r.count <= 0) {
+          skipped++;
+          continue;
+        }
+        const ips: string[] = IpUtil.sampleV4(raw, perCidr);
         for (let k = 0; k < ips.length; k++) {
           out.push(Scanner.makeCandidate(ips[k], defaultPort, 4));
         }
@@ -205,20 +264,39 @@ export class Scanner {
           }
         }
       } else {
+        // 纯地址：v4 形如 1.2.3.4:443；v6 可能裸写 2606:4700::1 或 2606:4700::1:2053
         const colon: number = host.lastIndexOf(':');
-        if (colon > 0 && host.indexOf(':') === colon) {
-          const pv: number = parseInt(host.substring(colon + 1), 10);
-          if (pv > 0 && pv < 65536) {
-            port = pv;
-            host = host.substring(0, colon);
+        if (colon > 0) {
+          const portText: string = host.substring(colon + 1);
+          let digits: boolean = portText.length > 0;
+          for (let d = 0; d < portText.length; d++) {
+            const code: number = portText.charCodeAt(d);
+            if (code < 48 || code > 57) {
+              digits = false;
+              break;
+            }
+          }
+          if (digits) {
+            const pv: number = parseInt(portText, 10);
+            const head: string = host.substring(0, colon);
+            if (pv > 0 && pv < 65536 && host.indexOf(':') === colon) {
+              port = pv;
+              host = head;
+            } else if (pv > 0 && pv < 65536 && IpUtil.isV6(head)) {
+              // 纯 IPv6 带端口：只有前段仍是合法 IPv6 才拆分端口
+              port = pv;
+              host = head;
+            }
           }
         }
       }
       if (!IpUtil.isV4(host) && !IpUtil.isV6(host)) {
+        skipped++;
         continue;
       }
       out.push(Scanner.makeCandidate(host, port, IpUtil.isV6(host) ? 6 : 4));
     }
+    Scanner.lastParseSkipped = skipped;
     return out;
   }
 
@@ -265,18 +343,250 @@ export class Scanner {
   }
 
   /** 阶段一：TCP 快速筛选（按真实结果分类统计，不把超时/错误混成「TCP 不通」） */
+  /**
+   * IPv6 环境自检：真机/路由掉线时先给一条可区分的日志，
+   * 避免把「环境没有 IPv6」误判成「代码故障」。
+   */
+  static async checkV6Env(): Promise<boolean> {
+    try {
+      const r: TcpResult = await TcpProbe.pingOnce('2606:4700:4700::1111', 443, 3000);
+      return r.ok && r.rttMs > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 质量预检单节点：小窗口快速估速（只用于判断能否达标，不参与最终统计） */
+  private static async probeQuality(c: Candidate, cfg: ScanConfig, windowMs: number): Promise<boolean> {
+    const t: SpeedTarget = {
+      ip: c.ip,
+      port: c.port,
+      host: DEFAULT_TRACE_HOST,
+      url: 'https://' + DEFAULT_TRACE_HOST + SPEED_PATH,
+      timeoutMs: Math.min(cfg.traceTimeoutMs, 3000),
+      windowMs: windowMs,
+      maxBytes: 2 * 1024 * 1024
+    };
+    try {
+      const r = await SpeedTest.run(t);
+      return r.ok && r.avgMbps >= cfg.minSpeedMbps;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 质量预检：进入正式测速前，按延迟从低到高只挑出「测速地址数」个达标节点。
+   * - 完全测速：所有地区合计目标 = speedCount；全部地区：每地区各 speedPerRegion 个；
+   *   地区测速：只预检 regionCode 指定地区；三种都支持合格速度门槛。
+   * - 有界并发 4、达标即停；不达标顺延；检测数/合格数/在途数实时上报；
+   * - 候选耗尽或明显异常时提前结束，返回已经合格的节点，不把未检测节点误标失败。
+   */
+  static async stagePrecheck(cfg: ScanConfig, candidates: Candidate[], hooks: ScanHooks,
+    token: CancellationToken): Promise<PrecheckResult> {
+    const res: PrecheckResult = new PrecheckResult();
+    const all: Candidate[] = candidates.slice();
+    all.sort((a: Candidate, b: Candidate): number => {
+      const la: number = a.minLatencyMs > 0 ? a.minLatencyMs : 1e9;
+      const lb: number = b.minLatencyMs > 0 ? b.minLatencyMs : 1e9;
+      return la - lb;
+    });
+    const oneRegion: boolean = cfg.speedScope === SpeedScope.REGION;
+    const perRegion: boolean = cfg.speedScope === SpeedScope.PER_REGION;
+    const wantRegion: string = cfg.regionCode.trim().length > 0 ? cfg.regionCode.trim().toUpperCase() : 'UNK';
+    const need: Map<string, number> = new Map<string, number>();
+    if (perRegion) {
+      const per: number = Math.max(1, Math.min(20, cfg.speedPerRegion));
+      for (let i = 0; i < all.length; i++) {
+        const k: string = all[i].colo.length > 0 ? all[i].colo.toUpperCase() : 'UNK';
+        if (need.get(k) === undefined) {
+          need.set(k, per);
+          res.quota += per;
+        }
+      }
+    } else if (oneRegion) {
+      let n: number = 0;
+      for (let i = 0; i < all.length; i++) {
+        const k: string = all[i].colo.length > 0 ? all[i].colo.toUpperCase() : 'UNK';
+        if (k === wantRegion) {
+          n++;
+        }
+      }
+      res.quota = Math.min(Math.max(1, cfg.speedCount), Math.max(1, n));
+    } else {
+      res.quota = Math.min(Math.max(1, cfg.speedCount), Math.max(1, all.length));
+    }
+    hooks.onPrecheckStart(res.quota, all.length);
+    const minSpeed: number = cfg.minSpeedMbps;
+    if (minSpeed <= 0 || all.length === 0 || res.quota <= 0) {
+      const taken: Candidate[] = [];
+      for (let i = 0; i < all.length && taken.length < res.quota; i++) {
+        const k: string = all[i].colo.length > 0 ? all[i].colo.toUpperCase() : 'UNK';
+        if (oneRegion && k !== wantRegion) {
+          continue;
+        }
+        taken.push(all[i]);
+      }
+      res.list = taken;
+      res.qualified = taken.length;
+      res.checked = 0;
+      res.exhausted = res.qualified < res.quota;
+      hooks.onPrecheckDone(res.qualified, res.checked, res.exhausted, res.quota);
+      return res;
+    }
+    const gateWindow: number = Math.min(2500, Math.max(1600, Math.floor(cfg.speedWindowMs * 2 / 3)));
+    const gateConc: number = 4;
+    const maxChecked: number = Math.max(res.quota * 6, 40);
+    const limitMs: number = Math.max(30000, res.quota * 12000);
+    const startAt: number = Date.now();
+    hooks.onPhase(2, '质量预检（目标 ' + res.quota.toString() + ' 个，窗口 ' + gateWindow.toString() +
+      'ms，并发 ' + gateConc.toString() + '）');
+    hooks.onLog('质量预检开始：参与 ' + all.length.toString() + ' 个，目标 ' + res.quota.toString() +
+      ' 个，合格速度 ' + minSpeed.toString() + ' MB/s，单次窗口 ' + gateWindow.toString() + 'ms');
+
+    let next: number = 0;
+    const inflight: Set<string> = new Set<string>();
+    let abortReason: string = '';
+    const quotaOf = (c: Candidate): number => {
+      const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
+      const v: number | undefined = need.get(k);
+      return v === undefined ? 0 : v;
+    };
+    const provider = async (): Promise<void> => {
+      while (true) {
+        if (token.isCancelled()) {
+          abortReason = 'cancelled';
+          return;
+        }
+        if (res.qualified >= res.quota) {
+          return;
+        }
+        if ((Date.now() - startAt) > limitMs) {
+          abortReason = 'timeout';
+          return;
+        }
+        if (res.checked + inflight.size >= maxChecked) {
+          abortReason = 'checked-limit';
+          return;
+        }
+        let pick: number = -1;
+        while (next < all.length) {
+          const c: Candidate = all[next];
+          next++;
+          if (perRegion && quotaOf(c) <= 0) {
+            continue;
+          }
+          if (oneRegion) {
+            const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
+            if (k !== wantRegion) {
+              continue;
+            }
+          }
+          pick = next - 1;
+          break;
+        }
+        if (pick < 0) {
+          abortReason = 'exhausted';
+          return;
+        }
+        const c: Candidate = all[pick];
+        const key: string = c.ip + ':' + c.port.toString();
+        inflight.add(key);
+        hooks.onPrecheckTick(res.checked, res.qualified, inflight.size, res.quota);
+        const ok: boolean = await Scanner.probeQuality(c, cfg, gateWindow);
+        inflight.delete(key);
+        if (token.isCancelled()) {
+          abortReason = 'cancelled';
+          return;
+        }
+        res.checked++;
+        if (ok) {
+          c.verdict = Verdict.PASS;
+          c.remark = '预检达标';
+          c.failReason = '';
+          res.list.push(c);
+          res.qualified = res.list.length;
+          if (perRegion) {
+            const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
+            const left: number | undefined = need.get(k);
+            need.set(k, (left === undefined ? 1 : left) - 1);
+          }
+        } else {
+          c.verdict = Verdict.FAILED;
+          c.remark = '合格速度不达标';
+          c.failReason = 'quality';
+        }
+        hooks.onPrecheckTick(res.checked, res.qualified, inflight.size, res.quota);
+        hooks.onProgress(res.checked, all.length, res.qualified,
+          Math.max(0, res.checked - res.qualified));
+      }
+    };
+    const workers: Promise<void>[] = [];
+    const workerCount: number = Math.max(1, Math.min(gateConc, all.length));
+    for (let i = 0; i < workerCount; i++) {
+      workers.push(provider());
+    }
+    await Promise.all(workers);
+    if (token.isCancelled()) {
+      res.cancelled = true;
+    }
+    // 并发 4 时收尾那一刻可能同时合格多个，超出目标的裁掉：
+    // 目标 10 就只保留 10 个，避免出现「合格 13 / 目标 10」这种越界显示与多测。
+    if (res.list.length > res.quota) {
+      res.list = res.list.slice(0, res.quota);
+    }
+    res.qualified = res.list.length;
+    res.exhausted = res.qualified < res.quota;
+    if (abortReason === 'cancelled') {
+      hooks.onLog('质量预检已取消：已检测 ' + res.checked.toString() + ' 个，达标 ' + res.qualified.toString() + ' 个');
+    } else if (res.qualified >= res.quota) {
+      hooks.onLog('质量预检完成：已检测 ' + res.checked.toString() + ' 个，达标 ' + res.qualified.toString() +
+        ' 个（目标 ' + res.quota.toString() + '）');
+    } else if (abortReason === 'timeout') {
+      hooks.onLog('质量预检超时结束：已用 ' + Math.round((Date.now() - startAt) / 1000).toString() +
+        ' 秒，已检测 ' + res.checked.toString() + ' 个，仅达标 ' + res.qualified.toString() +
+        ' 个（疑似网络异常或合格速度设置过高，请检查网络）');
+    } else if (abortReason === 'checked-limit') {
+      hooks.onLog('质量预检提前结束：已检测 ' + res.checked.toString() + ' 个仍不足目标，仅达标 ' +
+        res.qualified.toString() + ' 个（达标率过低，请检查网络或调低合格速度）');
+    } else {
+      hooks.onLog('质量预检结束：候选耗尽，共检测 ' + res.checked.toString() + ' 个，达标 ' +
+        res.qualified.toString() + ' 个（目标 ' + res.quota.toString() + '）');
+    }
+    hooks.onPrecheckDone(res.qualified, res.checked, res.exhausted, res.quota);
+    return res;
+  }
+
+  /**
+   * IPv6 有效延迟上限：随机 IPv6 地址在 Cloudflare 段内通常走较远的移动路由，
+   * 实测平均最小延迟约 375ms；若沿用 IPv4 的 260ms 口径会误杀 90% 以上可达节点。
+   * 这里按用户阈值放大 2.2 倍并封顶 800ms，IPv4 保持原值不变。
+   */
+  static effectiveLatencyLimit(cfg: ScanConfig): number {
+    if (cfg.ipVersion !== IpVersion.V6) {
+      return cfg.latencyLimitMs;
+    }
+    const adaptive: number = Math.round(cfg.latencyLimitMs * 2.2);
+    return Math.max(cfg.latencyLimitMs, Math.min(800, adaptive));
+  }
+
   static async stagePing(cfg: ScanConfig, list: Candidate[], hooks: ScanHooks,
     token: CancellationToken): Promise<Candidate[]> {
+    const limitMsEff: number = Scanner.effectiveLatencyLimit(cfg);
     hooks.onPhase(1, '第一阶段 · TCP 筛选 + 数据中心（TCP ' + cfg.pingTimes.toString() + ' 次，上限 ' +
-      cfg.latencyLimitMs.toString() + 'ms，并行取 colo）');
+      limitMsEff.toString() + 'ms，并行取 colo）');
+    if (limitMsEff > cfg.latencyLimitMs) {
+      hooks.onLog('IPv6 自适应延迟上限：' + cfg.latencyLimitMs.toString() + 'ms → ' + limitMsEff.toString() +
+        'ms（随机 IPv6 路由普遍较远，沿用 IPv4 阈值会误杀大量可达节点）');
+    }
     hooks.onLog('候选 IP 共 ' + list.length.toString() + ' 个，开始第一轮 TCP 延迟筛选');
+    const statStartMs: number = Date.now();
     let done: number = 0;
     let passed: number = 0;
     let overLimit: number = 0;
     let timeouts: number = 0;
     let otherErrors: number = 0;
     let skipped: number = 0;
-    let speedLow: number = 0;
     const errSamples: string[] = [];
     const keep: Candidate[] = [];
     // 延迟达标的 IP 立刻并行去要数据中心，最后统一收尾
@@ -315,7 +625,7 @@ export class Scanner {
           break;
         }
         // 第一次延迟已明显低于门槛（≤ 门槛 60%）：无需再重试，直接省一次连接
-        if (r.ok && r.rttMs > 0 && r.rttMs <= cfg.latencyLimitMs * 0.6) {
+        if (r.ok && r.rttMs > 0 && r.rttMs <= limitMsEff * 0.6) {
           break;
         }
         if (k < cfg.pingTimes - 1) {
@@ -363,7 +673,7 @@ export class Scanner {
             errSamples.push(c.ip + ' ' + lastStage + codeText + msgText);
           }
         }
-      } else if (c.minLatencyMs >= cfg.latencyLimitMs) {
+      } else if (c.minLatencyMs >= limitMsEff) {
         c.verdict = Verdict.SLOW;
         c.remark = '延迟超限';
         overLimit++;
@@ -374,9 +684,8 @@ export class Scanner {
       }
       hooks.onSpeedTick(index, c, true);
       done++;
-      if (done % 10 === 0 || done === list.length) {
-        hooks.onProgress(done, list.length, passed, timeouts + otherErrors + overLimit);
-      }
+      // 每完成一个真实探测就上报（UI 侧再做 80ms 节流），避免按批次跳跃
+      hooks.onProgress(done, list.length, passed, timeouts + otherErrors + overLimit);
     });
 
     await Promise.all(coloTasks);
@@ -390,128 +699,39 @@ export class Scanner {
         keep.push(list[i]);
       }
     }
-    // 「合格速度」预检（第一轮末端、进入测速之前）：按延迟从低到高，
-    // 只挑出可能进入测速的 N 个节点做小幅估速；测不动或不达标的直接淘汰，
-    // 并顺延到后面的候选，保证「测速地址数」能凑满且都是可测速的节点。
-    if (cfg.minSpeedMbps > 0 && keep.length > 0) {
-      keep.sort((a: Candidate, b: Candidate): number => {
-        const la: number = a.minLatencyMs > 0 ? a.minLatencyMs : 1e9;
-        const lb: number = b.minLatencyMs > 0 ? b.minLatencyMs : 1e9;
-        return la - lb;
-      });
-      const regionMode: boolean = cfg.speedScope === SpeedScope.PER_REGION;
-      const per: number = Math.max(1, Math.min(20, cfg.speedPerRegion));
-      const need: Map<string, number> = new Map<string, number>();
-      let quota: number = 0;
-      if (regionMode) {
-        for (let i = 0; i < keep.length; i++) {
-          const k: string = keep[i].colo.length > 0 ? keep[i].colo.toUpperCase() : 'UNK';
-          const n0: number | undefined = need.get(k);
-          if (n0 === undefined) {
-            need.set(k, per);
-            quota += per;
-          }
-        }
-      } else {
-        quota = Math.min(Math.max(1, cfg.speedCount), keep.length);
-      }
-      const gateWindow: number = Math.min(2500, Math.max(1600, Math.floor(cfg.speedWindowMs * 2 / 3)));
-      const gateConc: number = 2;
-      // 不设硬性上限：一直从低延迟往下测，直到凑满配额或候选耗尽。
-      // 但若明显异常（检测很多但几乎不达标/耗时过长），中止并提示排查网络。
-      const gateSoftLimit: number = Math.max(24, quota * 4);
-      const gateElapsedLimitMs: number = 90000;
-      const gateStartAt: number = Date.now();
-      hooks.onPhase(1, '第一阶段 · 合格速度预检（目标 ' + quota.toString() + ' 个，窗口 ' +
-        gateWindow.toString() + 'ms）');
-      hooks.onLog('合格速度预检：TCP 通过 ' + keep.length.toString() + ' 个，目标测速 ' +
-        quota.toString() + ' 个，单次窗口 ' + gateWindow.toString() + 'ms，合格速度 ' +
-        cfg.minSpeedMbps.toString() + ' MB/s');
-      const probeOne = async (c: Candidate): Promise<boolean> => {
-        const pt: SpeedTarget = {
-          ip: c.ip,
-          port: c.port,
-          host: DEFAULT_TRACE_HOST,
-          url: 'https://' + DEFAULT_TRACE_HOST + SPEED_PATH,
-          timeoutMs: Math.min(cfg.traceTimeoutMs, 3000),
-          windowMs: gateWindow,
-          maxBytes: 2 * 1024 * 1024
-        };
-        const r = await SpeedTest.run(pt);
-        return r.ok && r.avgMbps >= cfg.minSpeedMbps;
-      };
-      const qualified: Candidate[] = [];
-      let taken: number = 0;
-      let idx: number = 0;
-      while (qualified.length < quota && idx < keep.length) {
-        const batch: Candidate[] = [];
-        while (batch.length < gateConc && idx < keep.length) {
-          const c: Candidate = keep[idx];
-          idx++;
-          if (regionMode) {
-            const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
-            const n0: number | undefined = need.get(k);
-            const n: number = n0 === undefined ? 0 : n0;
-            if (n <= 0) {
-              continue;
-            }
-          }
-          batch.push(c);
-        }
-        if (batch.length === 0) {
-          break;
-        }
-        if (taken >= gateSoftLimit && qualified.length * 10 < taken) {
-          hooks.onLog('合格速度预检提前中止：已检测 ' + taken.toString() + ' 个，仅合格 ' +
-            qualified.length.toString() + ' 个（达标率过低，疑似网络异常或「合格速度」设置过高），请检查网络或调低合格速度');
-          break;
-        }
-        if ((Date.now() - gateStartAt) > gateElapsedLimitMs && qualified.length < quota) {
-          hooks.onLog('合格速度预检超时中止：已用 ' + Math.round((Date.now() - gateStartAt) / 1000).toString() +
-            ' 秒，已检测 ' + taken.toString() + ' 个，合格 ' + qualified.length.toString() +
-            ' 个（疑似网络异常或整体速度偏低），请检查网络或调低合格速度');
-          break;
-        }
-        const rs: boolean[] = await Promise.all(batch.map((c: Candidate): Promise<boolean> => probeOne(c)));
-        taken += batch.length;
-        for (let i = 0; i < batch.length; i++) {
-          const c: Candidate = batch[i];
-          if (rs[i]) {
-            qualified.push(c);
-            if (regionMode) {
-              const k: string = c.colo.length > 0 ? c.colo.toUpperCase() : 'UNK';
-              const n0: number | undefined = need.get(k);
-              need.set(k, (n0 === undefined ? 1 : n0) - 1);
-            }
-          } else {
-            c.verdict = Verdict.FAILED;
-            c.remark = '合格速度不达标';
-            speedLow++;
-          }
-        }
-        hooks.onProgress(taken, keep.length, qualified.length, speedLow);
-      }
-      hooks.onLog('合格速度预检完成：检测 ' + taken.toString() + ' 个，合格 ' +
-        qualified.length.toString() + ' 个进入测速，淘汰 ' + speedLow.toString() + ' 个');
-      if (qualified.length === 0) {
-        hooks.onLog('合格速度预检后没有剩余节点，跳过测速');
-      }
-      keep.splice(0, keep.length);
-      for (let i = 0; i < qualified.length; i++) {
-        keep.push(qualified[i]);
-      }
-    }
+    // 质量预检已抽到 Scanner.stagePrecheck：在第一轮结束、正式测速前单独执行，
+    // 这样「凑满目标才进测速」「进度/在途数上报」「不误标未检测节点」都能单独控制。
     const coloOk: number = keep.length;
-    const coloDropped: number = Math.max(0, passed - speedLow - keep.length);
+    const coloDropped: number = Math.max(0, passed - keep.length);
     hooks.onLog('第一阶段完成：候选 ' + list.length.toString() + ' 个；TCP 成功 ' + passed.toString() +
       ' 个（延迟达标）；延迟超限 ' + overLimit.toString() + ' 个；连接超时 ' + timeouts.toString() +
-      ' 个；合格速度未达标 ' + speedLow.toString() +
       ' 个；其他错误 ' + otherErrors.toString() + ' 个；取消/未执行 ' + skipped.toString() +
       ' 个；最终通过 ' + keep.length.toString() + ' 个（拿到 colo ' + coloOk.toString() + ' 个）' +
       (coloDropped > 0 ? ('，另有 ' + coloDropped.toString() + ' 个无法完成 HTTPS 探测') : ''));
     if (errSamples.length > 0) {
       hooks.onLog('连接错误示例：' + errSamples.join('；'));
     }
+    let statSent: number = 0;
+    let statRecv: number = 0;
+    let statLatSum: number = 0;
+    let statLatCnt: number = 0;
+    for (let i = 0; i < list.length; i++) {
+      const sc: Candidate = list[i];
+      statSent += sc.pingSent;
+      statRecv += sc.pingRecv;
+      if (sc.minLatencyMs >= 0 && sc.pingRecv > 0) {
+        statLatSum += sc.minLatencyMs;
+        statLatCnt++;
+      }
+    }
+    const statDur: number = Math.max(1, Date.now() - statStartMs);
+    const statSec: number = statDur / 1000;
+    hooks.onLog('统计：版本 ' + (cfg.ipVersion === IpVersion.V6 ? 'IPv6' : 'IPv4') +
+      '，候选 ' + list.length.toString() + '，探测 ' + statSent.toString() + ' 次，TCP 成功 ' + statRecv.toString() +
+      '，超时 ' + timeouts.toString() + '，其他错误 ' + otherErrors.toString() +
+      '，耗时 ' + statSec.toFixed(1) + 's，速率 ' + (statSent / statSec).toFixed(1) + ' 次/s，成功率 ' +
+      (statSent > 0 ? (statRecv * 100 / statSent).toFixed(1) : '0') + '%，平均最小延迟 ' +
+      (statLatCnt > 0 ? (statLatSum / statLatCnt).toFixed(0) : '-') + 'ms');
     return keep;
   }
 
@@ -570,9 +790,8 @@ export class Scanner {
       }
       hooks.onSpeedTick(index, c, true);
       done++;
-      if (done % 10 === 0 || done === list.length) {
-        hooks.onProgress(done, list.length, okCount, list.length - okCount);
-      }
+      // 每完成一个真实探测就上报（UI 侧再做 80ms 节流），避免按批次跳跃
+      hooks.onProgress(done, list.length, okCount, list.length - okCount);
     });
     hooks.onLog('数据中心获取完成：' + list.length.toString() + ' 个中 ' + okCount.toString() + ' 个拿到 colo');
   }
@@ -713,10 +932,25 @@ export class Scanner {
     let list: Candidate[] = [];
     if (cfg.mode === ScanMode.OFFICIAL) {
       list = Scanner.officialCandidates(cfg);
-      hooks.onLog('候选来源：官方 IP 段，生成 ' + list.length.toString() + ' 个');
+      if (cfg.ipVersion === IpVersion.V6) {
+        hooks.onLog('候选来源：官方 IP 段（IPv6 社区 /48 池共 ' +
+          Scanner.lastLayeredBlock48.toString() + ' 个 /48），生成 ' + list.length.toString() + ' 个');
+      } else {
+        hooks.onLog('候选来源：官方 IP 段（IPv4 按 /24 分层），生成 ' + list.length.toString() + ' 个');
+      }
     } else {
-      list = Scanner.customCandidates(cfg.customText, cfg.port);
-      hooks.onLog('候选来源：自定义，解析出 ' + list.length.toString() + ' 个');
+      let entries: number = 0;
+      const rawLines: string[] = cfg.customText.split('\n');
+      for (let li = 0; li < rawLines.length; li++) {
+        const t: string = rawLines[li].trim();
+        if (t.length > 0 && !t.startsWith('#')) {
+          entries++;
+        }
+      }
+      const perCidr: number = Math.max(1, Math.ceil(cfg.sampleCount / Math.max(1, entries)));
+      list = Scanner.customCandidates(cfg.customText, cfg.port, perCidr);
+      hooks.onLog('候选来源：自定义（' + entries.toString() + ' 行，每条个采 ' + perCidr.toString() +
+        '），解析出 ' + list.length.toString() + ' 个');
     }
     list = Scanner.dedupe(list);
     if (list.length === 0) {
@@ -724,27 +958,40 @@ export class Scanner {
       return [];
     }
 
-    // 域名解析采样：开启后用测速域名解析（IPv4 取 A，IPv6 取 AAAA）并并入候选
-    if (cfg.domainSampling && cfg.domain.length > 0) {
+    // 域名解析采样：填了域名就自动解析（IPv4→A，IPv6→AAAA）并入候选，保留随机地址。
+    // IPv6 随机地址命中率低，域名记录是正向补充，不能替换掉随机候选。
+    const seedDomain: string = cfg.domain.length > 0 ? cfg.domain :
+      (cfg.ipVersion === IpVersion.V6 ? DEFAULT_TRACE_HOST : '');
+    if (seedDomain.length > 0) {
       try {
-        const info = await DnsService.resolve(cfg.domain);
+        const info = await DnsService.resolve(seedDomain);
         const seeds: string[] = [];
         for (let i = 0; i < info.ips.length; i++) {
           const ipIsV6: boolean = IpUtil.isV6(info.ips[i]);
           if (cfg.ipVersion === IpVersion.V6 ? ipIsV6 : !ipIsV6) {
-            seeds.push(info.ips[i] + ':' + cfg.port.toString());
+            // 只放纯 IP：带端口拼接对 IPv6 会产生 2606:4700::1:443 这类歧义写法
+            seeds.push(info.ips[i]);
           }
         }
         if (seeds.length > 0) {
-          list = list.concat(Scanner.customCandidates(seeds.join('\n'), cfg.port));
-          list = Scanner.dedupe(list);
-          hooks.onLog('域名采样：' + cfg.domain + ' 解析到 ' + seeds.length.toString() + ' 个地址，已并入候选');
+          const extra: Candidate[] = Scanner.customCandidates(seeds.join('\n'), cfg.port, 1);
+          list = Scanner.dedupe(list.concat(extra));
+          hooks.onLog('域名采样：' + seedDomain + ' 解析到 ' + seeds.length.toString() +
+            ' 个地址，已并入候选（保留随机地址）');
         } else {
-          hooks.onLog('域名采样：' + cfg.domain + ' 无可用记录（A/AAAA）');
+          hooks.onLog('域名采样：' + seedDomain + ' 无匹配记录（A/AAAA），继续用随机地址');
         }
       } catch (e) {
-        hooks.onLog('域名采样失败：域名解析异常');
+        hooks.onLog('域名采样失败：' + seedDomain + ' 解析异常，继续用随机地址');
       }
+    }
+    if (Scanner.lastParseSkipped > 0) {
+      hooks.onLog('自定义候选：有 ' + Scanner.lastParseSkipped.toString() + ' 行无法解析，已忽略');
+    }
+    if (cfg.ipVersion === IpVersion.V6) {
+      const envOk: boolean = await Scanner.checkV6Env();
+      hooks.onLog(envOk ? 'IPv6 环境自检：可用（测试地址已连通）' :
+        'IPv6 环境自检：不可用或超时（本机无 IPv6 或网络掉线时属环境问题，不是代码故障）');
     }
 
     const passedPing: Candidate[] = await Scanner.stagePing(cfg, list, hooks, token);

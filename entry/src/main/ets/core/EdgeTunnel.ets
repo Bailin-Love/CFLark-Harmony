@@ -40,7 +40,7 @@ import { url } from '@kit.ArkTS';
 const DOMAIN: number = 0x0000;
 const TAG: string = 'EdgeTunnel';
 const TIMEOUT_MS: number = 20000;
-const EDGE_UA: string = 'CFLark/1.3.8 (HarmonyOS; edgetunnel-upload)';
+const EDGE_UA: string = 'CFLark/1.4.0 (HarmonyOS; edgetunnel-upload)';
 const ADD_PATH: string = '/admin/ADD.txt';
 /** Cloudflare API 站点（本项目实测在模拟器内可正常 TLS 握手） */
 const CF_API_BASE: string = 'https://api.cloudflare.com/client/v4';
