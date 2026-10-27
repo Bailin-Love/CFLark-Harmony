@@ -44,11 +44,11 @@ CFLark 是一款为 HarmonyOS NEXT 打造的原生 Cloudflare 节点优选工具
 
 ### 方式一：HAP 安装（调试包）
 
-1. 下载 Releases 中的 `CFLark-Harmony-1.4.0-debug.hap`。
+1. 下载 Releases 中的 `CFLark-Harmony-1.4.0-signed-debug.hap`。
 2. 连接鸿蒙设备（需开启开发者模式与 USB 调试），执行：
 
 ```bash
-hdc install CFLark-Harmony-1.4.0-debug.hap
+hdc install CFLark-Harmony-1.4.0-signed-debug.hap
 ```
 
 3. 也可以把 HAP 传到手机/平板后用文件管理器打开安装（需允许安装未知来源应用）。
