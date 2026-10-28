@@ -55,11 +55,11 @@ hdc install CFLark-Harmony-1.4.1-debug.hap
 
 ### 方式二：App Pack 安装（发行版，推荐）
 
-下载 `CFLark-Harmony-1.4.1-release.app.hap`，**Hokit 可直接安装，无需修改后缀**；也可用于归档或上架流程。
+下载 `CFLark-Harmony-1.4.1-app-release.app.hap`，**Hokit 可直接安装，无需修改后缀**；也可用于归档或上架流程。
 
 > GitHub 附件不支持 `.app` 后缀，因此发行版 `.app` 统一命名为 `*.app.hap`，本质仍是鸿蒙 App Pack。
 
-> 1.4.1 的两个安装包均为**未签名**构建：推荐用 Hokit 安装；若设备拦截，可用 DevEco Studio 的自动签名或自有证书重新签名后再安装。
+> 1.4.1 的两个安装包均为**未签名**构建 —— 这是刻意为之：当前鸿蒙侧载生态（Hokit、轻启、Hapkit、小白盒子等）会在安装时自动重签，无需自带签名。推荐直接拖入 Hokit 安装。
 
 ## 使用流程
 
