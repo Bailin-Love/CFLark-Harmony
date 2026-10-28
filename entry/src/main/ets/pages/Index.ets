@@ -16,6 +16,10 @@ import { hdsMaterial, HdsTabs, HdsTabsFloatingStyle, SystemMaterialParams } from
 import { BarStyle } from '../entryability/EntryAbility';
 import { Candidate, ScanConfig, ScanMode, IpVersion, Verdict, Stage, DomainInfo, SpeedScope } from '../core/Types';
 import { ConfigStore, ThemeMode, UiConfig, defaultUiConfig, defaultScanConfig, PORT_OPTIONS, LIB_SOURCES, LibSource, maxScanConcurrency, defaultScanConcurrency } from '../core/ConfigStore';
+import { I18n, LangMode } from '../core/I18n';
+import { UpdateChecker, UpdateStatus, UpdateCheckResult, ReleaseInfo } from '../core/UpdateChecker';
+import { Changelog, ChangelogEntry, ChangeItem, ChangeKind } from '../core/Changelog';
+import { AppMeta } from '../core/AppMeta';
 import { AppBackground } from '../core/AppBackground';
 import { Scanner, ScanHooks, CancellationToken, PrecheckResult } from '../core/Scanner';
 import { Ranker } from '../core/Ranker';
@@ -43,6 +47,151 @@ const WARN_C: string = '#F59E0B';
 const BAD_C: string = '#F43F5E';
 const PRIMARY: string = '#4F46E5';
 
+// ============================================================================
+// 沉浸材质承载层基础设施
+//
+// 官方约束（本机 SDK component/common.d.ts:22624 systemMaterial）：
+//   "This API affects the backgroundColor, borderColor, borderWidth and shadow
+//    of the component. You are advised not to use this API together with the
+//    aforementioned APIs."
+// 也就是说：把 systemMaterial 直接挂在「同时设置了 background/linearGradient/
+// border/shadow」的卡片外框上，材质会被这些自绘属性覆盖掉 —— 这正是此前
+// 「开关能切、真机几乎看不出变化」的根因。正确做法是把材质放在一个
+// 独立的、只有透明底的子节点上（承载层），由它铺满卡片。
+// ============================================================================
+
+/** 材质对象缓存：避免每次 build 都 new ImmersiveMaterial（真机会掉帧） */
+class MatStore {
+  private static cache: Map<string, uiMaterial.Material> = new Map();
+
+  /** 惰性构造沉浸材质；任何异常都退化为 Material.empty（组件级关闭材质） */
+  static immersive(style: uiMaterial.ImmersiveStyle, dark: boolean, alpha: number,
+    liquid: boolean, shadow: boolean, light: string): uiMaterial.Material {
+    const key: string = style.toString() + '|' + (dark ? '1' : '0') + '|' + alpha.toFixed(3) +
+      '|' + (liquid ? '1' : '0') + '|' + (shadow ? '1' : '0') + '|' + light;
+    const hit: uiMaterial.Material | undefined = MatStore.cache.get(key);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let made: uiMaterial.Material = uiMaterial.Material.empty;
+    try {
+      const tint: string = dark ? 'rgba(20,22,30,' + alpha.toFixed(3) + ')'
+        : 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
+      if (liquid) {
+        const optLiquid: uiMaterial.ImmersiveOptions = {
+          style: style,
+          materialColor: tint,
+          colorInvert: false,
+          applyShadow: shadow,
+          interactive: true,
+          lightEffect: { color: light.length > 0 ? light : '#33FFFFFF' }
+        };
+        made = new uiMaterial.ImmersiveMaterial(optLiquid);
+      } else {
+        const optStatic: uiMaterial.ImmersiveOptions = {
+          style: style,
+          materialColor: tint,
+          colorInvert: false,
+          applyShadow: shadow,
+          interactive: false
+        };
+        made = new uiMaterial.ImmersiveMaterial(optStatic);
+      }
+    } catch (e) {
+      made = uiMaterial.Material.empty;
+    }
+    MatStore.cache.set(key, made);
+    return made;
+  }
+}
+
+/**
+ * 材质属性修饰器。
+ * systemMaterial 必须在 applyNormalAttribute 回调里设置，且修饰器对象要在
+ * 每次 build 时重新构造，这样才能读到最新的响应式状态（开关/档位）。
+ */
+class GlassCarrierModifier implements AttributeModifier<ToggleAttribute> {
+  private mat: uiMaterial.Material | undefined = undefined;
+  private radius: number = 20;
+
+  constructor(mat: uiMaterial.Material | undefined, radius: number) {
+    this.mat = mat;
+    this.radius = radius;
+  }
+
+  applyNormalAttribute(instance: ToggleAttribute): void {
+    instance.borderRadius(this.radius);
+    instance.clip(true);
+    instance.backgroundColor(Color.Transparent);
+    instance.hitTestBehavior(HitTestMode.None);
+    if (this.mat !== undefined && this.mat !== uiMaterial.Material.empty) {
+      instance.systemMaterial(this.mat);
+    }
+  }
+}
+
+/**
+ * 玻璃承载层：铺满父容器，只负责「系统沉浸材质」。
+ * 用 Toggle(Button) 而不是普通容器承载，是因为按钮类组件才有完整的
+ * 系统材质表面（普通容器只设 systemMaterial 在真机上不出材质）。
+ * 必须显式 matchParent 尺寸，否则塌缩为 0 宽高。
+ */
+@Component
+struct GlassCarrier {
+  /** 是否启用系统沉浸材质 */
+  @Prop enabledMat: boolean = true;
+  /** 材质厚度：0 ULTRA_THIN / 1 THIN / 2 REGULAR / 3 THICK / 4 ULTRA_THICK */
+  @Prop thickness: number = 1;
+  @Prop carrierRadius: number = 20;
+  @Prop darkMode: boolean = true;
+  /** 着色浓度 0~0.6，越小越通透 */
+  @Prop tintAlpha: number = 0.20;
+  /** 交互流光（悬浮导航等可交互表面） */
+  @Prop liquid: boolean = false;
+  @Prop lightColor: string = '';
+  /** 承载层高度（vp）：由卡片实测高度传入，避免 matchParent 把卡片撑满屏幕 */
+  @Prop carrierHeight: number = 0;
+
+  private styleOf(): uiMaterial.ImmersiveStyle {
+    if (this.thickness <= 0) {
+      return uiMaterial.ImmersiveStyle.ULTRA_THIN;
+    }
+    if (this.thickness === 1) {
+      return uiMaterial.ImmersiveStyle.THIN;
+    }
+    if (this.thickness === 2) {
+      return uiMaterial.ImmersiveStyle.REGULAR;
+    }
+    if (this.thickness === 3) {
+      return uiMaterial.ImmersiveStyle.THICK;
+    }
+    return uiMaterial.ImmersiveStyle.ULTRA_THICK;
+  }
+
+  build() {
+    Stack() {
+      if (this.enabledMat) {
+        Toggle({ type: ToggleType.Button, isOn: false }) {
+          Text('')
+            .fontSize(0)
+        }
+        .width(LayoutPolicy.matchParent)
+        .height(LayoutPolicy.matchParent)
+        .backgroundColor(Color.Transparent)
+        .enabled(false)
+        .focusable(false)
+        .hitTestBehavior(HitTestMode.None)
+        .attributeModifier(new GlassCarrierModifier(
+          MatStore.immersive(this.styleOf(), this.darkMode, this.tintAlpha, this.liquid, false, this.lightColor),
+          this.carrierRadius))
+      }
+    }
+    .width('100%')
+    .height(this.carrierHeight)
+    .hitTestBehavior(HitTestMode.None)
+  }
+}
+
 @CustomDialog
 struct CustomImportDialog {
   controller?: CustomDialogController;
@@ -52,12 +201,18 @@ struct CustomImportDialog {
   darkMode: boolean = false;
   /** 跟随页面主题色（主按钮用） */
   accentColor: string = '#C9A3A6';
+  /** 是否英文界面（跟随全局 AppStorage，切换语言后立即生效） */
+  @StorageProp('lang_en') langEn: boolean = false;
   onUrl: (u: string) => void = () => {};
   onFile: () => void = () => {};
   onSave: (t: string) => void = () => {};
   @State mode: number = 0;
   @State url: string = '';
   @State draft: string = '';
+
+  private t(zh: string, en: string): string {
+    return this.langEn ? en : zh;
+  }
 
   aboutToAppear(): void {
     this.url = this.initialUrl;
@@ -139,7 +294,7 @@ struct CustomImportDialog {
   build() {
     Column() {
       Row() {
-        Text('自定义导入')
+        Text(this.t('自定义导入', 'Custom import'))
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
           .fontColor(this.t1())
@@ -157,22 +312,22 @@ struct CustomImportDialog {
       .width('100%')
 
       if (this.mode === 0) {
-        Text('选择导入方式：来源需一行一个地址或 CIDR，可用 # 注释。')
+        Text(this.t('选择导入方式：来源需一行一个地址或 CIDR，可用 # 注释。', 'Choose an import method: one address or CIDR per line; # starts a comment.'))
           .fontSize(11)
           .fontColor(this.t3())
           .width('100%')
           .margin({ top: 10, bottom: 12 })
         Column() {
-          this.OptionRow('链接导入', '从网址拉取 IP 列表，自动识别 v4 / v6', () => { this.mode = 1; })
-          this.OptionRow('文件导入', '选择本地的 txt / csv 文件', () => {
+          this.OptionRow(this.t('链接导入', 'Import from link'), this.t('从网址拉取 IP 列表，自动识别 v4 / v6', 'Fetch an IP list from a URL; v4/v6 detected automatically'), () => { this.mode = 1; })
+          this.OptionRow(this.t('文件导入', 'Import from file'), this.t('选择本地的 txt / csv 文件', 'Choose a local txt / csv file'), () => {
             this.onFile();
             if (this.controller) { this.controller.close(); }
           })
-          this.OptionRow('文本粘贴 / 编辑', '直接粘贴或手动修改来源文本', () => { this.mode = 2; })
+          this.OptionRow(this.t('文本粘贴 / 编辑', 'Paste / edit text'), this.t('直接粘贴或手动修改来源文本', 'Paste directly or edit the source text manually'), () => { this.mode = 2; })
         }
         .width('100%')
       } else if (this.mode === 1) {
-        this.FieldLabel('链接地址')
+        this.FieldLabel(this.t('链接地址', 'Link URL'))
         TextInput({ text: this.url, placeholder: 'https://example.com/ips-v6' })
           .width('100%')
           .height(40)
@@ -184,8 +339,8 @@ struct CustomImportDialog {
           .margin({ top: 8 })
           .onChange((v: string) => { this.url = v; })
         Row() {
-          this.Btn('返回', false, '48%', () => { this.mode = 0; })
-          this.Btn('拉取导入', true, '48%', () => {
+          this.Btn(this.t('返回', 'Back'), false, '48%', () => { this.mode = 0; })
+          this.Btn(this.t('拉取导入', 'Fetch and import'), true, '48%', () => {
             this.onUrl(this.url.trim());
             if (this.controller) { this.controller.close(); }
           })
@@ -194,8 +349,8 @@ struct CustomImportDialog {
         .justifyContent(FlexAlign.SpaceBetween)
         .margin({ top: 14 })
       } else {
-        this.FieldLabel('来源文本')
-        TextArea({ text: this.draft, placeholder: '每行一个：1.2.3.4 / 1.2.3.4:8443 / [2001:db8::1]:443 / CIDR' })
+        this.FieldLabel(this.t('来源文本', 'Source text'))
+        TextArea({ text: this.draft, placeholder: this.t('每行一个：1.2.3.4 / 1.2.3.4:8443 / [2001:db8::1]:443 / CIDR', 'One per line: 1.2.3.4 / 1.2.3.4:8443 / [2001:db8::1]:443 / CIDR') })
           .width('100%')
           .height(176)
           .fontSize(12)
@@ -206,8 +361,8 @@ struct CustomImportDialog {
           .margin({ top: 8 })
           .onChange((v: string) => { this.draft = v; })
         Row() {
-          this.Btn('清空', false, '48%', () => { this.draft = ''; })
-          this.Btn('保存并启用', true, '48%', () => {
+          this.Btn(this.t('清空', 'Clear'), false, '48%', () => { this.draft = ''; })
+          this.Btn(this.t('保存并启用', 'Save and enable'), true, '48%', () => {
             this.onSave(this.draft);
             if (this.controller) { this.controller.close(); }
           })
@@ -324,7 +479,7 @@ struct Index {
 
   // 扫描状态
   @State scanning: boolean = false;
-  @State phaseText: string = '就绪';
+  @State phaseText: string = '';
   @State done: number = 0;
   @State total: number = 0;
   @State passed: number = 0;
@@ -366,7 +521,7 @@ struct Index {
         this.mode = ScanMode.CUSTOM;
         this.srcIdx = 3;
         this.scheduleScanSave();
-        this.toast(this.customText.length > 0 ? '已保存自定义来源' : '自定义来源已清空');
+        this.toast(this.customText.length > 0 ? this.t('已保存自定义来源', 'Custom source saved') : this.t('自定义来源已清空', 'Custom source cleared'));
       }
     }),
     autoCancel: true,
@@ -374,13 +529,33 @@ struct Index {
   });
   @State sampleText: string = '2000';
   @State cfgRev: number = 0;
+  /** 扫描页「高级选项」是否展开（默认收起，压缩页面长度） */
+  @State advParamOpen: boolean = false;
+  @State showParamNotes: boolean = false;
+  /** 冷启动时的应用内启动页：用应用主题渲染，覆盖系统启动窗口与首帧之间的空档 */
+  /** 宽屏扫描页左列实测高度（vp），用于把第二列卡片底部撑到同一水平线 */
+  @State scanLeftColH: number = 0;
+
+  /** 宽屏下第二列卡片的最小高度：左列高度减去卡片自身下外边距；手机端返回 0（不干预） */
+  private speedCardMinH(): number {
+    if (this.winW < 900 || this.scanLeftColH <= 12) {
+      return 0;
+    }
+    return this.scanLeftColH - 12;
+  }
+  /** 更新日志中当前展开的版本号，空串表示全部折叠 */
+  @State changelogOpen: string = '';
+  /** 测速页「高级选项」是否展开 */
+  @State advSpeedOpen: boolean = false;
+  @State advUploadOpen: boolean = false;
+  @State bgAdvancedOpen: boolean = false;
   @State concurrencyText: string = defaultScanConcurrency().toString();
   @State latencyText: string = '300';
   /** 延迟上限建议提示（随 IPv4/IPv6 变化） */
-  @State latencyHint: string = '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）';
+  @State latencyHint: string = '';
   @State bgPath: string = '';
   /** 底部胶囊拖动时的指尖 x（-1 表示未触摸） */
-  @State pingText: string = '2';
+  @State pingText: string = '1';
   @State speedCountText: string = '10';
   @State speedRoundsText: string = '1';
   @State speedWindowText: string = '3000';
@@ -408,6 +583,30 @@ struct Index {
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
   @State appVersion: string = '1.4.0';
+  // ===== 语言 =====
+  @State langMode: number = LangMode.SYSTEM;
+  @State langEn: boolean = false;
+  // ===== 设置二级页：-1 首页，>=0 具体分类 =====
+  @State settingsSub: number = -1;
+  /** 手机：当前内嵌展开的分类（默认展开「外观与主题」） */
+  @State settingsAccordion: number = 0;   // 已废弃：手机改为分类详情页，保留字段避免其他地方引用报错
+  /** 平板/电脑：左侧菜单选中的分类（默认外观与主题） */
+  @State settingsPane: number = 0;
+  private settingsSubScroller: Scroller = new Scroller();
+  private settingsScrollCache: number = 0;
+  // ===== 更新检查 =====
+  @State updStatus: number = UpdateStatus.IDLE;
+  @State updDetail: string = '';
+  @State updLatestVersion: string = '';
+  @State updLatestDate: string = '';
+  @State updLatestNotes: string = '';
+  @State updLatestUrl: string = '';
+  @State updHasPackage: boolean = false;
+  @State updFromFallback: boolean = false;
+  // ===== 更新日志 / 升级说明 =====
+  @State showChangelogDialog: boolean = false;
+  @State changelogVersion: string = '';
+  private static readonly CHANGELOG_SEEN_KEY: string = 'changelog_seen_version';
   /** IPv6 网络诊断：运行状态与结果文本 */
   @State diagBusy: boolean = false;
   @State diagText: string = '';
@@ -460,13 +659,13 @@ struct Index {
       const net: connection.NetHandle = connection.getDefaultNetSync();
       if (net.netId === 0) {
         this.netOk = false;
-        this.addLog('未检测到可用网络，请先连接 Wi-Fi 或移动数据');
+        this.addLog(this.t('未检测到可用网络，请先连接 Wi-Fi 或移动数据', 'No network detected. Connect to Wi-Fi or mobile data first.'));
       } else {
         this.netOk = true;
       }
     } catch (e) {
       const err: BusinessError = e as BusinessError;
-      this.addLog('网络状态检测失败：' + err.message);
+      this.addLog(this.t('网络状态检测失败：', 'Network status check failed: ') + err.message);
     }
   }
   /** 从 cloudflare trace 文本里取 ip= 那一行 */
@@ -534,17 +733,17 @@ struct Index {
         return;
       }
       if (this.isPrivateIp(ip) || warpOn) {
-        this.addLog('网络环境：出口 IP ' + ip + (warpOn ? '（WARP 已开启）' : '（私有地址）') +
-          '，建议关闭代理后重新测速');
+        this.addLog(this.t('网络环境：出口 IP ', 'Network: egress IP ') + ip + (warpOn ? this.t('（WARP 已开启）', ' (WARP enabled)') : this.t('（私有地址）', ' (private address)')) +
+          this.t('，建议关闭代理后重新测速', ', turn off the proxy and re-run the speed test'));
         setTimeout(() => {
-          this.toast('检测到当前网络经过代理，测速结果会失真，建议先关闭代理');
+          this.toast(this.t('检测到当前网络经过代理，测速结果会失真，建议先关闭代理', 'A proxy was detected on this network; speed test results will be inaccurate. Turn off the proxy first.'));
         }, 700);
       } else {
-        this.addLog('网络环境：出口 IP ' + ip);
+        this.addLog(this.t('网络环境：出口 IP ', 'Network: egress IP ') + ip);
       }
     }).catch((e: BusinessError) => {
       req.destroy();
-      this.addLog('网络环境检测失败：' + e.message);
+      this.addLog(this.t('网络环境检测失败：', 'Network check failed: ') + e.message);
     });
   }
 
@@ -571,7 +770,7 @@ struct Index {
       }
     } catch (e) {
       const be: BusinessError = e as BusinessError;
-      this.addLog('读取版本号失败：' + be.message);
+      this.addLog(this.t('读取版本号失败：', 'Failed to read version: ') + be.message);
     }
     this.ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
 
@@ -587,8 +786,9 @@ struct Index {
       this.initEtConfig();
       this.glassLevel = ConfigStore.glassLevel();
       this.loadUi();
+      this.maybeShowChangelog();
     }).catch((e: BusinessError) => {
-      this.addLog('读取配置失败：' + e.message);
+      this.addLog(this.t('读取配置失败：', 'Failed to read settings: ') + e.message);
     });
     BarStyle.apply(this.dark);
     this.runEntrance(true);
@@ -619,7 +819,7 @@ struct Index {
     this.entranceTimer = setTimeout(() => {
       this.entranceTimer = -1;
       if (!this.netOk) {
-        this.toast('当前无网络连接，请先联网再开始优选');
+        this.toast(this.t('当前无网络连接，请先联网再开始优选', 'No network connection. Connect to the internet before starting selection.'));
       }
     }, 900);
   }
@@ -677,12 +877,12 @@ struct Index {
   /** 主题按钮文案 */
   private themeLabel(): string {
     if (this.themeMode === ThemeMode.DARK) {
-      return '深色';
+      return this.t('深色', 'Dark');
     }
     if (this.themeMode === ThemeMode.LIGHT) {
-      return '浅色';
+      return this.t('浅色', 'Light');
     }
-    return '跟随系统';
+    return this.t('跟随系统', 'Follow system');
   }
 
   loadConfig(): void {
@@ -709,7 +909,7 @@ struct Index {
     this.keepAlive = ConfigStore.keepAlive();
     AppBackground.enabled = this.keepAlive;
     this.regionCode = c.regionCode;
-    this.latencyHint = '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）';
+    this.latencyHint = this.t('建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）', 'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
     this.bgPath = ConfigStore.bgPath();
   }
 
@@ -717,7 +917,7 @@ struct Index {
   private async pickBackground(): Promise<void> {
     const ctx = this.ctx;
     if (ctx === undefined) {
-      this.toast('应用上下文未就绪');
+      this.toast(this.t('应用上下文未就绪', 'App context not ready'));
       return;
     }
     try {
@@ -735,11 +935,11 @@ struct Index {
       fileIo.closeSync(f);
       this.bgPath = dst;
       await ConfigStore.saveBgPath(dst);
-      this.addLog('已设置自定义背景图');
-      this.toast('背景已更新');
+      this.addLog(this.t('已设置自定义背景图', 'Custom background image set'));
+      this.toast(this.t('背景已更新', 'Background updated'));
     } catch (e) {
       const err = e as BusinessError;
-      this.toast('选择背景失败：' + err.message);
+      this.toast(this.t('选择背景失败：', 'Failed to select background: ') + err.message);
     }
   }
 
@@ -747,8 +947,8 @@ struct Index {
   private async clearBackground(): Promise<void> {
     this.bgPath = '';
     await ConfigStore.saveBgPath('');
-    this.addLog('已恢复默认渐变背景');
-    this.toast('已恢复默认背景');
+    this.addLog(this.t('已恢复默认渐变背景', 'Default gradient background restored'));
+    this.toast(this.t('已恢复默认背景', 'Default background restored'));
   }
 
   /** 当前生效的预设背景序号，-1 表示未使用预设 */
@@ -768,19 +968,19 @@ struct Index {
   private bgPathLabel(): string {
     const p: number = this.presetBgIndex();
     if (p >= 0) {
-      return '当前：预设背景 ' + (p + 1);
+      return this.t('当前：预设背景 ', 'Current: preset background ') + (p + 1);
     }
     if (this.bgPath.length > 0) {
-      return '当前：图库自定义图片';
+      return this.t('当前：图库自定义图片', 'Current: custom image from gallery');
     }
-    return '默认使用渐变背景';
+    return this.t('默认使用渐变背景', 'Uses the gradient background by default');
   }
 
   /** 应用内置预设背景：从 rawfile 复制进沙箱，与图库选择共用同一条渲染/持久化路径 */
   private async usePresetBackground(index: number): Promise<void> {
     const ctx = this.ctx;
     if (ctx === undefined) {
-      this.toast('应用上下文未就绪');
+      this.toast(this.t('应用上下文未就绪', 'App context not ready'));
       return;
     }
     try {
@@ -793,21 +993,21 @@ struct Index {
       fileIo.closeSync(f);
       this.bgPath = dst;
       await ConfigStore.saveBgPath(dst);
-      this.addLog('已应用预设背景 ' + (index + 1));
-      this.toast('背景已更新');
+      this.addLog(this.t('已应用预设背景 ', 'Preset background applied: ') + (index + 1));
+      this.toast(this.t('背景已更新', 'Background updated'));
     } catch (e) {
       const err = e as BusinessError;
-      this.toast('应用预设背景失败：' + err.message);
+      this.toast(this.t('应用预设背景失败：', 'Failed to apply preset background: ') + err.message);
     }
   }
   /** 进度条左侧文案：同时显示成功/失败数，避免「整数进度」看不出失败 */
   progressLabel(): string {
     if (this.total <= 0) {
-      return '就绪';
+      return this.t('就绪', 'Ready');
     }
     let s: string = this.done.toString() + '/' + this.total.toString();
     if (this.passed + this.failed > 0) {
-      s += ' · 通过 ' + this.passed.toString() + ' · 未通过 ' + this.failed.toString();
+      s += this.t(' · 通过 ', ' · Passed ') + this.passed.toString() + this.t(' · 未通过 ', ' · Failed ') + this.failed.toString();
     }
     return s;
   }
@@ -887,7 +1087,7 @@ struct Index {
 
   /** 切换 IPv4/IPv6 时更新建议值；若当前仍是另一协议的默认值，则自动跟随 */
   private maybeAutoSuggest(v6: boolean): void {
-    this.latencyHint = '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）';
+    this.latencyHint = this.t('建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）', 'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
     if (v6) {
       this.latencyHint = this.latencyHint;
     }
@@ -895,15 +1095,36 @@ struct Index {
   }
 
   /** 一键应用建议参数（IPv4/IPv6 统一：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s） */
+  /** 参数输入框的当前值（直接读 @State，保证按钮/外部修改能立即回显） */
+  private paramValue(field: string): string {
+    if (field === 'sample') {
+      return this.sampleText;
+    }
+    if (field === 'conc') {
+      return this.concurrencyText;
+    }
+    if (field === 'lat') {
+      return this.latencyText;
+    }
+    if (field === 'ping') {
+      return this.pingText;
+    }
+    if (field === 'minSpeed') {
+      return this.minSpeedText;
+    }
+    return '';
+  }
+
   private applySuggestedParams(): void {
     this.sampleText = '3000';
-    this.cfgRev++;
     this.concurrencyText = '30';
     this.latencyText = '300';
     this.pingText = '1';
     this.minSpeedText = '0.1';
+    // 全部写完再换一次 id：TextInput 的 text 只作初值，需重建才能回显被抳截/规范化后的值
+    this.cfgRev++;
     this.scheduleScanSave();
-    this.toast('已应用建议参数：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s（IPv4/IPv6 统一）');
+    this.toast(this.t('已应用建议参数：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s（IPv4/IPv6 统一）', 'Applied recommended settings: 3000 samples, 30 threads, 300ms latency cap, 1 ping, 0.1MB/s min speed (same for IPv4/IPv6)'));
   }
 
   /** 滚动回调：只在跨越阈值时改 @State，避免滚动过程中每帧重建整个页面 */
@@ -987,25 +1208,25 @@ struct Index {
   doResolve(): void {
     const d: string = DnsService.normalize(this.domain);
     if (!DnsService.isValidDomain(d)) {
-      this.domainInfoText = '请先填写有效域名，例如 cdn.example.com';
+      this.domainInfoText = this.t('请先填写有效域名，例如 cdn.example.com', 'Enter a valid domain, e.g. cdn.example.com');
       return;
     }
     this.resolving = true;
-    this.domainInfoText = '解析中…';
+    this.domainInfoText = this.t('解析中…', 'Resolving…');
     DnsService.resolve(d).then((info: DomainInfo) => {
       this.resolving = false;
       if (info.ok) {
         let cf: number = 0;
         for (let i = 0; i < info.ips.length; i++) {
-          this.addLog('解析到 ' + info.ips[i]);
+          this.addLog(this.t('解析到 ', 'Resolved ') + info.ips[i]);
         }
-        this.domainInfoText = '解析到 ' + info.ips.length.toString() + ' 个地址';
+        this.domainInfoText = this.t('解析到 ', 'Resolved ') + info.ips.length.toString() + this.t(' 个地址', ' addresses');
       } else {
-        this.domainInfoText = '解析失败：' + info.error;
+        this.domainInfoText = this.t('解析失败：', 'Resolve failed: ') + info.error;
       }
     }).catch((e: BusinessError) => {
       this.resolving = false;
-      this.domainInfoText = '解析失败：' + e.message;
+      this.domainInfoText = this.t('解析失败：', 'Resolve failed: ') + e.message;
     });
   }
 
@@ -1015,7 +1236,7 @@ struct Index {
     }
     this.checkNetwork();
     if (!this.netOk) {
-      this.toast('没有网络连接，无法开始扫描');
+      this.toast(this.t('没有网络连接，无法开始扫描', 'No network connection; cannot start scanning'));
       return;
     }
     const c: ScanConfig = this.buildConfig();
@@ -1023,7 +1244,7 @@ struct Index {
     ConfigStore.save(c).then(() => {
       return;
     }).catch((e: BusinessError) => {
-      this.addLog('保存配置失败：' + e.message);
+      this.addLog(this.t('保存配置失败：', 'Failed to save settings: ') + e.message);
     });
     // 新一轮任务：递增代次 + 全新令牌；清掉上一轮节流定时器，旧任务回调一律作废
     this.scanGen++;
@@ -1033,7 +1254,7 @@ struct Index {
     this.clearScanTimers();
     this.scanning = true;
     AppBackground.hold('scan');
-    setTimeout(() => { this.addLog('后台保活：' + AppBackground.lastState); }, 1500);
+    setTimeout(() => { this.addLog(this.t('后台保活：', 'Background keep-alive: ') + AppBackground.lastState); }, 1500);
     this.startHeartbeat(gen);
     this.results = [];
     this.pingList = [];
@@ -1049,7 +1270,7 @@ struct Index {
     this.failedRaw = 0;
     this.logs = [];
     this.logBuf = [];
-    this.phaseText = '准备中';
+    this.phaseText = this.t('准备中', 'Preparing');
     this.curTab = 0;
 
     const alive = (): boolean => gen === this.scanGen && !myToken.isCancelled();
@@ -1091,31 +1312,31 @@ struct Index {
       if (myToken.isCancelled()) {
         this.scanning = false;
         this.stopHeartbeat();
-        this.phaseText = '已停止';
-        this.addLog('已停止：不再继续后续阶段');
+        this.phaseText = this.t('已停止', 'Stopped');
+        this.addLog(this.t('已停止：不再继续后续阶段', 'Stopped: no further stages will run'));
         AppBackground.release('scan');
         return;
       }
       this.results = list;
-      this.phaseText = '第一轮完成';
+      this.phaseText = this.t('第一轮完成', 'Round 1 complete');
       this.splitResults(list);
       if (this.pingList.length === 0) {
         // 一个都没通过：明确告诉用户，而不是给一片空白
         const v6: boolean = c.ipVersion === IpVersion.V6;
         const lowCount: number = list.filter((x: Candidate) => x.remark === '合格速度不达标').length;
-        this.phaseText = v6 ? 'IPv6 无可用节点' : '没有可用节点';
+        this.phaseText = v6 ? this.t('IPv6 无可用节点', 'No usable IPv6 nodes') : this.t('没有可用节点', 'No usable nodes');
         this.addLog(v6
           ? (lowCount > 0
-            ? '第一轮没有通过的节点：其中 ' + lowCount.toString() +
-              ' 个因合格速度未达标被淘汰，可调低「合格速度」；若仍无结果，请检查网络是否支持 IPv6。'
-            : '第一轮没有通过的节点。若当前网络不支持 IPv6，或该网段不可达，都会是这个结果。')
+            ? this.t('第一轮没有通过的节点：其中 ', 'No nodes passed round 1; of which ') + lowCount.toString() +
+              this.t(' 个因合格速度未达标被淘汰，可调低「合格速度」；若仍无结果，请检查网络是否支持 IPv6。', ' nodes were dropped for being below the minimum speed; lower "Min speed". If there are still no results, check whether your network supports IPv6.')
+            : this.t('第一轮没有通过的节点。若当前网络不支持 IPv6，或该网段不可达，都会是这个结果。', 'No nodes passed round 1. This is expected if your network does not support IPv6 or the subnet is unreachable.'))
           : (lowCount > 0
-            ? '第一轮没有通过的节点：其中 ' + lowCount.toString() +
-              ' 个因合格速度未达标被淘汰，可调低「合格速度」或设为 0；其余请检查网络连接或调高「延迟上限」。'
-            : '第一轮没有通过的节点。请检查网络连接，或调高「延迟上限」。'));
+            ? this.t('第一轮没有通过的节点：其中 ', 'No nodes passed round 1; of which ') + lowCount.toString() +
+              this.t(' 个因合格速度未达标被淘汰，可调低「合格速度」或设为 0；其余请检查网络连接或调高「延迟上限」。', ' nodes were dropped for being below the minimum speed; lower "Min speed" or set it to 0, and otherwise check your network or raise the "Latency cap".')
+            : this.t('第一轮没有通过的节点。请检查网络连接，或调高「延迟上限」。', 'No nodes passed round 1. Check your network connection or raise the "Latency cap".')));
         this.toast(lowCount > 0
-          ? ('没有可用节点：' + lowCount.toString() + ' 个低于合格速度门槛')
-          : (v6 ? '当前网络可能不支持 IPv6，未发现可用节点' : '没有可用节点，请检查网络或调高延迟上限'));
+          ? (this.t('没有可用节点：', 'No usable nodes: ') + lowCount.toString() + this.t(' 个低于合格速度门槛', ' below the minimum speed'))
+          : (v6 ? this.t('当前网络可能不支持 IPv6，未发现可用节点', 'Your network may not support IPv6; no usable nodes found') : this.t('没有可用节点，请检查网络或调高延迟上限', 'No usable nodes. Check your network or raise the latency cap.')));
         this.scanning = false;
         this.curTab = 1;
         AppBackground.release('scan');
@@ -1123,7 +1344,7 @@ struct Index {
       }
       const scope: number = c.speedScope;
       if (!c.enableSpeed) {
-        this.addLog('第一轮筛选完成（测速已关闭），可在「筛选」页查看地区分布');
+        this.addLog(this.t('第一轮筛选完成（测速已关闭），可在「筛选」页查看地区分布', 'Round 1 filtering complete (speed test off). View region distribution on the "Filter" tab.'));
         this.scanning = false;
         this.curTab = 1;
         AppBackground.release('scan');
@@ -1131,23 +1352,23 @@ struct Index {
       }
       this.curTab = 1;
       if (scope === SpeedScope.REGION) {
-        this.addLog('第一轮筛选完成：请填地区码后点「开始测速」，程序会先做质量预检再正式测速');
+        this.addLog(this.t('第一轮筛选完成：请填地区码后点「开始测速」，程序会先做质量预检再正式测速', 'Round 1 filtering complete: enter a region code and tap "Start speed test"; a quality pre-check runs before the real test'));
         this.scanning = false;
         AppBackground.release('scan');
         return;
       }
-      this.addLog('第一轮筛选完成，开始质量预检（三种测速范围都先预检再测速）');
+      this.addLog(this.t('第一轮筛选完成，开始质量预检（三种测速范围都先预检再测速）', 'Round 1 filtering complete; starting quality pre-check (all three speed test scopes pre-check before the real test)'));
       this.runPrecheck(gen, c, myToken).catch((e: BusinessError) => {
         this.scanning = false;
-        this.phaseText = '预检出错';
+        this.phaseText = this.t('预检出错', 'Pre-check error');
         AppBackground.release('scan');
-        this.addLog('质量预检异常：' + e.message);
+        this.addLog(this.t('质量预检异常：', 'Quality pre-check error: ') + e.message);
       });
     }).catch((e: BusinessError) => {
       this.scanning = false;
-      this.phaseText = '出错';
+      this.phaseText = this.t('出错', 'Error');
       AppBackground.release('scan');
-      this.addLog('扫描异常：' + e.message);
+      this.addLog(this.t('扫描异常：', 'Scan error: ') + e.message);
     });
   }
 
@@ -1181,8 +1402,8 @@ struct Index {
     this.pcTarget = 0;
     this.pcCandidates = 0;
     this.pcExhausted = false;
-    this.pcMsg = '正在按延迟从低到高检测合格速度…';
-    this.phaseText = '质量预检';
+    this.pcMsg = this.t('正在按延迟从低到高检测合格速度…', 'Checking minimum speed in ascending latency order…');
+    this.phaseText = this.t('质量预检', 'Quality pre-check');
     const alive = (): boolean => gen === this.scanGen && !myToken.isCancelled();
     const hooks: ScanHooks = new ScanHooks();
     hooks.onPhase = (phase: number, text: string) => {
@@ -1209,7 +1430,7 @@ struct Index {
       }
       this.pcTarget = target;
       this.pcCandidates = candidates;
-      this.pcMsg = '候选 ' + candidates.toString() + ' 个，目标达标 ' + target.toString() + ' 个';
+      this.pcMsg = this.t('候选 ', 'Candidates: ') + candidates.toString() + this.t(' 个，目标达标 ', ', target ') + target.toString() + this.t(' 个', ' nodes');
     };
     hooks.onPrecheckTick = (checked: number, qualified: number, inflight: number, target: number) => {
       if (!alive()) {
@@ -1218,9 +1439,9 @@ struct Index {
       this.pcChecked = checked;
       this.pcQualified = qualified;
       this.pcTarget = target;
-      this.pcMsg = '检测 ' + checked.toString() + ' · 合格 ' +
+      this.pcMsg = this.t('检测 ', 'Checked ') + checked.toString() + this.t(' · 合格 ', ' · Qualified ') +
         (target > 0 && qualified > target ? target : qualified).toString() +
-        ' · 在测 ' + inflight.toString() + ' · 目标 ' + target.toString();
+        this.t(' · 在测 ', ' · Testing ') + inflight.toString() + this.t(' · 目标 ', ' · Target ') + target.toString();
     };
     hooks.onPrecheckDone = (qualified: number, checked: number, exhausted: boolean, target: number) => {
       if (!alive()) {
@@ -1241,16 +1462,16 @@ struct Index {
       this.precheckDone = true;
       this.scanning = false;
       if (res.cancelled) {
-        this.phaseText = '已停止';
-        this.pcMsg = '预检已取消';
-        this.addLog('已停止：质量预检未完成');
+        this.phaseText = this.t('已停止', 'Stopped');
+        this.pcMsg = this.t('预检已取消', 'Pre-check cancelled');
+        this.addLog(this.t('已停止：质量预检未完成', 'Stopped: quality pre-check not finished'));
         AppBackground.release('scan');
         return;
       }
       if (res.list.length === 0) {
-        this.pcMsg = '预检后没有达标节点';
-        this.phaseText = '预检完成：0 个达标';
-        this.addLog('质量预检结束：检测 ' + res.checked.toString() + ' 个，0 个达标；可调低「合格速度」或检查网络');
+        this.pcMsg = this.t('预检后没有达标节点', 'No nodes met the target after pre-check');
+        this.phaseText = this.t('预检完成：0 个达标', 'Pre-check complete: 0 met target');
+        this.addLog(this.t('质量预检结束：检测 ', 'Quality pre-check finished: checked ') + res.checked.toString() + this.t(' 个，0 个达标；可调低「合格速度」或检查网络', ' nodes, 0 met target; lower "Min speed" or check your network'));
         this.curTab = 1;
         AppBackground.release('scan');
         return;
@@ -1260,8 +1481,8 @@ struct Index {
       this.buildGroups(this.pingList);
       this.speedList = [];
       this.speedStates = [];
-      this.addLog('质量预检完成：检测 ' + res.checked.toString() + ' 个，达标 ' +
-        res.list.length.toString() + ' 个，开始正式测速');
+      this.addLog(this.t('质量预检完成：检测 ', 'Quality pre-check complete: checked ') + res.checked.toString() + this.t(' 个，达标 ', ' nodes, ') +
+        res.list.length.toString() + this.t(' 个，开始正式测速', ' met target, starting the real speed test'));
       this.startHeartbeat(gen);
       AppBackground.release('scan');
       this.startSpeedTest(res.list);
@@ -1271,8 +1492,8 @@ struct Index {
       }
       this.precheckActive = false;
       this.scanning = false;
-      this.phaseText = '预检出错';
-      this.addLog('质量预检异常：' + (e as BusinessError).message);
+      this.phaseText = this.t('预检出错', 'Pre-check error');
+      this.addLog(this.t('质量预检异常：', 'Quality pre-check error: ') + (e as BusinessError).message);
       AppBackground.release('scan');
     }
   }
@@ -1283,7 +1504,7 @@ struct Index {
       return;
     }
     if (this.pingList.length === 0) {
-      this.toast('请先在「扫描」页完成第一轮筛选');
+      this.toast(this.t('请先在「扫描」页完成第一轮筛选', 'Complete round 1 filtering on the "Scan" tab first'));
       return;
     }
     if (!this.precheckDone) {
@@ -1297,9 +1518,9 @@ struct Index {
       this.startHeartbeat(gen);
       this.runPrecheck(gen, this.buildConfig(), myToken).catch((e: BusinessError) => {
         this.scanning = false;
-        this.phaseText = '预检出错';
+        this.phaseText = this.t('预检出错', 'Pre-check error');
         AppBackground.release('scan');
-        this.addLog('质量预检异常：' + e.message);
+        this.addLog(this.t('质量预检异常：', 'Quality pre-check error: ') + e.message);
       });
       return;
     }
@@ -1312,7 +1533,7 @@ struct Index {
     }
     const base: Candidate[] = (targets !== undefined && targets.length > 0) ? targets : this.pingList;
     if (base.length === 0) {
-      this.toast('请先在「扫描」页完成第一轮筛选');
+      this.toast(this.t('请先在「扫描」页完成第一轮筛选', 'Complete round 1 filtering on the "Scan" tab first'));
       return;
     }
     this.precheckActive = false;
@@ -1321,7 +1542,7 @@ struct Index {
     ConfigStore.save(c).then(() => {
       return;
     }).catch((e: BusinessError) => {
-      this.addLog('保存配置失败：' + e.message);
+      this.addLog(this.t('保存配置失败：', 'Failed to save settings: ') + e.message);
     });
     this.scanGen++;
     const gen: number = this.scanGen;
@@ -1337,7 +1558,7 @@ struct Index {
     AppBackground.hold('speed');
     // 换地区/换模式重测时，必须清空上一轮的速度结果，否则会残留别的地区的节点
     this.speedList = [];
-    this.phaseText = '准备测速';
+    this.phaseText = this.t('准备测速', 'Preparing speed test');
     this.curTab = 2;
 
     const alive = (): boolean => gen === this.scanGen && !myToken.isCancelled();
@@ -1404,21 +1625,21 @@ struct Index {
         // 被用户停止时也要复位 scanning，否则「重新测速」按钮会被
         // startSpeedTest 开头的 if (this.scanning) return 挡住，看起来像没反应。
         this.scanning = false;
-        this.phaseText = '已停止';
-        this.addLog('已停止测速');
+        this.phaseText = this.t('已停止', 'Stopped');
+        this.addLog(this.t('已停止测速', 'Speed test stopped'));
         AppBackground.release('speed');
         return;
       }
       this.scanning = false;
-      this.phaseText = '测速完成';
+      this.phaseText = this.t('测速完成', 'Speed test complete');
       Ranker.apply(this.results, c);
       this.splitResults(this.results);
-      this.addLog('第二轮测速完成，共 ' + this.speedList.length.toString() + ' 个节点');
+      this.addLog(this.t('第二轮测速完成，共 ', 'Round 2 speed test complete: ') + this.speedList.length.toString() + this.t(' 个节点', ' nodes'));
       // 开了自动上传就把这批结果推到 edgetunnel 订阅；配置不完整时记一条日志后台跳过，
       // 避免每次测速结束都弹失败提示。
       if (this.etEnabled) {
         if (!this.etReady()) {
-          this.addLog('已开启订阅自动上传，但' + (this.etWay === 1 ? 'API 直传参数' : '域名或密码') + '未填，跳过本次上传');
+          this.addLog(this.t('已开启订阅自动上传，但', 'Subscription auto-upload is on, but ') + (this.etWay === 1 ? this.t('API 直传参数', 'API direct upload parameters') : this.t('域名或密码', 'the domain or password')) + this.t('未填，跳过本次上传', ' not set; skipping this upload'));
         } else {
           this.uploadEdgeTunnel(true);
         }
@@ -1426,9 +1647,9 @@ struct Index {
       AppBackground.release('speed');
     }).catch((e: BusinessError) => {
       this.scanning = false;
-      this.phaseText = '测速出错';
+      this.phaseText = this.t('测速出错', 'Speed test error');
       AppBackground.release('speed');
-      this.addLog('测速异常：' + e.message);
+      this.addLog(this.t('测速异常：', 'Speed test error: ') + e.message);
     });
   }
   stopScan(): void {
@@ -1440,8 +1661,8 @@ struct Index {
     this.scanning = false;
     this.clearScanTimers();
     this.stopHeartbeat();
-    this.phaseText = '已停止';
-    this.addLog('用户停止了扫描');
+    this.phaseText = this.t('已停止', 'Stopped');
+    this.addLog(this.t('用户停止了扫描', 'User stopped the scan'));
     AppBackground.release('scan');
     AppBackground.release('speed');
   }
@@ -1471,8 +1692,8 @@ struct Index {
         this.stopHeartbeat();
         return;
       }
-      this.addLog('运行中 · 完成 ' + this.doneRaw.toString() + '/' + this.totalRaw.toString() +
-        ' · 通过 ' + this.passedRaw.toString() + '（后台保活' + (AppBackground.enabled ? '开' : '关') + '）');
+      this.addLog(this.t('运行中 · 完成 ', 'Running · Done ') + this.doneRaw.toString() + '/' + this.totalRaw.toString() +
+        this.t(' · 通过 ', ' · Passed ') + this.passedRaw.toString() + this.t('（后台保活', ' (background keep-alive: ') + (AppBackground.enabled ? this.t('开', 'On') : this.t('关', 'Off')) + '）');
     }, 5000);
   }
 
@@ -1500,11 +1721,11 @@ struct Index {
 
   async doExport(fmt: ExportFormat): Promise<void> {
     if (this.speedList.length === 0) {
-      this.toast('还没有测速结果');
+      this.toast(this.t('还没有测速结果', 'No speed test results yet'));
       return;
     }
     if (this.ctx === undefined || this.ctx === null) {
-      this.toast('上下文未就绪');
+      this.toast(this.t('上下文未就绪', 'App context not ready'));
       return;
     }
     const opt = defaultExportOptions();
@@ -1520,16 +1741,16 @@ struct Index {
     try {
       const saved: string = await FileSaver.saveText(this.ctx, name, text);
       if (saved.length === 0) {
-        this.toast('已取消保存');
-        this.addLog('导出已取消');
+        this.toast(this.t('已取消保存', 'Save cancelled'));
+        this.addLog(this.t('导出已取消', 'Export cancelled'));
         return;
       }
-      this.toast('已保存：' + saved);
-      this.addLog('导出 ' + name + ' → ' + saved);
+      this.toast(this.t('已保存：', 'Saved: ') + saved);
+      this.addLog(this.t('导出 ', 'Export ') + name + ' → ' + saved);
     } catch (e) {
       const err: BusinessError = e as BusinessError;
-      this.toast('保存失败：' + err.message);
-      this.addLog('导出失败：' + err.message);
+      this.toast(this.t('保存失败：', 'Save failed: ') + err.message);
+      this.addLog(this.t('导出失败：', 'Export failed: ') + err.message);
     }
   }
   // ---------- 主题色 ----------
@@ -1559,7 +1780,7 @@ struct Index {
   }
 
   txt3(): string {
-    return this.dark ? '#8B8B95' : '#94A3B8';
+    return this.dark ? '#8B8B95' : '#64748B';
   }
 
   soft(): string {
@@ -1572,7 +1793,7 @@ struct Index {
 
   coloText(c: Candidate): string {
     if (c.colo.length === 0) {
-      return '未知地区';
+      return this.t('未知地区', 'Unknown region');
     }
     return Geo.placeZh(c.colo.toUpperCase());
   }
@@ -1626,6 +1847,7 @@ struct Index {
             .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
             .hitTestBehavior(HitTestMode.None)
         }
+        this.AuroraLayer()
       }
 
       // 正常流式布局：标题区在最顶上直接占位，不再用覆盖层遮罩
@@ -1657,7 +1879,7 @@ struct Index {
                   .borderRadius(this.CHIP_H / 2)
                   .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : this.soft())
                   .linearGradient({ angle: 180, colors: this.floatSheen() })
-                  .systemMaterial(this.shouldUseCardMaterial() ? this.cardMaterial() : undefined)
+                  .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.COMPONENT_THIN : BlurStyle.NONE)
                   .border({ width: 1, color: this.navGlassBorder() })
                 .shadow({
                   radius: this.dark ? 12 : 14,
@@ -1668,7 +1890,7 @@ struct Index {
                 .onClick(() => {
                   this.setThemeMode((this.themeMode + 1) % 3);
                 })
-                .accessibilityText('切换外观模式，当前' + this.themeLabel())
+                .accessibilityText(this.t('切换外观模式，当前', 'Switch appearance mode; current: ') + this.themeLabel())
               }
               .alignItems(VerticalAlign.Center)
               .width('100%')
@@ -1692,70 +1914,13 @@ struct Index {
 
 
         Stack({ alignContent: Alignment.Top }) {
-        HdsTabs({ index: this.curTab, barPosition: BarPosition.End }) {
-          TabContent() {
-            Column() {
-              this.ScanPage()
-            }
-            .width('100%')
-            .height('100%')
-          }.tabBar(this.TabItem('扫描', 0))
-
-          TabContent() {
-            Column() {
-              this.PingPage()
-            }
-            .width('100%')
-            .height('100%')
-          }.tabBar(this.TabItem('筛选', 1))
-
-          TabContent() {
-            Column() {
-              this.SpeedPage()
-            }
-            .width('100%')
-            .height('100%')
-          }.tabBar(this.TabItem('测速', 2))
-    TabContent() {
-      Column() {
-
-        this.SettingsPage()
-      }
-      .width('100%')
-      .height('100%')
-    }.tabBar(this.TabItem('设置', 3))
-        }
-        .width('100%')
-        .height('100%')
-        // 官方「沉浸光感」：HdsTabs 悬浮页签 + barFloatingStyle.systemMaterialEffect
-        // （见《鸿蒙沉浸光感》文档：barOverlap(true)/vertical(false)/barPosition(End)）
-        .vertical(false)
-        .barOverlap(true)
-        .barBackgroundColor(this.dark ? '#A61C1C22' : '#00FFFFFF')
-    .barFloatingStyle(this.navFloatStyle())
-        .backgroundColor(Color.Transparent)
-        .scrollable(true)
-        .onContentWillChange((cur: number, coming: number) => {
-          // 滑动切页时，在内容真正切换前就把选中态落下去，避免图标颜色滞后到动画结束
-          if (coming >= 0 && coming !== this.navSel) {
-            this.navSel = coming;
-            this.navPillX = this.navTabCenter(coming);
-            this.setPillScale(1.0, 0, 0);
+          // 语言切换时重建内容树：@Builder 的按值参数不会随状态刷新，
+          // 只有重建节点才能让「已渲染页面上的文案」立即变成新语言。
+          if (this.langEn) {
+            this.TabsCore()
+          } else {
+            this.TabsCore()
           }
-          return true;
-        })
-        .onChange((index: number) => {
-          if (index !== this.curTab) {
-            this.anyScrollY = 0;
-            if (this.showBackTop) {
-              this.showBackTop = false;
-            }
-          }
-          this.curTab = index;
-          this.navSel = index;
-          this.navPillX = this.navTabCenter(index);
-          this.setPillScale(1.0, 0, 0);
-        })
 
 
         // 顶部滚动边缘模糊已改由各页面 Scroll 的 linearGradientBlur 承担（单节点、无条带、无蒙版）
@@ -1778,14 +1943,14 @@ struct Index {
           Text('↑')
             .fontSize(20)
             .fontWeight(FontWeight.Medium)
-            .fontColor(this.accent())
+            .fontColor(this.accentText())
         }
-        .width(46)
-        .height(46)
-        .borderRadius(23)
+        .width(this.fabSize())
+        .height(this.fabSize())
+        .borderRadius(this.fabSize() / 2)
         .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : (this.dark ? 'rgba(39,39,46,0.92)' : 'rgba(255,255,255,0.94)'))
         .linearGradient({ angle: 180, colors: this.floatSheen() })
-        .systemMaterial(this.shouldUseCardMaterial() ? this.cardMaterial() : undefined)
+        .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.COMPONENT_THIN : BlurStyle.NONE)
         .border({ width: 1, color: this.navGlassBorder() })
         .shadow({
           radius: this.dark ? 16 : 18,
@@ -1793,7 +1958,7 @@ struct Index {
           offsetX: 0,
           offsetY: 6
         })
-        .margin({ right: 18, bottom: this.pageBottomPad() + 8 })
+        .margin({ right: this.fabRight(), bottom: this.fabBottom() })
         .onClick(() => {
           if (this.curTab === 0) {
             this.scanScroller.scrollEdge(Edge.Top);
@@ -1810,11 +1975,19 @@ struct Index {
           }
         })
       }
+
+      // 参数说明：整屏轻量弹窗（点击遮罩或「知道了」关闭，输入内容不受影响）
+      if (this.showParamNotes) {
+        this.ParamNotesSheet()
+      }
     }
     .width('100%')
     .height('100%')
     .backgroundColor(this.dark ? '#202433' : '#DBE3EE')
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    .bindContentCover($$this.showChangelogDialog, this.UpgradeCover(), {
+      modalTransition: ModalTransition.DEFAULT
+    })
     .onAreaChange((oldV: Area, newV: Area) => {
       const w: number = newV.width as number;
       if (w > 0 && Math.abs(w - this.winW) > 1) {
@@ -1830,7 +2003,7 @@ struct Index {
         .fontSize(26)
         .fontWeight(FontWeight.Bold)
         .fontColor(this.txt())
-      Text('Cloudflare 智能优选 · v' + this.appVersion)
+      Text(this.t('Cloudflare 智能优选 · v', 'Cloudflare smart selection · v') + this.appVersion)
         .fontSize(12)
         .fontColor(this.txt3())
         .margin({ top: 2 })
@@ -1868,7 +2041,7 @@ struct Index {
             .fontColor(this.txt3())
             .margin({ right: 12, top: 6 })
           if (this.pingList.length > 0) {
-            Text('可用 ' + this.pingList.length.toString() + ' 个')
+            Text(this.t('可用 ', 'Available ') + this.pingList.length.toString() + this.t(' 个', ' nodes'))
               .fontSize(12)
               .fontColor(this.txt3())
               .margin({ top: 6 })
@@ -1892,6 +2065,142 @@ struct Index {
 
 
   /** 当前设备是否支持系统沉浸材质（不支持的设备自动退回手绘玻璃） */
+  /** 当前生效的材质厚度档位 0..4；关闭材质或设备不支持时返回 -1 */
+  private glassThickness(): number {
+    if (!this.shouldUseCardMaterial()) {
+      return -1;
+    }
+    const st: uiMaterial.ImmersiveStyle = this.immersiveStyle();
+    if (st === uiMaterial.ImmersiveStyle.ULTRA_THIN) {
+      return 0;
+    }
+    if (st === uiMaterial.ImmersiveStyle.THIN) {
+      return 1;
+    }
+    if (st === uiMaterial.ImmersiveStyle.REGULAR) {
+      return 2;
+    }
+    if (st === uiMaterial.ImmersiveStyle.THICK) {
+      return 3;
+    }
+    return 4;
+  }
+
+  /** 材质着色浓度：越薄越淡，让背景透上来 */
+  private glassTintAlpha(): number {
+    const t: number = this.glassThickness();
+    if (this.dark) {
+      return t <= 1 ? 0.10 : (t === 2 ? 0.14 : 0.18);
+    }
+    return t <= 1 ? 0.08 : (t === 2 ? 0.12 : 0.16);
+  }
+
+  private glassStyleOf(th: number): uiMaterial.ImmersiveStyle {
+    if (th <= 0) {
+      return uiMaterial.ImmersiveStyle.ULTRA_THIN;
+    }
+    if (th === 1) {
+      return uiMaterial.ImmersiveStyle.THIN;
+    }
+    if (th === 2) {
+      return uiMaterial.ImmersiveStyle.REGULAR;
+    }
+    if (th === 3) {
+      return uiMaterial.ImmersiveStyle.THICK;
+    }
+    return uiMaterial.ImmersiveStyle.ULTRA_THICK;
+  }
+
+  private glassModifier(radius: number): AttributeModifier<ToggleAttribute> {
+    const th: number = this.glassThickness();
+    return new GlassCarrierModifier(
+      MatStore.immersive(this.glassStyleOf(th), this.dark, this.glassTintAlpha(), false, false, ''), radius);
+  }
+
+  /**
+   * 卡片玻璃底：用 Toggle(ToggleType.Button) 承载系统材质。
+   * Toggle 是官方「全页面可渲染 systemMaterial」的白名单组件之一，
+   * 普通容器（Stack/Column/Row）在内容区设置材质不会渲染。
+   * 放在 background 层：不参与布局，不会把卡片撑高，也不拦截交互。
+   */
+  @Builder GlassBackdrop() {
+    Stack() {
+      if (this.shouldUseCardMaterial()) {
+        Toggle({ type: ToggleType.Button, isOn: false }) {
+          Text('')
+            .fontSize(0)
+        }
+        .width(LayoutPolicy.matchParent)
+        .height(LayoutPolicy.matchParent)
+        .backgroundColor(Color.Transparent)
+        .enabled(false)
+        .focusable(false)
+        .hitTestBehavior(HitTestMode.None)
+        .attributeModifier(this.glassModifier(20))
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .hitTestBehavior(HitTestMode.None)
+  }
+
+  /** 任意 hex 色 + 透明度 → rgba 字符串 */
+  private hueRgba(hex: string, alpha: number): string {
+    const r: number = Number.parseInt(hex.substring(1, 3), 16);
+    const g: number = Number.parseInt(hex.substring(3, 5), 16);
+    const b: number = Number.parseInt(hex.substring(5, 7), 16);
+    return 'rgba(' + r.toString() + ',' + g.toString() + ',' + b.toString() + ',' + alpha.toFixed(2) + ')';
+  }
+
+  /**
+   * 背景光斑层：在底色之上铺 3 团柔光。
+   * 没有明暗与色彩变化时，系统材质/模糊都没有可折射的内容，
+   * 玻璃看起来就只是"更黑一点的块"——这层是玻璃质感的物理前提。
+   */
+  @Builder AuroraLayer() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Circle()
+        .width(this.winW * 1.20)
+        .height(this.winW * 1.20)
+        .radialGradient({
+          center: [this.winW * 0.60, this.winW * 0.60],
+          radius: this.winW * 0.60,
+          colors: [[this.accentRgba(this.dark ? 0.34 : 0.26), 0.0],
+            [this.accentRgba(this.dark ? 0.13 : 0.11), 0.42],
+            [this.accentRgba(0.0), 1.0]]
+        })
+        .position({ x: -this.winW * 0.46, y: -this.winW * 0.34 })
+        .fill(Color.Transparent)
+      Circle()
+        .width(this.winW * 1.05)
+        .height(this.winW * 1.05)
+        .radialGradient({
+          center: [this.winW * 0.525, this.winW * 0.525],
+          radius: this.winW * 0.525,
+          colors: [[this.hueRgba('#5B7CFA', this.dark ? 0.30 : 0.20), 0.0],
+            [this.hueRgba('#5B7CFA', this.dark ? 0.10 : 0.08), 0.40],
+            [this.hueRgba('#5B7CFA', 0.0), 1.0]]
+        })
+        .position({ x: this.winW * 0.40, y: this.winH * 0.26 })
+        .fill(Color.Transparent)
+      Circle()
+        .width(this.winW * 0.95)
+        .height(this.winW * 0.95)
+        .radialGradient({
+          center: [this.winW * 0.475, this.winW * 0.475],
+          radius: this.winW * 0.475,
+          colors: [[this.hueRgba('#2DD4BF', this.dark ? 0.20 : 0.16), 0.0],
+            [this.hueRgba('#2DD4BF', 0.0), 1.0]]
+        })
+        .position({ x: -this.winW * 0.34, y: this.winH * 0.60 })
+        .fill(Color.Transparent)
+    }
+    .width('100%')
+    .height('100%')
+    .hitTestBehavior(HitTestMode.None)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+  }
+
   matSupported(): boolean {
     return uiMaterial.isImmersiveMaterialSupported();
   }
@@ -1924,25 +2233,25 @@ struct Index {
 
   private matTypeName(): string {
     if (this.matType === 1) {
-      return '沉浸';
+      return this.t('沉浸', 'Immersive');
     }
     if (this.matType === 2) {
-      return '无材质';
+      return this.t('无材质', 'No material');
     }
-    return '自适应';
+    return this.t('自适应', 'Adaptive');
   }
 
   private matLevelName(): string {
     if (this.matLevel === 1) {
-      return '精致';
+      return this.t('精致', 'Exquisite');
     }
     if (this.matLevel === 2) {
-      return '柔和';
+      return this.t('柔和', 'Gentle');
     }
     if (this.matLevel === 3) {
-      return '平滑';
+      return this.t('平滑', 'Smooth');
     }
-    return '自适应';
+    return this.t('自适应', 'Adaptive');
   }
 
   /**
@@ -1978,11 +2287,11 @@ struct Index {
 
   /** 材质类型 -> hdsMaterial.MaterialType（OA 12136-12144） */
   private hdsMatType(): hdsMaterial.MaterialType {
+    if (!this.globalImmersion || !this.matSupported() || this.matType === 2) {
+      return hdsMaterial.MaterialType.NONE;
+    }
     if (this.matType === 1) {
       return hdsMaterial.MaterialType.IMMERSIVE;
-    }
-    if (this.matType === 2) {
-      return hdsMaterial.MaterialType.NONE;
     }
     return hdsMaterial.MaterialType.ADAPTIVE;
   }
@@ -2003,7 +2312,7 @@ struct Index {
 
   /** 全局开关 + 类型非 NONE 才走系统材质（OA shouldUseCardMaterial 12180-12182） */
   private shouldUseCardMaterial(): boolean {
-    return this.globalImmersion && this.matType !== 2;
+    return this.globalImmersion && this.matType !== 2 && this.matSupported();
   }
 
   private systemMatParams(): SystemMaterialParams {
@@ -2154,18 +2463,13 @@ struct Index {
   }
 
   /** 卡片系统材质层：组件级 systemMaterial，直接铺满卡片（不再用 HdsTabs 悬浮 bar） */
+  /**
+   * 历史上这里放的是 systemMaterial 承载层。实测 systemMaterial 在内容区（Stack/Column）不生效
+   * （真机日志：Material inactive: out of scope），而且 .height('100%') 在 Scroll 内会按可视区解析，
+   * 把卡片撑高、在页面底部留下大片空白。材质已改由卡片自身的 backgroundBlurStyle + 渐变底色实现，
+   * 因此这里保留空实现，只为兼容既有调用点。
+   */
   @Builder MeasuredImmersionCard(cardId: string, cardRadius: number) {
-    if (this.shouldUseCardMaterial()) {
-      Stack()
-        .width('100%')
-        .height('100%')
-        .borderRadius(cardRadius)
-        .clip(true)
-        .backgroundColor(Color.Transparent)
-        .systemMaterial(this.cardMaterial())
-        .hitTestBehavior(HitTestMode.None)
-        .zIndex(0)
-    }
   }
 
   /** 光感等级对卡片厚度的影响：等级越高卡片越实、阴影越深 */
@@ -2193,29 +2497,29 @@ struct Index {
   private cardShadowR(): number {
     const e: number = this.effLevel();
     if (e < 0) {
-      return 6;
+      return 4;
     }
     if (e === 0) {
-      return 22;
+      return 28;
     }
     if (e === 1) {
-      return 16;
+      return 20;
     }
-    return 9;
+    return 12;
   }
 
   /** 光感等级的名称，用于设置页状态提示 */
   private glassLevelName(): string {
     if (this.glassLevel === 0) {
-      return '弱';
+      return this.t('弱', 'Weak');
     }
     if (this.glassLevel === 1) {
-      return '标准';
+      return this.t('标准', 'Standard');
     }
     if (this.glassLevel === 2) {
-      return '强';
+      return this.t('强', 'Strong');
     }
-    return '极致';
+    return this.t('极致', 'Ultra');
   }
 
   /** 系统沉浸材质档位名称（对齐 uiMaterial.ImmersiveStyle） */
@@ -2265,24 +2569,50 @@ struct Index {
 
   private themeColorName(idx: number): string {
     if (idx === 0) {
-      return '柠檬黄';
+      return this.t('柠檬黄', 'Lemon yellow');
     }
     if (idx === 1) {
-      return '奶油黄';
+      return this.t('奶油黄', 'Cream yellow');
     }
     if (idx === 2) {
-      return '鼠尾草绿';
+      return this.t('鼠尾草绿', 'Sage green');
     }
     if (idx === 3) {
-      return '雾霾蓝';
+      return this.t('雾霾蓝', 'Haze blue');
     }
     if (idx === 4) {
-      return '灰豆沙粉';
+      return this.t('灰豆沙粉', 'Muted rose');
     }
-    return '清透炭黑';
+    return this.t('清透炭黑', 'Clear charcoal');
   }
 
   /** 当前主题色：主按钮、选中 chip、滑块都用它 */
+  /** 浅色模式下压暗主题色：小字号文字/图标落在浅玻璃上需要更高对比度 */
+  /** 浅色模式下把主题色填充压深一档：白字落在浅粉/浅黄上有足够对比度 */
+  private accentFill(): string {
+    const c: string = this.accent();
+    if (this.dark) {
+      return c;
+    }
+    const hex2 = (v: number): string => (v < 16 ? '0' : '') + v.toString(16);
+    const r: number = Math.round(Number.parseInt(c.substring(1, 3), 16) * 0.84);
+    const g: number = Math.round(Number.parseInt(c.substring(3, 5), 16) * 0.84);
+    const b: number = Math.round(Number.parseInt(c.substring(5, 7), 16) * 0.84);
+    return '#' + hex2(r) + hex2(g) + hex2(b);
+  }
+
+  private accentText(): string {
+    const c: string = this.accent();
+    if (this.dark) {
+      return c;
+    }
+    const hex2 = (v: number): string => (v < 16 ? '0' : '') + v.toString(16);
+    const r: number = Math.round(Number.parseInt(c.substring(1, 3), 16) * 0.62);
+    const g: number = Math.round(Number.parseInt(c.substring(3, 5), 16) * 0.62);
+    const b: number = Math.round(Number.parseInt(c.substring(5, 7), 16) * 0.62);
+    return '#' + hex2(r) + hex2(g) + hex2(b);
+  }
+
   accent(): string {
     return this.themeColorAt(this.themeColorIdx);
   }
@@ -2291,12 +2621,12 @@ struct Index {
   private styleName(): string {
     const s: uiMaterial.ImmersiveStyle = this.styleOfLevel();
     if (s === uiMaterial.ImmersiveStyle.ULTRA_THIN || s === uiMaterial.ImmersiveStyle.THIN) {
-      return '薄玻璃';
+      return this.t('薄玻璃', 'Thin glass');
     }
     if (s === uiMaterial.ImmersiveStyle.REGULAR) {
-      return '中玻璃';
+      return this.t('中玻璃', 'Medium glass');
     }
-    return '厚玻璃';
+    return this.t('厚玻璃', 'Thick glass');
   }
 
   /** 背景图模糊半径（0~50vp） */
@@ -2348,6 +2678,37 @@ struct Index {
     return this.bgBrightPct / 50;
   }
 
+  /** 就地双语：zh 为唯一键，en 为英文文案 */
+  private t(zh: string, en: string): string {
+    return this.langEn ? en : zh;
+  }
+
+  /** 应用语言模式（立即生效，不改任何用户数据） */
+  applyLangMode(mode: number): void {
+    this.langMode = I18n.clampMode(mode);
+    this.langEn = I18n.resolve(this.langMode);
+    AppStorage.setOrCreate('lang_en', this.langEn);
+    this.refreshStaticTexts();
+  }
+
+  /**
+   * 静态初始文案（不能放在字段初始化器里：那时 @State 存储还不存在，会触发 jscrash）。
+   * 只在「尚未进入运行态」或「仍是初始文案」时刷新，不覆盖运行中的状态文字。
+   */
+  private refreshStaticTexts(): void {
+    const readyZh: string = '就绪';
+    const readyEn: string = 'Ready';
+    if (this.phaseText.length === 0 || this.phaseText === readyZh || this.phaseText === readyEn) {
+      this.phaseText = this.t(readyZh, readyEn);
+    }
+    const hint: string = this.latencyHint;
+    if (hint.length === 0 || hint.indexOf('260~320') >= 0) {
+      this.latencyHint = this.t(
+        '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）',
+        'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
+    }
+  }
+
   loadUi(): void {
     const c: UiConfig = ConfigStore.ui();
     this.globalImmersion = c.globalImmersion;
@@ -2356,6 +2717,7 @@ struct Index {
     this.themeColorIdx = c.themeColor;
     this.bgBlurPct = c.bgBlur;
     this.bgBrightPct = c.bgBright;
+    this.applyLangMode(c.langMode);
   }
 
   saveUi(): void {
@@ -2365,10 +2727,11 @@ struct Index {
       matLevel: this.matLevel,
       themeColor: this.themeColorIdx,
       bgBlur: this.bgBlurPct,
-      bgBright: this.bgBrightPct
+      bgBright: this.bgBrightPct,
+      langMode: this.langMode
     };
     ConfigStore.saveUi(c).catch((e: BusinessError) => {
-      this.addLog('保存外观设置失败：' + e.message);
+      this.addLog(this.t('保存外观设置失败：', 'Failed to save appearance settings: ') + e.message);
     });
   }
 
@@ -2376,7 +2739,7 @@ struct Index {
     this.themeMode = m;
     this.applyThemeMode();
     ConfigStore.saveTheme(m).catch((e: BusinessError) => {
-      this.addLog('保存主题失败：' + e.message);
+      this.addLog(this.t('保存主题失败：', 'Failed to save theme: ') + e.message);
     });
   }
   /**
@@ -2410,7 +2773,11 @@ struct Index {
     return 2;
   }
 
-  /** 卡片玻璃的系统模糊档位：精致更厚、平滑更薄；「沉浸」再升一档 */
+  /**
+   * 卡片玻璃的模糊档位（只有材质开启时才真正模糊）。
+   * 关闭材质时返回 NONE，交给实心底座保证可读性——
+   * 这样总开关的两侧是两套完整设计，而不是同一种卡片的透明度微调。
+   */
   private cardBlurStyle(): BlurStyle {
     const e: number = this.effLevel();
     if (e < 0) {
@@ -2425,31 +2792,36 @@ struct Index {
     return this.matType === 1 ? BlurStyle.BACKGROUND_REGULAR : BlurStyle.BACKGROUND_THIN;
   }
 
-  /** 卡片霜面 tint：精致更通透、平滑更实；深色模式用低透白叠出玻璃厚度 */
+  /**
+   * 卡片霜面 tint。
+   * 开启材质：顶部一道极淡白高光、中部近乎透明、底部压一层暗部——
+   * 叠在 backgroundBlurStyle 的模糊底之上，才有"有厚度的玻璃"而不是"糊了一层白"。
+   * 关闭材质：实心不透明底座，保证任何背景/图片下文字都稳。
+   */
   private cardTint(): Array<[ResourceColor, number]> {
     const e: number = this.effLevel();
     const photo: number = this.bgPath.length > 0 ? 1 : 0;
     if (this.dark) {
       if (e < 0) {
-        return [['rgba(48,52,64,0.94)', 0.0], ['rgba(48,52,64,0.88)', 0.55], ['rgba(48,52,64,0.82)', 1.0]];
+        return [['rgba(36,39,49,0.97)', 0.0], ['rgba(32,35,44,0.97)', 0.55], ['rgba(29,32,40,0.97)', 1.0]];
       }
-      const lift: number = photo * 0.06;
-      const a0: number = (e === 0 ? 0.10 : (e === 1 ? 0.15 : 0.22)) + lift;
-      const a1: number = (e === 0 ? 0.06 : (e === 1 ? 0.09 : 0.14)) + lift;
-      const a2: number = (e === 0 ? 0.03 : (e === 1 ? 0.04 : 0.07)) + lift;
+      const lift: number = photo * 0.05;
+      const a0: number = (e === 0 ? 0.12 : (e === 1 ? 0.10 : 0.08)) + lift;
+      const a1: number = (e === 0 ? 0.05 : (e === 1 ? 0.045 : 0.04)) + lift * 0.5;
+      const a2: number = e === 0 ? 0.22 : (e === 1 ? 0.18 : 0.14);
       return [['rgba(255,255,255,' + a0.toFixed(3) + ')', 0.0],
-        ['rgba(255,255,255,' + a1.toFixed(3) + ')', 0.55],
-        ['rgba(255,255,255,' + a2.toFixed(3) + ')', 1.0]];
+        ['rgba(255,255,255,' + a1.toFixed(3) + ')', 0.46],
+        ['rgba(8,10,16,' + a2.toFixed(3) + ')', 1.0]];
     }
     if (e < 0) {
-      return [['rgba(255,255,255,0.96)', 0.0], ['rgba(255,255,255,0.92)', 0.55], ['rgba(255,255,255,0.88)', 1.0]];
+      return [['rgba(255,255,255,0.99)', 0.0], ['rgba(252,253,255,0.99)', 0.55], ['rgba(248,250,253,0.99)', 1.0]];
     }
-    const lift: number = photo * 0.08;
-    const b0: number = Math.min(0.9, (e === 0 ? 0.18 : (e === 1 ? 0.38 : 0.60)) + lift);
-    const b1: number = Math.min(0.85, (e === 0 ? 0.11 : (e === 1 ? 0.26 : 0.46)) + lift);
-    const b2: number = Math.min(0.8, (e === 0 ? 0.06 : (e === 1 ? 0.15 : 0.30)) + lift);
+    const lift: number = photo * 0.06;
+    const b0: number = Math.min(0.82, (e === 0 ? 0.30 : (e === 1 ? 0.40 : 0.52)) + lift);
+    const b1: number = Math.min(0.78, (e === 0 ? 0.20 : (e === 1 ? 0.30 : 0.42)) + lift);
+    const b2: number = Math.min(0.74, (e === 0 ? 0.12 : (e === 1 ? 0.20 : 0.30)) + lift);
     return [['rgba(255,255,255,' + b0.toFixed(3) + ')', 0.0],
-      ['rgba(255,255,255,' + b1.toFixed(3) + ')', 0.55],
+      ['rgba(255,255,255,' + b1.toFixed(3) + ')', 0.46],
       ['rgba(255,255,255,' + b2.toFixed(3) + ')', 1.0]];
   }
 
@@ -2463,16 +2835,16 @@ struct Index {
 
   private cardBorderColor(): string {
     if (this.effLevel() < 0) {
-      return this.dark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)';
+      return this.dark ? 'rgba(255,255,255,0.07)' : 'rgba(15,23,42,0.09)';
     }
-    return this.dark ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.78)';
+    return this.dark ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.92)';
   }
 
   private cardShadowColor(): string {
     if (this.effLevel() < 0) {
-      return '#14000000';
+      return this.dark ? 'rgba(0,0,0,0.30)' : 'rgba(15,23,42,0.08)';
     }
-    return this.dark ? 'rgba(0,0,0,0.52)' : 'rgba(15,23,42,0.16)';
+    return this.dark ? 'rgba(0,0,0,0.58)' : 'rgba(15,23,42,0.18)';
   }
 
   private cardShadowY(): number {
@@ -2492,31 +2864,31 @@ struct Index {
   /** 设备系统材质等级名称 */
   private deviceLevelName(): string {
     if (!this.matSupported()) {
-      return '不支持';
+      return this.t('不支持', 'Unsupported');
     }
     const lv: uiMaterial.MaterialLevel = uiMaterial.getGlobalMaterialLevel();
     if (lv === uiMaterial.MaterialLevel.EXQUISITE) {
-      return '精致';
+      return this.t('精致', 'Exquisite');
     }
     if (lv === uiMaterial.MaterialLevel.GENTLE) {
-      return '柔和';
+      return this.t('柔和', 'Gentle');
     }
-    return '平滑';
+    return this.t('平滑', 'Smooth');
   }
 
   /** 卡片玻璃描述（设置页状态提示） */
   private glassDesc(): string {
     const e: number = this.effLevel();
     if (e < 0) {
-      return '（无材质）';
+      return this.t('（无材质）', 'No material');
     }
     if (e === 0) {
-      return '（厚玻璃）';
+      return this.t('（厚玻璃）', 'Thick glass');
     }
     if (e === 1) {
-      return '（中玻璃）';
+      return this.t('（中玻璃）', 'Medium glass');
     }
-    return '（薄玻璃）';
+    return this.t('（薄玻璃）', 'Thin glass');
   }
 
   /** 进度条配色：跟随主题色 */
@@ -2955,20 +3327,22 @@ struct Index {
         Column() {
           SymbolGlyph(this.tabIcon(index))
             .fontSize(20)
-            .fontColor([this.navSel === index ? this.accent() : this.txt3()])
+            .fontColor([this.navSel === index ? this.accentText() : this.txt3()])
           Text(this.tabLabel(index))
             .fontSize(10)
             .margin({ top: 2 })
             .fontWeight(this.navSel === index ? FontWeight.Medium : FontWeight.Normal)
-            .fontColor(this.navSel === index ? this.accent() : this.txt3())
+            .fontColor(this.navSel === index ? this.txt() : this.txt3())
         }
         .width('100%')
         .height(46)
         .justifyContent(FlexAlign.Center)
+        .backgroundColor(this.navSel === index ? this.soft() : Color.Transparent)
+        .borderRadius(14)
+        .animation({ duration: 180, curve: Curve.EaseOut })
       }
       .width('100%')
       .height(46)
-      .animation({ duration: 180, curve: Curve.EaseOut })
     }
     .layoutWeight(1)
     .height('100%')
@@ -2980,7 +3354,7 @@ struct Index {
 
   /** 来源名称 */
   private srcLabel(): string {
-    return ['CF 官方 IP 段', '社区 IPv6 段库', '社区 IPv4 段库', '自定义（文件 / 链接）'][this.srcIdx];
+    return [this.t('CF 官方 IP 段', 'CF official IP ranges'), this.t('社区 IPv6 段库', 'Community IPv6 ranges'), this.t('社区 IPv4 段库', 'Community IPv4 ranges'), this.t('自定义（文件 / 链接）', 'Custom (file / link)')][this.srcIdx];
   }
 
   /** 来源弹层：与卡片同族玻璃底，选项之间只有发丝分隔线、没有独立圆角 */
@@ -2989,7 +3363,7 @@ struct Index {
       ForEach([0, 1, 2, 3], (i: number) => {
         Column() {
           Row() {
-            Text(['CF 官方 IP 段', '社区 IPv6 段库', '社区 IPv4 段库', '自定义（文件 / 链接）'][i])
+            Text([this.t('CF 官方 IP 段', 'CF official IP ranges'), this.t('社区 IPv6 段库', 'Community IPv6 ranges'), this.t('社区 IPv4 段库', 'Community IPv4 ranges'), this.t('自定义（文件 / 链接）', 'Custom (file / link)')][i])
               .fontSize(13)
               .fontColor(i === this.srcIdx ? this.accent() : this.txt())
               .fontWeight(i === this.srcIdx ? FontWeight.Medium : FontWeight.Normal)
@@ -2997,7 +3371,7 @@ struct Index {
             if (i === this.srcIdx) {
               Text('✓')
                 .fontSize(12)
-                .fontColor(this.accent())
+                .fontColor(this.accentText())
             }
           }
           .width('100%')
@@ -3066,20 +3440,59 @@ struct Index {
     const need: number = this.headerH + 12;
     return need > base ? need : base;
   }
+  /** 悬浮导航胶囊：底距与高度（与 navFloatStyle() 的取值保持同源） */
+  private navBottomMargin(): number {
+    return Math.max(px2vp(this.navBarPx) + 18, 28);
+  }
+
+  private navPillH(): number {
+    return 56;
+  }
+
+  /** 回到顶部按钮：尺寸 / 与导航的间距 / 自底偏移 / 右侧偏移 / 内容区需要让出的高度 */
+  private fabSize(): number {
+    return 46;
+  }
+
+  private fabGap(): number {
+    // 与导航胶囊之间的呼吸间距：按钮自成一条，不贴着导航
+    return 24;
+  }
+
+  private fabBottom(): number {
+    // 贴在导航胶囊上方，而不是贴屏幕底部：导航底距 + 胶囊高度 + 间距
+    return this.navBottomMargin() + this.navPillH() + this.fabGap();
+  }
+
+  private fabRight(): number {
+    // 宽屏时对齐到内容最大宽度（1600）的内边距，而不是永远贴窗口右边
+    if (this.winW >= 900) {
+      const side: number = Math.max(0, (this.winW - 1600) / 2);
+      return side + 18;
+    }
+    return 18;
+  }
+
+  /** 内容区为悬浮按钮让出的高度：按钮本体 + 间距 + 余量 */
+  private fabReserve(): number {
+    return this.fabSize() + this.fabGap() + 12;
+  }
+
   private pageBottomPad(): number {
-    return 62 + 26 + px2vp(this.navBarPx) + 16;
+    // 导航胶囊 + 悬浮按钮占位，保证滚到底时最后一张卡片停在按钮上方而不是被压住
+    return 62 + 26 + px2vp(this.navBarPx) + 16 + this.fabReserve();
   }
   private tabLabel(index: number): string {
     if (index === 0) {
-      return '扫描';
+      return this.t('扫描', 'Scan');
     }
     if (index === 1) {
-      return '筛选';
+      return this.t('筛选', 'Filter');
     }
     if (index === 2) {
-      return '测速';
+      return this.t('测速', 'Speed test');
     }
-    return '设置';
+    return this.t('设置', 'Settings');
   }
 
   /** 浅光版主题色：向白混合约 60%，用于选中图标/文字，保证是淡光而不是浓色 */
@@ -3139,7 +3552,7 @@ struct Index {
     Column() {
       SymbolGlyph(this.tabIcon(index))
         .fontSize(19)
-        .fontColor([this.navSel === index ? (this.dark ? this.accent() : this.accentPale()) : this.txt3()])
+        .fontColor([this.navSel === index ? this.accentText() : this.txt3()])
         .margin({ bottom: 2 })
       Text(label)
         .fontSize(10)
@@ -3147,7 +3560,7 @@ struct Index {
         .width('100%')
         .textAlign(TextAlign.Center)
         .fontWeight(this.navSel === index ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(this.navSel === index ? (this.dark ? this.accent() : this.accentPale()) : this.txt3())
+        .fontColor(this.navSel === index ? this.accentText() : this.txt3())
     }
     .width('100%')
     .height('100%')
@@ -3177,8 +3590,13 @@ struct Index {
                   this.CardParam()
                 }
                 .layoutWeight(1)
+                .onAreaChange((_o: Area, a: Area) => {
+                  const h: number = Number(a.height);
+                  if (Math.abs(h - this.scanLeftColH) > 0.5) {
+                    this.scanLeftColH = h;
+                  }
+                })
                 Column({ space: 14 }) {
-                  this.CardPort()
                   this.CardSpeed()
                 }
                 .layoutWeight(1)
@@ -3186,10 +3604,10 @@ struct Index {
               .width('100%')
               .alignItems(VerticalAlign.Top)
 
-              Column().height(104)
+
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: this.contentTop() })
+            .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
             .constraintSize({ maxWidth: 1080 })
             .width(this.tabLeftZoneW())
 
@@ -3211,20 +3629,19 @@ struct Index {
                   .padding(16)
                 }
                 .width('100%')
-                .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+                .backgroundBlurStyle(this.cardBlurStyle(),
                   { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
                 .constraintSize({ maxHeight: 520 })
                 .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
                 .borderRadius(20)
-                .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+                .border({ width: 1, color: this.cardBorderColor() })
                 .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
                 .margin({ bottom: 16 })
-                .systemMaterial(this.cardMaterial())
               }
               .width('100%')
             }
             .width(this.tabColW())
-            .padding({ left: 16, right: 16, top: this.contentTop() })
+            .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
     }
     .alignItems(VerticalAlign.Top)
     .justifyContent(FlexAlign.Center)
@@ -3253,36 +3670,19 @@ struct Index {
     Scroll(this.scanScroller) {
     Column() {
     
-    GridRow({
-    columns: { sm: 12, md: 12, lg: 12 },
-    gutter: { x: 14, y: 14 },
-    breakpoints: { value: ['600vp', '900vp'], reference: BreakpointsReference.WindowSize }
-    }) {
-    GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
+    Column() {
     this.CardSource()
-    }
-    GridCol({ span: { sm: 12, md: 12, lg: 12 } }) {
     if (this.scanning || this.total > 0) {
     this.ActionBar()
     }
-    }
-    GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
-    this.CardPort()
-    }
-    GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
     this.CardParam()
-    }
-    GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
     this.CardSpeed()
-    }
-    
-    GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
     this.CardLog(false, 180, true)
     }
-    }
     .width('100%')
+    .alignItems(HorizontalAlign.Start)
     
-    Column().height(104)
+
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
@@ -3319,20 +3719,20 @@ struct Index {
     const gen: number = this.diagGen;
     this.diagBusy = true;
     this.armDiagWatchdog();
-    this.diagText = '正在诊断 IPv4，请稍候…';
+    this.diagText = this.t('正在诊断 IPv4，请稍候…', 'Diagnosing IPv4, please wait…');
     try {
     const text: string = await Diag.runV4();
     if (gen !== this.diagGen) {
     return;
     }
     this.diagText = text;
-    this.addLog('IPv4 网络诊断完成');
+    this.addLog(this.t('IPv4 网络诊断完成', 'IPv4 network diagnostics complete'));
     } catch (e) {
     if (gen !== this.diagGen) {
     return;
     }
     const err: BusinessError = e as BusinessError;
-    this.diagText = '诊断失败：' + (err.message !== undefined ? err.message : '未知错误');
+    this.diagText = this.t('诊断失败：', 'Diagnostics failed: ') + (err.message !== undefined ? err.message : this.t('未知错误', 'Unknown error'));
     } finally {
     if (gen === this.diagGen) {
     this.disarmDiagWatchdog();
@@ -3354,13 +3754,13 @@ struct Index {
     try {
     const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.diagText);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
-    this.toast('诊断结果已复制');
+    this.toast(this.t('诊断结果已复制', 'Diagnostic results copied'));
     }).catch((e: BusinessError) => {
-    this.toast('复制失败：' + e.message);
+    this.toast(this.t('复制失败：', 'Copy failed: ') + e.message);
     });
     } catch (e) {
     const err: BusinessError = e as BusinessError;
-    this.toast('复制失败：' + err.message);
+    this.toast(this.t('复制失败：', 'Copy failed: ') + err.message);
     }
     }
     
@@ -3372,20 +3772,20 @@ struct Index {
     const gen: number = this.diagGen;
     this.diagBusy = true;
     this.armDiagWatchdog();
-    this.diagText = '正在诊断 IPv6，请稍候…';
+    this.diagText = this.t('正在诊断 IPv6，请稍候…', 'Diagnosing IPv6, please wait…');
     try {
     const text: string = await Diag.run();
     if (gen !== this.diagGen) {
     return;
     }
     this.diagText = text;
-    this.addLog('IPv6 网络诊断完成，详情见「设置 → 网络诊断」');
+    this.addLog(this.t('IPv6 网络诊断完成，详情见「设置 → 网络诊断」', 'IPv6 network diagnostics complete; see Settings → Network diagnostics for details'));
     } catch (e) {
     if (gen !== this.diagGen) {
     return;
     }
     const err: BusinessError = e as BusinessError;
-    this.diagText = '诊断失败：' + (err.message !== undefined ? err.message : '未知错误');
+    this.diagText = this.t('诊断失败：', 'Diagnostics failed: ') + (err.message !== undefined ? err.message : this.t('未知错误', 'Unknown error'));
     } finally {
     if (gen === this.diagGen) {
     this.disarmDiagWatchdog();
@@ -3400,7 +3800,7 @@ struct Index {
     this.diagWatchdog = setTimeout(() => {
     if (gen === this.diagGen && this.diagBusy) {
     this.diagBusy = false;
-    this.diagText = this.diagText + '\n\n（诊断超时，按钮已恢复。请检查网络后重试）';
+    this.diagText = this.diagText + this.t('\n\n（诊断超时，按钮已恢复。请检查网络后重试）', '\n\n(Diagnostic timed out; the button has been restored. Check your network and try again.)');
     }
     }, 120000);
     }
@@ -3467,7 +3867,7 @@ struct Index {
     .textAlign(TextAlign.Center)
     .layoutWeight(1)
     .height(this.CHIP_H)
-    .backgroundColor(current === index ? this.accent() : this.soft())
+    .backgroundColor(current === index ? this.accentFill() : this.soft())
     .borderRadius(this.CHIP_R)
     .margin({ right: index === items.length - 1 ? 0 : 6 })
     .onClick(() => {
@@ -3482,205 +3882,312 @@ struct Index {
     }
     
     @Builder SourceHint() {
-    if (this.srcIdx >= 1) {
-    Text(this.sourceBrief())
+    Text(this.srcIdx >= 1 ? this.sourceBrief() : this.t('内置官方段库，无需导入；选「自定义」后可自行导入', 'Built-in official ranges, no import needed; choose "Custom" to import your own'))
     .fontSize(11)
     .fontColor(this.txt3())
-    .width('100%')
-    .padding({ left: 110 })
-    .margin({ top: 6 })
-    .maxLines(1)
-    .textOverflow({ overflow: TextOverflow.Ellipsis })
-    } else {
-    Text('内置官方段库，无需导入；选「自定义」后可自行导入')
-    .fontSize(11)
-    .fontColor(this.txt3())
-    .width('100%')
-    .padding({ left: 110 })
-    .margin({ top: 6 })
-    .maxLines(1)
-    .textOverflow({ overflow: TextOverflow.Ellipsis })
-    }
-    }
-    
-    @Builder CardSource() {
-    Stack({ alignContent: Alignment.TopStart }) {
-    Column() {
-    this.CardTitle('候选来源', $r('sys.symbol.wifi'))
-    // 开始优选：紧贴「候选来源」标题下方
-    Row() {
-    Text(this.scanning ? '停止' : '开始优选')
-    .fontSize(16)
-    .fontWeight(FontWeight.Medium)
-    .fontColor('#FFFFFF')
-    .width('100%')
-    .height(48)
-    .textAlign(TextAlign.Center)
-    .backgroundColor(this.scanning ? BAD_C : this.accent())
-    .borderRadius(14)
-    .onClick(() => {
-    if (this.scanning) {
-    this.stopScan();
-    } else {
-    this.startScan();
-    }
-    })
-    }
-    .width('100%')
-    .margin({ top: 20, bottom: 2 })
-    Row() {
-    Text('来源')
-    .fontSize(13)
-    .fontColor(this.txt2())
-    .width(110)
-    Row() {
-    Text(this.srcLabel())
-    .fontSize(12)
-    .fontWeight(FontWeight.Medium)
-    .fontColor(this.txt())
-    .maxLines(1)
-    .textOverflow({ overflow: TextOverflow.Ellipsis })
-    .layoutWeight(1)
-    Text('▼')
-    .fontSize(8)
-    .fontColor(this.txt2())
-    .margin({ left: 6 })
-    }
-    .height(36)
-    .layoutWeight(1)
-    .padding({ left: 12, right: 10 })
-    .backgroundColor(this.inputBg())
-    .borderRadius(9)
-    .justifyContent(FlexAlign.SpaceBetween)
-    .bindMenu(this.SourceMenu(), {
-    backgroundColor: Color.Transparent
-    })
-    // 官方来源无需按钮；社区库=更新来源；自定义=自定义导入
-    if (this.srcIdx !== 0) {
-    Text((this.srcIdx === 1 || this.srcIdx === 2) ? '更新来源' : '自定义导入')
-    .fontSize(12)
-    .fontWeight(FontWeight.Medium)
-    .fontColor('#FFFFFF')
-    .textAlign(TextAlign.Center)
-    .height(36)
-    .padding({ left: 12, right: 12 })
-    .backgroundColor(this.accent())
-    .borderRadius(9)
-    .margin({ left: 8 })
-    .onClick(() => {
-    if (this.srcIdx === 3 && this.customText.trim().length === 0) {
-    this.toast('自定义为空，请添加来源');
-    }
-    this.importDlg.open();
-    })
-    }
-    }
-    .width('100%')
-    .alignItems(VerticalAlign.Center)
-    .margin({ top: 10 })
-    
-    Row() {
-    Text('IP 版本')
-    .fontSize(13)
-    .fontColor(this.txt2())
-    .width(110)
-    Row() {
-    Text('IPv4')
-    .fontSize(12)
-    .fontColor(this.ipVersion === IpVersion.V4 ? '#FFFFFF' : this.txt2())
-    .textAlign(TextAlign.Center)
-    .layoutWeight(1)
-    .height(34)
-    .backgroundColor(this.ipVersion === IpVersion.V4 ? this.accent() : this.soft())
-    .borderRadius(9)
-    .onClick(() => {
-    this.ipVersion = IpVersion.V4;
-    this.maybeAutoSuggest(false);
-    })
-    Text('IPv6')
-    .fontSize(12)
-    .fontColor(this.ipVersion === IpVersion.V6 ? '#FFFFFF' : this.txt2())
-    .textAlign(TextAlign.Center)
-    .layoutWeight(1)
-    .height(34)
-    .backgroundColor(this.ipVersion === IpVersion.V6 ? this.accent() : this.soft())
-    .borderRadius(9)
-    .margin({ left: 6 })
-    .onClick(() => {
-    this.ipVersion = IpVersion.V6;
-    this.maybeAutoSuggest(true);
-    })
-    }
-    .layoutWeight(1)
-    }
     .width('100%')
     .margin({ top: 8 })
+    .maxLines(2)
+    .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
     
-    this.SourceHint()
-    }
-    .width('100%')
-    .onAreaChange((_o: Area, a: Area) => {
-    this.updateMeasuredCardHeight('src', a);
-    })
-    .width('100%')
-    .padding(16)
-    }
-    .width('100%')
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
-    { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
-    .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
-    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
-  }
-
-  @Builder CardPort() {
+  /** 候选来源：来源 / IP 版本 / 端口 三组参数合并为一张卡片，减少卡片数与纵向占用 */
+  @Builder CardSource() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle('端口', $r('sys.symbol.gearshape'))
+        this.CardTitle(this.t('候选来源', 'Candidate source'), $r('sys.symbol.wifi'))
+
+        // 开始优选：主操作，视觉权重最高
+        Text(this.scanning ? this.t('停止', 'Stop') : this.t('开始优选', 'Start selection'))
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#FFFFFF')
+          .width('100%')
+          .height(48)
+          .textAlign(TextAlign.Center)
+          .backgroundColor(this.scanning ? BAD_C : this.accentFill())
+          .borderRadius(14)
+          .margin({ top: 14 })
+          .onClick(() => {
+            if (this.scanning) {
+              this.stopScan();
+            } else {
+              this.startScan();
+            }
+          })
+
         Row() {
-          ForEach(PORT_OPTIONS, (p: number, index: number) => {
-            Text(p.toString())
-              .fontSize(this.CHIP_FS)
-              .fontColor(this.port === p ? '#FFFFFF' : this.txt2())
+          Text(this.t('来源', 'Source'))
+            .fontSize(13)
+            .fontColor(this.txt2())
+            .width(72)
+          Row() {
+            Text(this.srcLabel())
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.txt())
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Text('▼')
+              .fontSize(8)
+              .fontColor(this.txt2())
+              .margin({ left: 6 })
+          }
+          .height(36)
+          .layoutWeight(1)
+          .padding({ left: 12, right: 10 })
+          .backgroundColor(this.inputBg())
+          .borderRadius(10)
+          .justifyContent(FlexAlign.SpaceBetween)
+          .bindMenu(this.SourceMenu(), {
+            backgroundColor: Color.Transparent
+          })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        .margin({ top: 12 })
+
+        // 官方来源无需按钮；社区库=更新来源；自定义=自定义导入
+        if (this.srcIdx !== 0) {
+          Text((this.srcIdx === 1 || this.srcIdx === 2) ? this.t('更新来源', 'Update source') : this.t('自定义导入', 'Custom import'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.accentText())
+            .textAlign(TextAlign.Center)
+            .width('100%')
+            .height(34)
+            .backgroundColor(this.soft())
+            .borderRadius(9)
+            .margin({ top: 8 })
+            .onClick(() => {
+              if (this.srcIdx === 3 && this.customText.trim().length === 0) {
+                this.toast(this.t('自定义为空，请添加来源', 'Custom source is empty; add a source'));
+              }
+              this.importDlg.open();
+            })
+        }
+
+        Row() {
+          Text(this.t('IP 版本', 'IP version'))
+            .fontSize(13)
+            .fontColor(this.txt2())
+            .width(72)
+          Row() {
+            Text('IPv4')
+              .fontSize(12)
+              .fontColor(this.ipVersion === IpVersion.V4 ? '#FFFFFF' : this.txt2())
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
               .height(this.CHIP_H)
-              .backgroundColor(this.port === p ? this.accent() : this.soft())
-              .borderRadius(9)
-              .margin({ right: index === PORT_OPTIONS.length - 1 ? 0 : 5 })
+              .backgroundColor(this.ipVersion === IpVersion.V4 ? this.accentFill() : this.soft())
+              .borderRadius(this.CHIP_R)
               .onClick(() => {
-                this.port = p;
-                this.scheduleScanSave();
+                this.ipVersion = IpVersion.V4;
+                this.maybeAutoSuggest(false);
               })
-          }, (p: number, index: number) => p.toString())
+            Text('IPv6')
+              .fontSize(12)
+              .fontColor(this.ipVersion === IpVersion.V6 ? '#FFFFFF' : this.txt2())
+              .textAlign(TextAlign.Center)
+              .layoutWeight(1)
+              .height(this.CHIP_H)
+              .backgroundColor(this.ipVersion === IpVersion.V6 ? this.accentFill() : this.soft())
+              .borderRadius(this.CHIP_R)
+              .margin({ left: 6 })
+              .onClick(() => {
+                this.ipVersion = IpVersion.V6;
+                this.maybeAutoSuggest(true);
+              })
+          }
+          .layoutWeight(1)
         }
         .width('100%')
-        .margin({ top: 10 })
-        Text('Cloudflare 只支持这几个 TLS 端口')
+        .margin({ top: 8 })
+
+        Row() {
+          Text(this.t('端口', 'Port'))
+            .fontSize(13)
+            .fontColor(this.txt2())
+            .width(72)
+          Row() {
+            ForEach(PORT_OPTIONS, (p: number, index: number) => {
+              Text(p.toString())
+                .fontSize(this.CHIP_FS)
+                .fontColor(this.port === p ? '#FFFFFF' : this.txt2())
+                .textAlign(TextAlign.Center)
+                .layoutWeight(1)
+                .height(this.CHIP_H)
+                .backgroundColor(this.port === p ? this.accentFill() : this.soft())
+                .borderRadius(this.CHIP_R)
+                .margin({ right: index === PORT_OPTIONS.length - 1 ? 0 : 4 })
+                .onClick(() => {
+                  this.port = p;
+                  this.scheduleScanSave();
+                })
+            }, (p: number, index: number) => p.toString())
+          }
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .margin({ top: 8 })
+
+        Text(this.t('Cloudflare 只支持这几个 TLS 端口。', 'Cloudflare only supports these TLS ports.'))
           .fontSize(11)
           .fontColor(this.txt3())
+          .width('100%')
           .margin({ top: 8 })
+
+        this.SourceHint()
+      }
       .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('port', a);
+        this.updateMeasuredCardHeight('src', a);
       })
       .width('100%')
       .padding(16)
       }
-      .padding(16)
       .width('100%')
-    }
     .width('100%')
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
     { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
+  }
+
+
+  /** 紧凑参数格：标签压在输入框上方，多列并排，替代「一个参数一行 + 一段长说明」 */
+  @Builder ParamCell(label: string, field: string, inputId: string, numeric: boolean, onChange: (v: string) => void) {
+    Column() {
+      Text(label)
+        .fontSize(12)
+        .fontColor(this.txt3())
+        .maxLines(1)
+        .margin({ bottom: 6 })
+      TextInput({ text: this.paramValue(field) })
+        .id(inputId)
+        .width('100%')
+        .height(38)
+        .fontSize(14)
+        .fontColor(this.txt())
+        .backgroundColor(this.inputBg())
+        .borderRadius(10)
+        .type(numeric ? InputType.Number : InputType.Normal)
+        .onChange(onChange)
+    }
+    .layoutWeight(1)
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 卡片内折叠条：默认收起，收起时只占一行，展开后露出低频参数与参数说明 */
+  @Builder AdvRow(open: boolean, onTap: () => void) {
+    Row() {
+      Text(open ? this.t('收起高级选项', 'Hide advanced options') : this.t('高级选项', 'Advanced options'))
+        .fontSize(12)
+        .fontColor(this.txt2())
+      Blank()
+      Text(open ? this.t('收起', 'Collapse') : this.t('展开', 'Expand'))
+        .fontSize(12)
+        .fontColor(this.accentText())
+    }
+    .width('100%')
+    .height(38)
+    .padding({ left: 12, right: 12 })
+    .backgroundColor(this.soft())
+    .borderRadius(10)
+    .margin({ top: 10 })
+    .onClick(onTap)
+  }
+
+  /** 参数说明弹窗：轻量、居中、可关闭，不改动页面布局 */
+  @Builder ParamNotesSheet() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(0,0,0,0.38)')
+        .onClick(() => {
+          this.showParamNotes = false;
+        })
+      Stack({ alignContent: Alignment.TopStart }) {
+        Column({ space: 10 }) {
+          Row({ space: 8 }) {
+            SymbolGlyph($r('sys.symbol.info_circle'))
+              .fontSize(16)
+              .fontColor([this.accentText()])
+            Text(this.t('参数说明', 'Parameter notes'))
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.txt())
+              .layoutWeight(1)
+          }
+          .width('100%')
+          this.ParamNotesBody()
+          Row() {
+            Text(this.t('知道了', 'Got it'))
+              .fontSize(13)
+              .fontColor(Color.White)
+              .textAlign(TextAlign.Center)
+              .height(36)
+              .layoutWeight(1)
+              .borderRadius(10)
+              .backgroundColor(this.accentFill())
+              .onClick(() => {
+                this.showParamNotes = false;
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding(18)
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('86%')
+      .constraintSize({ maxWidth: 460 })
+      .backgroundBlurStyle(this.cardBlurStyle(),
+        { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+      .linearGradient({ angle: 145, colors: this.cardTint() })
+      .borderRadius(20)
+      .border({ width: 1, color: this.cardBorderColor() })
+      .shadow({ radius: 24, color: this.cardShadowColor(), offsetX: 0, offsetY: 10 })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 参数说明正文（弹窗内使用） */
+  @Builder ParamNotesBody() {
+    Column() {
+      Text(this.t('采样数：IPv4/IPv6 统一 3000；随机地址命中率偏低时可改用域名 AAAA 采样。', 'Samples: 3000 for both IPv4 and IPv6; if random addresses have a low hit rate, sample domain AAAA records instead.'))
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .width('100%')
+      Text(this.t('并发上限：手机 120 / 平板 200 / 电脑 300（当前设备 ', 'Concurrency cap: 120 on phones / 200 on tablets / 300 on computers (this device: ') + maxScanConcurrency().toString() +
+        this.t('），超过会自动改回上限。', '). Values above it are reset to the cap automatically.'))
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 6 })
+      Text(this.latencyHint)
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 6 })
+      Text(this.t('每个 IP 连 ', 'Each IP gets ') + this.pingText + this.t(' 次 TCP 取最小值；超过延迟上限直接淘汰，IPv4/IPv6 共用同一上限。', ' TCP samples, keeping the minimum; nodes above the latency cap are dropped. IPv4 and IPv6 share the same cap.'))
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 6 })
+      Text(this.t('合格速度：低于该值的节点在第一轮初筛后按延迟从低到高逐个淘汰，凑不满会提前中止（0 = 不淘汰）。', 'Min speed: after the round 1 pre-filter, nodes below this value are eliminated one by one in ascending latency order, and the process stops early if the target cannot be filled (0 = no elimination).'))
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 6 })
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder CardParam() {
@@ -3691,164 +4198,141 @@ struct Index {
             .fontSize(16)
             .fontColor([this.txt2()])
             .margin({ right: 8 })
-          Text('快速筛选参数')
+          Text(this.t('快速筛选参数', 'Quick filter parameters'))
             .fontSize(15)
             .fontWeight(FontWeight.Medium)
             .fontColor(this.txt())
-          Blank()
-          Text('应用建议')
-            .fontSize(12)
-            .fontColor(this.accent())
-            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-            .backgroundColor(this.soft())
-            .borderRadius(9)
-            .onClick(() => { this.applySuggestedParams(); })
-        }
-        .width('100%')
-        Row() {
-          Text('采样数')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(110)
-          TextInput({ text: this.sampleText })
             .layoutWeight(1)
-            .height(40)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          // 说明入口固定在卡片右上角，与「应用建议」不再重复
+          Text('ⓘ')
             .fontSize(13)
-            .fontColor(this.txt())
-            .backgroundColor(this.inputBg())
-            .borderRadius(10)
-            .type(InputType.Number)
-            .onChange((v: string) => {
-              this.sampleText = v;
-              this.scheduleScanSave();
+            .fontColor(this.accentText())
+            .textAlign(TextAlign.Center)
+            .width(28)
+            .height(28)
+            .borderRadius(14)
+            .backgroundColor(this.soft())
+            .margin({ left: 8 })
+            .accessibilityText(this.t('参数说明', 'Parameter notes'))
+            .onClick(() => {
+              this.showParamNotes = true;
             })
         }
         .width('100%')
-        .margin({ top: 8 })
-        Text('建议：IPv4/IPv6 统一 3000 采样；随机地址命中率偏低时，可改用域名 AAAA 采样。')
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .margin({ top: 6 })
-        Row() {
-          Text('并发线程')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(110)
-          TextInput({ text: this.concurrencyText })
-            .id('conc-' + this.cfgRev.toString())
-            .layoutWeight(1)
-            .height(40)
-            .fontSize(13)
-            .fontColor(this.txt())
-            .backgroundColor(this.inputBg())
-            .borderRadius(10)
-            .type(InputType.Number)
-            .onChange((v: string) => {
+
+        if (this.winW >= 900) {
+          Row({ space: 10 }) {
+            this.ParamCell(this.t('采样数', 'Samples'), 'sample', 'sample-' + this.cfgRev.toString(), true, (v: string) => {
+              this.sampleText = v;
+              this.scheduleScanSave();
+            })
+            this.ParamCell(this.t('并发线程', 'Threads'), 'conc', 'conc-' + this.cfgRev.toString(), true, (v: string) => {
               const lim: number = maxScanConcurrency();
               const n: number = parseInt(v);
               if (!isNaN(n) && n > lim) {
                 this.concurrencyText = lim.toString();
                 // TextInput 的 text 只作初值，必须换 id 触发重建才能把上限值回显到输入框
                 this.cfgRev++;
-                this.toast('并发上限为 ' + lim.toString() + '，已按上限执行');
+                this.toast(this.t('并发上限为 ', 'Concurrency cap is ') + lim.toString() + this.t('，已按上限执行', '; the limit has been applied'));
               } else {
                 this.concurrencyText = v;
               }
               this.scheduleScanSave();
             })
-        }
-        .width('100%')
-        .margin({ top: 8 })
-
-        Text('并发上限：手机 120 / 平板 200 / 电脑 300（当前设备上限 ' + maxScanConcurrency().toString() +
-          '）。超过会自动改回上限；过高会导致设备发热卡死。')
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .margin({ top: 6 })
-        Row() {
-          Text('延迟上限 ms')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(110)
-          TextInput({ text: this.latencyText })
-            .layoutWeight(1)
-            .height(40)
-            .fontSize(13)
-            .fontColor(this.txt())
-            .backgroundColor(this.inputBg())
-            .borderRadius(10)
-            .type(InputType.Number)
-            .onChange((v: string) => {
+            this.ParamCell(this.t('延迟上限 ms', 'Latency cap ms'), 'lat', 'lat-' + this.cfgRev.toString(), true, (v: string) => {
               this.latencyText = v;
               this.scheduleScanSave();
             })
-        }
-        .width('100%')
-        .margin({ top: 8 })
-        Text(this.latencyHint)
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .width('100%')
-          .margin({ top: 6 })
-        this.FieldRow('Ping 次数', this.pingText, (v: string) => {
-          this.pingText = v;
-          this.scheduleScanSave();
-        })
-        Text('每个 IP 连 ' + this.pingText + ' 次 TCP 取最小值；最小值超过 ' + this.latencyText +
-          'ms 的直接淘汰。IPv4 与 IPv6 使用同一延迟上限（建议 260~320ms，默认 300ms；两次 ping 下 220ms 会明显偏严）。')
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .margin({ top: 8 })
-          Row() {
-            Text('合格速度 MB/s')
-              .fontSize(13)
-              .fontColor(this.txt2())
-              .width(110)
-            TextInput({ text: this.minSpeedText })
-              .layoutWeight(1)
-              .height(40)
-              .fontSize(13)
-              .fontColor(this.txt())
-              .backgroundColor(this.inputBg())
-              .borderRadius(10)
-              .onChange((v: string) => {
-                this.minSpeedText = v;
-                this.scheduleScanSave();
-              })
+            this.ParamCell(this.t('Ping 次数', 'Ping count'), 'ping', 'ping-' + this.cfgRev.toString(), true, (v: string) => {
+              this.pingText = v;
+              this.scheduleScanSave();
+            })
           }
           .width('100%')
-          .margin({ top: 8 })
+          .margin({ top: 12 })
+        } else {
+          Row({ space: 10 }) {
+            this.ParamCell(this.t('采样数', 'Samples'), 'sample', 'sample-' + this.cfgRev.toString(), true, (v: string) => {
+              this.sampleText = v;
+              this.scheduleScanSave();
+            })
+            this.ParamCell(this.t('并发线程', 'Threads'), 'conc', 'conc-' + this.cfgRev.toString(), true, (v: string) => {
+              const lim: number = maxScanConcurrency();
+              const n: number = parseInt(v);
+              if (!isNaN(n) && n > lim) {
+                this.concurrencyText = lim.toString();
+                // TextInput 的 text 只作初值，必须换 id 触发重建才能把上限值回显到输入框
+                this.cfgRev++;
+                this.toast(this.t('并发上限为 ', 'Concurrency cap is ') + lim.toString() + this.t('，已按上限执行', '; the limit has been applied'));
+              } else {
+                this.concurrencyText = v;
+              }
+              this.scheduleScanSave();
+            })
+          }
+          .width('100%')
+          .margin({ top: 12 })
+          Row({ space: 10 }) {
+            this.ParamCell(this.t('延迟上限 ms', 'Latency cap ms'), 'lat', 'lat-' + this.cfgRev.toString(), true, (v: string) => {
+              this.latencyText = v;
+              this.scheduleScanSave();
+            })
+            this.ParamCell(this.t('Ping 次数', 'Ping count'), 'ping', 'ping-' + this.cfgRev.toString(), true, (v: string) => {
+              this.pingText = v;
+              this.scheduleScanSave();
+            })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+        }
 
-          Text('低于该速度的节点会在第一轮 TCP 初筛后从延迟最低的开始逐个检测并淘汰，直到凑够「测速地址数」个达标节点；若大量节点都不达标会提前中止并提示检查网络（默认 0.1 MB/s，0 = 不淘汰）。')
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .margin({ top: 8 })
-
+        // 合格速度直接展示；右侧空位放「应用建议」，与输入框底边对齐
+        Row({ space: 10 }) {
+          this.ParamCell(this.t('合格速度 MB/s', 'Min speed MB/s'), 'minSpeed', 'speed-ms-' + this.cfgRev.toString(), false, (v: string) => {
+            this.minSpeedText = v;
+            this.scheduleScanSave();
+          })
+          Text(this.t('应用建议', 'Apply'))
+            .fontSize(12)
+            .fontColor(this.accentText())
+            .textAlign(TextAlign.Center)
+            .height(38)
+            .padding({ left: 14, right: 14 })
+            .backgroundColor(this.soft())
+            .borderRadius(10)
+            .constraintSize({ minWidth: 84 })
+            .onClick(() => {
+              this.applySuggestedParams();
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Bottom)
+        .margin({ top: 10 })
+      }
       .onAreaChange((_o: Area, a: Area) => {
         this.updateMeasuredCardHeight('param', a);
       })
       .width('100%')
       .padding(16)
       }
-      .padding(16)
       .width('100%')
-    }
     .width('100%')
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
     { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
   }
 
   @Builder CardSpeed() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
         Row() {
-          Text('下载测速')
+          Text(this.t('下载测速', 'Download speed test'))
             .fontSize(15)
             .fontWeight(FontWeight.Medium)
             .fontColor(this.txt())
@@ -3863,46 +4347,40 @@ struct Index {
         .width('100%')
 
         if (this.enableSpeed) {
-          Text('测速范围')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width('100%')
-            .margin({ top: 10 })
-
           Row() {
-            Text('完全测速')
+            Text(this.t('完全测速', 'Full speed test'))
               .fontSize(12)
               .fontColor(this.speedScope === SpeedScope.ALL ? '#FFFFFF' : this.txt2())
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
-              .height(34)
-              .backgroundColor(this.speedScope === SpeedScope.ALL ? this.accent() : this.soft())
-              .borderRadius(9)
+              .height(this.CHIP_H)
+              .backgroundColor(this.speedScope === SpeedScope.ALL ? this.accentFill() : this.soft())
+              .borderRadius(this.CHIP_R)
               .onClick(() => {
                 this.speedScope = SpeedScope.ALL;
                 this.scheduleScanSave();
               })
-            Text('地区测速')
+            Text(this.t('地区测速', 'Region speed test'))
               .fontSize(12)
               .fontColor(this.speedScope === SpeedScope.REGION ? '#FFFFFF' : this.txt2())
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
-              .height(34)
-              .backgroundColor(this.speedScope === SpeedScope.REGION ? this.accent() : this.soft())
-              .borderRadius(9)
+              .height(this.CHIP_H)
+              .backgroundColor(this.speedScope === SpeedScope.REGION ? this.accentFill() : this.soft())
+              .borderRadius(this.CHIP_R)
               .margin({ left: 6 })
               .onClick(() => {
                 this.speedScope = SpeedScope.REGION;
                 this.scheduleScanSave();
               })
-            Text('全部地区')
+            Text(this.t('全部地区', 'All regions'))
               .fontSize(12)
               .fontColor(this.speedScope === SpeedScope.PER_REGION ? '#FFFFFF' : this.txt2())
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
-              .height(34)
-              .backgroundColor(this.speedScope === SpeedScope.PER_REGION ? this.accent() : this.soft())
-              .borderRadius(9)
+              .height(this.CHIP_H)
+              .backgroundColor(this.speedScope === SpeedScope.PER_REGION ? this.accentFill() : this.soft())
+              .borderRadius(this.CHIP_R)
               .margin({ left: 6 })
               .onClick(() => {
                 this.speedScope = SpeedScope.PER_REGION;
@@ -3910,172 +4388,145 @@ struct Index {
               })
           }
           .width('100%')
-          .margin({ top: 8 })
+          .margin({ top: 12 })
 
-          if (this.speedScope === SpeedScope.ALL) {
-            this.FieldRow('测速地址数', this.speedCountText, (v: string) => {
-              this.speedCountText = v;
-              this.scheduleScanSave();
-            })
-            Text('第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 10，范围 1~99）；上传数量可在「设置 → 订阅上传」里限制。')
-              .fontSize(11)
-              .fontColor(this.txt3())
-              .margin({ top: 8 })
+          if (this.speedScope === SpeedScope.PER_REGION) {
+            Row({ space: 10 }) {
+              this.ParamCell(this.t('每地区数量', 'Per-region count'), this.speedPerRegionText, 'spd-per-' + this.cfgRev.toString(), true,
+                (v: string) => {
+                  this.speedPerRegionText = v;
+                  this.scheduleScanSave();
+                })
+              Column()
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .margin({ top: 10 })
+          } else {
+            Row({ space: 10 }) {
+              this.ParamCell(this.t('测速地址数', 'Test addresses'), this.speedCountText, 'spd-count-' + this.cfgRev.toString(), true,
+                (v: string) => {
+                  this.speedCountText = v;
+                  this.scheduleScanSave();
+                })
+              Column()
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .margin({ top: 10 })
           }
 
           if (this.speedScope === SpeedScope.REGION) {
-            this.FieldRow('测速地址数', this.speedCountText, (v: string) => {
-              this.speedCountText = v;
-              this.scheduleScanSave();
-            })
-            Row() {
-              Text('地区码')
-                .fontSize(13)
-                .fontColor(this.txt2())
-                .width(110)
-              TextInput({ text: this.regionCode, placeholder: '例如 HKG / LAX / NRT' })
-                .layoutWeight(1)
-                .height(40)
-                .fontSize(13)
-                .fontColor(this.txt())
-                .backgroundColor(this.inputBg())
-                .borderRadius(10)
-                .placeholderColor(this.txt3())
-                .onChange((v: string) => {
+            Row({ space: 10 }) {
+              this.ParamCell(this.t('地区码', 'Region code'), this.regionCode, 'spd-region-' + this.cfgRev.toString(), false,
+                (v: string) => {
                   this.regionCode = v;
+                  this.scheduleScanSave();
+                })
+              Column()
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .margin({ top: 10 })
+          }
+
+          Text(this.speedScope === SpeedScope.PER_REGION
+            ? this.t('按地区分组，每个地区各取延迟最低的前几个地址测速；覆盖所有地区。', 'Groups by region and speed-tests the few lowest-latency addresses in each region; covers all regions.')
+            : this.t('第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 10，范围 1~99）；上传数量可在「设置 → 订阅上传」限制。', 'Round 1 addresses are sorted by latency, lowest first, and only the top N are tested (default 10, range 1–99); the upload count can be limited in Settings → Subscription upload.'))
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .width('100%')
+            .margin({ top: 8 })
+
+          // 平板/电脑端横向空间充足：去掉「高级选项」折叠，参数直接全部展示
+          if (this.winW < 900) {
+            this.AdvRow(this.advSpeedOpen, () => {
+              animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
+                this.advSpeedOpen = !this.advSpeedOpen;
+              });
+            })
+          }
+
+          if (this.winW >= 900 || this.advSpeedOpen) {
+            Row({ space: 10 }) {
+              this.ParamCell(this.t('每地址次数', 'Rounds per address'), this.speedRoundsText, 'spd-rounds-' + this.cfgRev.toString(), true,
+                (v: string) => {
+                  this.speedRoundsText = v;
+                  this.scheduleScanSave();
+                })
+              this.ParamCell(this.t('窗口 ms', 'Window ms'), this.speedWindowText, 'spd-window-' + this.cfgRev.toString(), true,
+                (v: string) => {
+                  this.speedWindowText = v;
                   this.scheduleScanSave();
                 })
             }
             .width('100%')
-            .margin({ top: 8 })
-            Text('只测这个地区，同样按延迟从低到高取前 N 个（默认 10；HKG / LAX / NRT 这类三字码）。')
+            .margin({ top: 10 })
+
+            Row({ space: 10 }) {
+              this.ParamCell(this.t('测速域名（可选）', 'Test domain (optional)'), this.domain, 'spd-domain-' + this.cfgRev.toString(), false,
+                (v: string) => {
+                  this.domain = v;
+                  this.scheduleScanSave();
+                })
+              Column()
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .margin({ top: 10 })
+
+            Row() {
+              Text(this.t('解析测试', 'Resolve test'))
+                .fontSize(12)
+                .fontColor(this.accentText())
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor(this.soft())
+                .borderRadius(9)
+                .onClick(() => {
+                  this.doResolve();
+                })
+              Text(this.domainInfoText)
+                .fontSize(11)
+                .fontColor(this.txt3())
+                .margin({ left: 10 })
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .margin({ top: 10 })
+
+            Text(this.t('每个地址测 ', 'Each address is tested ') + this.speedRoundsText + this.t(' 次取平均，单次下载窗口 ', ' times and the results averaged; each download window is ') + this.speedWindowText +
+              this.t('ms。建议次数不超过 10，否则总耗时很长。域名用于测速 Host/SNI 校验，并自动解析其 A（IPv4）/AAAA（IPv6）记录并入候选；留空则用 speed.cloudflare.com。', 'ms. Keep rounds at 10 or fewer, otherwise the total takes a long time. The domain is used for the test Host/SNI check and its A (IPv4)/AAAA (IPv6) records are resolved into candidates; if blank, speed.cloudflare.com is used.'))
               .fontSize(11)
               .fontColor(this.txt3())
+              .width('100%')
               .margin({ top: 8 })
           }
-
-          if (this.speedScope === SpeedScope.PER_REGION) {
-            this.FieldRow('每地区数量', this.speedPerRegionText, (v: string) => {
-              this.speedPerRegionText = v;
-              this.scheduleScanSave();
-            })
-            Text('按 colo 分组，每个地区各取延迟最低的前几个测速，覆盖所有地区。')
-              .fontSize(11)
-              .fontColor(this.txt3())
-              .margin({ top: 8 })
-          }
-
-          Row() {
-            Text('每地址次数')
-              .fontSize(13)
-              .fontColor(this.txt2())
-              .width(110)
-            TextInput({ text: this.speedRoundsText })
-              .layoutWeight(1)
-              .height(40)
-              .fontSize(13)
-              .fontColor(this.txt())
-              .backgroundColor(this.inputBg())
-              .borderRadius(10)
-              .onChange((v: string) => {
-                this.speedRoundsText = v;
-                this.scheduleScanSave();
-              })
-          }
-          .width('100%')
-          .margin({ top: 8 })
-
-          Row() {
-            Text('窗口 ms')
-              .fontSize(13)
-              .fontColor(this.txt2())
-              .width(110)
-            TextInput({ text: this.speedWindowText })
-              .layoutWeight(1)
-              .height(40)
-              .fontSize(13)
-              .fontColor(this.txt())
-              .backgroundColor(this.inputBg())
-              .borderRadius(10)
-              .onChange((v: string) => {
-                this.speedWindowText = v;
-                this.scheduleScanSave();
-              })
-          }
-          .width('100%')
-          .margin({ top: 8 })
-
-          Text('每个地址测 ' + this.speedRoundsText + ' 次取平均，单次下载窗口 ' + this.speedWindowText +
-            'ms（CloudFlareScan 用 3 秒）。建议次数不超过 10，否则总耗时很长。')
+        } else {
+          Text(this.t('已关闭下载测速：只做连接可用性与延迟筛选，不测下载速度。', 'Download speed test is off: only connectivity and latency are filtered; download speed is not measured.'))
             .fontSize(11)
             .fontColor(this.txt3())
+            .width('100%')
             .margin({ top: 8 })
         }
-
-        Divider().color(this.lineC()).margin({ top: 12, bottom: 4 })
-
-        Row() {
-          Text('测速域名（可选）')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(110)
-          TextInput({ text: this.domain, placeholder: 'cdn.example.com' })
-            .layoutWeight(1)
-            .height(40)
-            .fontSize(13)
-            .fontColor(this.txt())
-            .backgroundColor(this.inputBg())
-            .borderRadius(10)
-            .placeholderColor(this.txt3())
-            .onChange((v: string) => {
-              this.domain = v;
-              this.scheduleScanSave();
-            })
-        }
-        .width('100%')
-        .margin({ top: 8 })
-
-        Row() {
-          Text('解析测试')
-            .fontSize(12)
-            .fontColor(this.accent())
-            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-            .backgroundColor(this.soft())
-            .borderRadius(9)
-            .onClick(() => {
-              this.doResolve();
-            })
-          Text(this.domainInfoText)
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .margin({ left: 10 })
-            .layoutWeight(1)
-        }
-        .width('100%')
-        .margin({ top: 10 })
-
-        Text('域名用于测速 Host/SNI 校验，并自动解析其 A（IPv4）/AAAA（IPv6）记录并入候选；留空则用 speed.cloudflare.com。')
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .margin({ top: 8 })
+      }
       .onAreaChange((_o: Area, a: Area) => {
         this.updateMeasuredCardHeight('speed', a);
       })
       .width('100%')
       .padding(16)
       }
-      .padding(16)
       .width('100%')
-    }
     .width('100%')
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
     { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    // 宽屏时按左列高度撑满，保证左右两列卡片底部边界齐平。
+    // 注意：这里直接读 @State（而不是用 Builder 形参），否则量测值变化不会触发重建。
+    .constraintSize({ minHeight: this.speedCardMinH() })
     .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
   }
   @Builder ThemeChip(label: string, idx: number) {
     Text(label)
@@ -4085,12 +4536,12 @@ struct Index {
       .layoutWeight(1)
       .height(this.BTN_H)
       .borderRadius(9)
-      .backgroundColor(this.themeMode === idx ? this.accent() : this.soft())
+      .backgroundColor(this.themeMode === idx ? this.accentFill() : this.soft())
       .onClick(() => {
         this.themeMode = idx;
         this.applyThemeMode();
         ConfigStore.saveTheme(idx).catch((e: BusinessError) => {
-          this.addLog('保存主题失败：' + e.message);
+          this.addLog(this.t('保存主题失败：', 'Failed to save theme: ') + e.message);
         });
       })
   }
@@ -4115,7 +4566,7 @@ struct Index {
       .layoutWeight(1)
       .height(this.BTN_H)
       .borderRadius(10)
-      .backgroundColor(this.chipSel(group, idx) ? this.accent() : (this.dark ? '#1AFFFFFF' : '#10000000'))
+      .backgroundColor(this.chipSel(group, idx) ? this.accentFill() : (this.dark ? '#1AFFFFFF' : '#10000000'))
       .onClick(() => {
         onTap();
       })
@@ -4164,104 +4615,132 @@ struct Index {
   @Builder CardAppearanceMaterial() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-      this.CardTitle('材质', $r('sys.symbol.paintbrush'))
-      Row() {
-        Column() {
-          Text('全局沉浸光感')
-            .fontSize(14)
-            .fontColor(this.txt())
-          Text('关闭后卡片与底部导航都不再使用沉浸光感')
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .margin({ top: 4 })
+        this.CardTitle(this.t('材质', 'Material'), $r('sys.symbol.paintbrush'))
+
+        Row() {
+          Column() {
+            Text(this.t('全局沉浸光感', 'Global immersive effect'))
+              .fontSize(14)
+              .fontColor(this.txt())
+            Text(this.t('关闭后卡片与底部导航都不再使用沉浸光感', 'When off, cards and the bottom navigation no longer use the immersive material effect'))
+              .fontSize(11)
+              .fontColor(this.txt3())
+              .margin({ top: 2 })
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          Toggle({ type: ToggleType.Switch, isOn: this.globalImmersion })
+            .selectedColor(this.accent())
+            .onChange((on: boolean) => {
+              this.globalImmersion = on;
+              this.saveUi();
+            })
         }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.globalImmersion })
-          .selectedColor(this.accent())
-          .onChange((on: boolean) => {
-            this.globalImmersion = on;
-            this.saveUi();
-          })
-      }
-      .width('100%')
-      .margin({ top: 12 })
-
-      Text('材质类型')
-        .fontSize(12)
-        .fontColor(this.txt3())
-        .width('100%')
-        .margin({ top: 16, bottom: 8 })
-      Row({ space: 8 }) {
-        this.OptChip('自适应', 'matType', 0, () => {
-          this.matType = 0;
-          this.saveUi();
-        })
-        this.OptChip('沉浸', 'matType', 1, () => {
-          this.matType = 1;
-          this.saveUi();
-        })
-        this.OptChip('无材质', 'matType', 2, () => {
-          this.matType = 2;
-          this.saveUi();
-        })
-      }
-      .width('100%')
-
-      Text('材质等级')
-        .fontSize(12)
-        .fontColor(this.txt3())
-        .width('100%')
-        .margin({ top: 16, bottom: 8 })
-      Row({ space: 8 }) {
-        this.OptChip('自适应', 'matLevel', 0, () => {
-          this.matLevel = 0;
-          this.saveUi();
-        })
-        this.OptChip('精致', 'matLevel', 1, () => {
-          this.matLevel = 1;
-          this.saveUi();
-        })
-        this.OptChip('柔和', 'matLevel', 2, () => {
-          this.matLevel = 2;
-          this.saveUi();
-        })
-        this.OptChip('平滑', 'matLevel', 3, () => {
-          this.matLevel = 3;
-          this.saveUi();
-        })
-      }
-      .width('100%')
-
-      Text(this.matSupported()
-        ? ('当前：' + this.matTypeName() + ' · ' + this.matLevelName() + '（设备等级 ' + this.deviceLevelName() + '，卡片' + this.glassDesc() + '）')
-        : '本机不支持系统沉浸材质，卡片与胶囊退回手绘玻璃。')
-        .fontSize(11)
-        .fontColor(this.txt3())
         .width('100%')
         .margin({ top: 12 })
-    }
+
+        Row() {
+          Text(this.t('类型', 'Type'))
+            .fontSize(12)
+            .fontColor(this.txt3())
+            .width(56)
+          Row({ space: 8 }) {
+            this.OptChip(this.t('自适应', 'Adaptive'), 'matType', 0, () => {
+              this.matType = 0;
+              this.saveUi();
+            })
+            this.OptChip(this.t('沉浸', 'Immersive'), 'matType', 1, () => {
+              this.matType = 1;
+              this.saveUi();
+            })
+            this.OptChip(this.t('无材质', 'No material'), 'matType', 2, () => {
+              this.matType = 2;
+              this.saveUi();
+            })
+          }
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        .margin({ top: 12 })
+
+        Row() {
+          Text(this.t('等级', 'Level'))
+            .fontSize(12)
+            .fontColor(this.txt3())
+            .width(56)
+          Row({ space: 8 }) {
+            this.OptChip(this.t('自适应', 'Adaptive'), 'matLevel', 0, () => {
+              this.matLevel = 0;
+              this.saveUi();
+            })
+            this.OptChip(this.t('精致', 'Exquisite'), 'matLevel', 1, () => {
+              this.matLevel = 1;
+              this.saveUi();
+            })
+            this.OptChip(this.t('柔和', 'Gentle'), 'matLevel', 2, () => {
+              this.matLevel = 2;
+              this.saveUi();
+            })
+            this.OptChip(this.t('平滑', 'Smooth'), 'matLevel', 3, () => {
+              this.matLevel = 3;
+              this.saveUi();
+            })
+          }
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        .margin({ top: 8 })
+
+        Text(this.matSupported()
+          ? (this.t('当前：', 'Current: ') + this.matTypeName() + ' · ' + this.matLevelName() + this.t('（设备等级 ', ' (device level ') + this.deviceLevelName() + this.t('，卡片', ', card: ') + this.glassDesc() + '）')
+          : this.t('本机不支持系统沉浸材质，卡片与胶囊退回手绘玻璃。', 'This device does not support system immersive materials; cards and the capsule fall back to hand-drawn glass.'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 12 })
+      }
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .padding(16)
-      .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
-        { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-      .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
-      .borderRadius(20)
-      .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('mat', a);
-      })
     }
-    .systemMaterial(this.cardMaterial())
     .width('100%')
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .clip(true)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .onAreaChange((_o: Area, a: Area) => {
+      this.updateMeasuredCardHeight('mat', a);
+    })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
   }
 
   /** 预设背景缩略图（Android 端 rawfile 直读，避免额外解码文件） */
+  /** 背景图块可见内容宽度：宽屏要扣掉左侧分类栏 */
+  private bgContentW(): number {
+    const w: number = Math.min(this.winW, 1600);
+    const side: number = w >= 900 ? 336 : 0;
+    return Math.max(240, w - side - 32);
+  }
+
+  /** 一行放几个图块：内容窄时 4 个（两行），内容宽时 8 个（一行），避免被拉成细长条 */
+  private bgCols(): number {
+    return this.bgContentW() >= 760 ? 8 : 4;
+  }
+
+  /** 图块高度：列数越少、单个越宽，相应加高以保持接近 3:2 的预览比例 */
+  private bgTileH(): number {
+    const cols: number = this.bgCols();
+    if (cols === 8) {
+      return 76;
+    }
+    return this.bgContentW() >= 560 ? 72 : 56;
+  }
+
   @Builder BgPresetTile(idx: number) {
     Stack({ alignContent: Alignment.Center }) {
       if (idx === 0) { Image($rawfile('bg/preset1.jpg'))
@@ -4297,13 +4776,13 @@ struct Index {
         Column()
           .width('100%')
           .height('100%')
-          .borderRadius(10)
+          .borderRadius(12)
           .border({ width: 2, color: this.accent() })
       }
     }
-    .width(40)
-    .height(40)
-    .borderRadius(10)
+    .width('100%')
+    .height(this.bgTileH())
+    .borderRadius(12)
     .clip(true)
     .backgroundColor(this.soft())
     .onClick(() => {
@@ -4321,13 +4800,13 @@ struct Index {
         Column()
           .width('100%')
           .height('100%')
-          .borderRadius(10)
+          .borderRadius(12)
           .border({ width: 2, color: this.accent() })
       }
     }
-    .width(40)
-    .height(40)
-    .borderRadius(10)
+    .width('100%')
+    .height(this.bgTileH())
+    .borderRadius(12)
     .clip(true)
     .backgroundColor(this.soft())
     .onClick(() => {
@@ -4339,27 +4818,27 @@ struct Index {
   @Builder CardAppearanceBackground() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle('外观', $r('sys.symbol.paintbrush'))
+        this.CardTitle(this.t('外观', 'Appearance'), $r('sys.symbol.paintbrush'))
 
-        Text('颜色模式')
+        Text(this.t('颜色模式', 'Color mode'))
           .fontSize(12)
           .fontColor(this.txt3())
           .width('100%')
           .margin({ top: 12, bottom: 8 })
         Row({ space: 8 }) {
-          this.OptChip('跟随系统', 'theme', 2, () => {
+          this.OptChip(this.t('跟随系统', 'Follow system'), 'theme', 2, () => {
             this.setThemeMode(2);
           })
-          this.OptChip('深色', 'theme', 0, () => {
+          this.OptChip(this.t('深色', 'Dark'), 'theme', 0, () => {
             this.setThemeMode(0);
           })
-          this.OptChip('浅色', 'theme', 1, () => {
+          this.OptChip(this.t('浅色', 'Light'), 'theme', 1, () => {
             this.setThemeMode(1);
           })
         }
         .width('100%')
 
-        Text('主题色')
+        Text(this.t('主题色', 'Accent color'))
           .fontSize(12)
           .fontColor(this.txt3())
           .width('100%')
@@ -4368,19 +4847,15 @@ struct Index {
           this.ThemeColorDot(0)
           this.ThemeColorDot(1)
           this.ThemeColorDot(2)
-        }
-        .width('100%')
-        Row({ space: 10 }) {
           this.ThemeColorDot(3)
           this.ThemeColorDot(4)
           this.ThemeColorDot(5)
         }
         .width('100%')
-        .margin({ top: 10 })
 
         Row() {
           Column() {
-            Text('背景图')
+            Text(this.t('背景图', 'Background image'))
               .fontSize(14)
               .fontColor(this.txt())
             Text(this.bgPathLabel())
@@ -4390,9 +4865,9 @@ struct Index {
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
-          Text('图库选择')
+          Text(this.t('图库选择', 'Choose from gallery'))
             .fontSize(12)
-            .fontColor(this.accent())
+            .fontColor(this.accentText())
             .padding({ left: 12, right: 12, top: 7, bottom: 7 })
             .backgroundColor(this.dark ? '#1AFFFFFF' : '#10000000')
             .borderRadius(10)
@@ -4403,35 +4878,106 @@ struct Index {
         .width('100%')
         .margin({ top: 18 })
 
-        Row({ space: 7 }) {
-          this.BgNoneTile()
-          this.BgPresetTile(0)
-          this.BgPresetTile(1)
-          this.BgPresetTile(2)
-          this.BgPresetTile(3)
-          this.BgPresetTile(4)
-          this.BgPresetTile(5)
-          this.BgPresetTile(6)
+        if (this.bgCols() === 8) {
+          Row({ space: 8 }) {
+            Column() {
+              this.BgNoneTile()
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(0)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(1)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(2)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(3)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(4)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(5)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(6)
+            }
+            .layoutWeight(1)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .margin({ top: 10 })
+        } else {
+        Row({ space: 8 }) {
+          Column() {
+            this.BgNoneTile()
+          }
+          .layoutWeight(1)
+          Column() {
+            this.BgPresetTile(0)
+          }
+          .layoutWeight(1)
+          Column() {
+            this.BgPresetTile(1)
+          }
+          .layoutWeight(1)
+          Column() {
+            this.BgPresetTile(2)
+          }
+          .layoutWeight(1)
         }
         .width('100%')
+        .alignItems(VerticalAlign.Center)
         .margin({ top: 10 })
 
-        this.PctSliderRow('背景图模糊程度', 'blur')
-        this.PctSliderRow('背景图明亮程度', 'bright')
+        Row({ space: 8 }) {
+          Column() {
+            this.BgPresetTile(3)
+          }
+          .layoutWeight(1)
+          Column() {
+            this.BgPresetTile(4)
+          }
+          .layoutWeight(1)
+          Column() {
+            this.BgPresetTile(5)
+          }
+          .layoutWeight(1)
+          Column() {
+            this.BgPresetTile(6)
+          }
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        }
+
+
+        // 两个滑杆属于常用外观调节，直接展示，不再折叠
+        this.PctSliderRow(this.t('背景图模糊程度', 'Background blur'), 'blur')
+        this.PctSliderRow(this.t('背景图明亮程度', 'Background brightness'), 'bright')
       }
       .width('100%')
       .padding(16)
     }
-    .systemMaterial(this.cardMaterial())
     .width('100%')
     .onAreaChange((_o: Area, a: Area) => {
       this.updateMeasuredCardHeight('appbg', a);
     })
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
     }
@@ -4461,7 +5007,7 @@ struct Index {
     const ctx: common.UIAbilityContext = this.ctx as common.UIAbilityContext;
     try {
       ctx.openLink(url).catch((err: BusinessError) => {
-        this.addLog('打开浏览器失败（' + err.code + '），改用系统浏览器');
+        this.addLog(this.t('打开浏览器失败（', 'Failed to open browser (') + err.code + this.t('），改用系统浏览器', '), falling back to the system browser'));
         this.startBrowser(url);
       });
     } catch (e) {
@@ -4477,7 +5023,7 @@ struct Index {
       uri: url
     };
     ctx.startAbility(want).catch((err: BusinessError) => {
-      this.addLog('无法打开链接：' + err.message);
+      this.addLog(this.t('无法打开链接：', 'Cannot open link: ') + err.message);
     });
   }
 
@@ -4495,7 +5041,7 @@ struct Index {
       .layoutWeight(1)
       Text('↗')
         .fontSize(13)
-        .fontColor(this.accent())
+        .fontColor(this.accentText())
     }
     .width('100%')
     .padding({ left: 12, right: 12, top: 9, bottom: 9 })
@@ -4509,13 +5055,13 @@ struct Index {
   @Builder CardRuntime() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle('运行', $r('sys.symbol.gearshape'))
+        this.CardTitle(this.t('运行', 'Runtime'), $r('sys.symbol.gearshape'))
         Row() {
           Column({ space: 3 }) {
-            Text('后台保持运行')
+            Text(this.t('后台保持运行', 'Keep running in background'))
               .fontSize(14)
               .fontColor(this.txt())
-            Text('开启后扫描/测速/上传期间切到后台不中断：手机/平板使用数据传输连续任务，PC 优先计算任务；关闭则使用系统默认行为')
+            Text(this.t('开启后扫描/测速/上传期间切到后台不中断：手机/平板使用数据传输连续任务，PC 优先计算任务；关闭则使用系统默认行为', 'When on, scans, speed tests and uploads keep running after switching to the background: DATA_TRANSFER continuous task on phones/tablets, compute task preferred on PC. When off, the system default applies.'))
               .fontSize(11)
               .fontColor(this.txt3())
               .lineHeight(16)
@@ -4529,9 +5075,9 @@ struct Index {
               AppBackground.enabled = v;
               ConfigStore.saveKeepAlive(v);
               if (v) {
-                this.addLog('后台保活已开启：扫描/测速/自动上传期间保持运行（手机/平板 DATA_TRANSFER，PC 优先 TASK_KEEPING）');
+                this.addLog(this.t('后台保活已开启：扫描/测速/自动上传期间保持运行（手机/平板 DATA_TRANSFER，PC 优先 TASK_KEEPING）', 'Background keep-alive on: stays running during scans, speed tests and auto uploads (DATA_TRANSFER on phones/tablets; TASK_KEEPING preferred on PC)'));
               } else {
-                this.addLog('后台保活已关闭：使用系统默认后台策略');
+                this.addLog(this.t('后台保活已关闭：使用系统默认后台策略', 'Background keep-alive off: using the system default background policy'));
               }
             })
         }
@@ -4549,20 +5095,19 @@ struct Index {
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
   }
 
   @Builder CardAbout() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle('关于', $r('sys.symbol.info_circle'))
+        this.CardTitle(this.t('关于', 'About'), $r('sys.symbol.info_circle'))
         Row() {
           Text('CFLark')
             .fontSize(14)
@@ -4574,25 +5119,122 @@ struct Index {
         }
         .width('100%')
         .margin({ top: 12 })
-        Text('Cloudflare 节点优选 · 鸿蒙原生应用')
+        Text(this.t('Cloudflare 节点优选 · 鸿蒙原生应用', 'Cloudflare node selection · native HarmonyOS app'))
           .fontSize(11)
           .fontColor(this.txt3())
           .margin({ top: 6 })
-        Text('TCP 筛选 → 数据中心 → 下载测速 → 加权排序，支持域名端到端校验与 edgetunnel 订阅上传。')
+        Text(this.t('TCP 筛选 → 数据中心 → 下载测速 → 加权排序，支持域名端到端校验与 edgetunnel 订阅上传。', 'TCP filter → data center → download speed test → weighted ranking, with end-to-end domain validation and edgetunnel subscription uploads.'))
           .fontSize(11)
           .fontColor(this.txt3())
           .lineHeight(17)
           .margin({ top: 8 })
-        this.AboutLink('GitHub 项目主页', '源码、Issue 与更新记录', 'https://github.com/Bailin-Love/CFLark-Harmony')
-        this.AboutLink('下载最新版本', 'GitHub Releases · HAP / APP', 'https://github.com/Bailin-Love/CFLark-Harmony/releases/latest')
+        this.AboutLink(this.t('GitHub 项目主页', 'GitHub project page'), this.t('源码、Issue 与更新记录', 'Source code, issues and changelog'), 'https://github.com/Bailin-Love/CFLark-Harmony')
+
+        // 检查更新：并入「关于」卡片，紧跟项目主页，不另起一张卡
+        Row({ space: 10 }) {
+          Column({ space: 3 }) {
+            Text(this.t('检查更新', 'Check for updates'))
+              .fontSize(13)
+              .fontColor(this.txt())
+            Text(this.updStatusText())
+              .fontSize(11)
+              .fontColor(this.updStatusColor())
+              .lineHeight(16)
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+          Text(this.updStatus === UpdateStatus.CHECKING ? this.t('检查中…', 'Checking…')
+            : (this.updFailed() ? this.t('重试', 'Retry') : this.t('检查', 'Check')))
+            .fontSize(12)
+            .fontColor(this.updStatus === UpdateStatus.CHECKING ? this.txt3() : Color.White)
+            .textAlign(TextAlign.Center)
+            .height(34)
+            .padding({ left: 16, right: 16 })
+            .borderRadius(9)
+            .backgroundColor(this.updStatus === UpdateStatus.CHECKING ? this.soft() : this.accentFill())
+            .onClick(() => {
+              this.checkUpdate();
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        .margin({ top: 12 })
+
+        if (this.updStatus === UpdateStatus.UPDATE_AVAILABLE) {
+          Row({ space: 8 }) {
+            Text('v' + this.updLatestVersion)
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.accentText())
+            Text(this.updLatestDate.length >= 10 ? this.updLatestDate.substring(0, 10) : this.updLatestDate)
+              .fontSize(11)
+              .fontColor(this.txt3())
+          }
+          .width('100%')
+          .margin({ top: 10 })
+          if (this.updLatestNotes.length > 0) {
+            Text(this.updLatestNotes.length > 260 ? this.updLatestNotes.substring(0, 260) + '…' : this.updLatestNotes)
+              .fontSize(11)
+              .fontColor(this.txt3())
+              .lineHeight(17)
+              .maxLines(6)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+              .margin({ top: 6 })
+          }
+          Text(this.updHasPackage
+            ? this.t('该版本的 Releases 提供安装包，请在发布页按需下载；应用不会自动安装。', 'This release provides an install package; download it from the release page if needed. The app never installs it automatically.')
+            : this.t('该版本的 Releases 未附带鸿蒙安装包，本应用不会自动下载或覆盖安装。', 'This release has no HarmonyOS package attached; this app never downloads or installs automatically.'))
+            .fontSize(10)
+            .fontColor(this.txt3())
+            .lineHeight(15)
+            .width('100%')
+            .margin({ top: 6 })
+          Row({ space: 8 }) {
+            Text(this.t('前往下载', 'Go to download'))
+              .fontSize(12)
+              .fontColor(Color.White)
+              .textAlign(TextAlign.Center)
+              .height(32)
+              .padding({ left: 14, right: 14 })
+              .borderRadius(9)
+              .backgroundColor(this.accentFill())
+              .onClick(() => {
+                this.openExternal(this.updLatestUrl.length > 0 ? this.updLatestUrl : AppMeta.RELEASES_URL);
+              })
+            Text(this.t('更新日志', 'Changelog'))
+              .fontSize(12)
+              .fontColor(this.accentText())
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .borderRadius(9)
+              .backgroundColor(this.soft())
+              .onClick(() => {
+                this.openChangelog();
+              })
+            Blank()
+          }
+          .width('100%')
+          .margin({ top: 10 })
+        }
+
+        if (this.updFromFallback && this.updStatus === UpdateStatus.UPDATE_AVAILABLE) {
+          Text(this.t('（接口受限，版本号由官方 Releases 页面读取，更新说明可能缺失）',
+            ' (API limited: version read from the official Releases page; notes may be missing)'))
+            .fontSize(10)
+            .fontColor(this.txt3())
+            .lineHeight(14)
+            .margin({ top: 6 })
+        }
+
         Divider()
           .color(this.cardBorderColor())
           .margin({ top: 12, bottom: 8 })
-        Text('免责条款')
+        Text(this.t('免责条款', 'Disclaimer'))
           .fontSize(11)
           .fontColor(this.txt2())
           .margin({ top: 2 })
-        Text('本应用仅供学习与个人研究使用，与 Cloudflare 官方无关。请遵守所在地区法律法规及 Cloudflare 服务条款；因使用本应用（含节点测速、订阅上传等）产生的任何后果由使用者自行承担。')
+        Text(this.t('本应用仅供学习与个人研究使用，与 Cloudflare 官方无关。请遵守所在地区法律法规及 Cloudflare 服务条款；因使用本应用（含节点测速、订阅上传等）产生的任何后果由使用者自行承担。', 'This app is for learning and personal research only and is not affiliated with Cloudflare. Please comply with the laws of your region and the Cloudflare Terms of Service; you are solely responsible for any consequences of using this app (including node speed tests and subscription uploads).'))
           .fontSize(10)
           .fontColor(this.txt3())
           .lineHeight(16)
@@ -4606,15 +5248,14 @@ struct Index {
     .padding(16)
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
     }
-    .systemMaterial(this.cardMaterial())
   }
 
   @Builder DiagOutput() {
@@ -4641,14 +5282,14 @@ struct Index {
   @Builder CardDiag() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle('网络诊断', $r('sys.symbol.info_circle'))
-        Text('用于区分「应用 Socket 问题 / 运营商路由问题 / 随机地址不可达 / 超时过短 / 延迟门槛过严」。自检固定使用 3000ms 超时、顺序执行，不会修改扫描配置。')
+        this.CardTitle(this.t('网络诊断', 'Network diagnostics'), $r('sys.symbol.info_circle'))
+        Text(this.t('用于区分「应用 Socket 问题 / 运营商路由问题 / 随机地址不可达 / 超时过短 / 延迟门槛过严」。自检固定使用 3000ms 超时、顺序执行，不会修改扫描配置。', 'Helps distinguish app socket issues / carrier routing issues / unreachable random addresses / timeouts that are too short / an overly strict latency threshold. The self-test always uses a 3000ms timeout and runs sequentially; it does not change scan settings.'))
           .fontSize(11)
           .fontColor(this.txt3())
           .lineHeight(16)
           .margin({ top: 8 })
         Row({ space: 10 }) {
-          Text(this.diagBusy ? '诊断中…' : '运行 IPv4 自检')
+          Text(this.diagBusy ? this.t('诊断中…', 'Diagnosing…') : this.t('运行 IPv4 自检', 'Run IPv4 self-test'))
             .fontSize(13)
             .fontColor(this.diagBusy ? this.txt3() : this.accent())
             .padding({ left: 14, right: 14, top: 8, bottom: 8 })
@@ -4659,7 +5300,7 @@ struct Index {
                 this.runIpv4Diag();
               }
             })
-          Text(this.diagBusy ? '诊断中…' : '运行 IPv6 自检')
+          Text(this.diagBusy ? this.t('诊断中…', 'Diagnosing…') : this.t('运行 IPv6 自检', 'Run IPv6 self-test'))
             .fontSize(13)
             .fontColor(this.diagBusy ? this.txt3() : this.accent())
             .padding({ left: 14, right: 14, top: 8, bottom: 8 })
@@ -4677,16 +5318,16 @@ struct Index {
 
         if (this.diagText.length > 0) {
           Row({ space: 10 }) {
-            Text('复制结果')
+            Text(this.t('复制结果', 'Copy results'))
               .fontSize(12)
-              .fontColor(this.accent())
+              .fontColor(this.accentText())
               .padding({ left: 12, right: 12, top: 6, bottom: 6 })
               .backgroundColor(this.soft())
               .borderRadius(8)
               .onClick(() => {
                 this.copyDiag();
               })
-            Text('清空')
+            Text(this.t('清空', 'Clear'))
               .fontSize(12)
               .fontColor(this.txt3())
               .padding({ left: 12, right: 12, top: 6, bottom: 6 })
@@ -4710,77 +5351,797 @@ struct Index {
       })
       .width('100%')
       .alignItems(HorizontalAlign.Start)
-      .padding(16)
     }
     .width('100%')
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
     { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
+  }
+
+  /**
+   * 标签页主体（抽出为 @Builder，便于语言切换时整棵重建）。
+   * 说明：ArkUI 中 @Builder 的按值参数不会随状态变化刷新，
+   * 因此在 build() 里用 if/else 两个等价分支包住本 Builder，
+   * 语言切换时销毁并重建，保证所有已渲染文案立即切换。
+   */
+  @Builder TabsCore() {
+    HdsTabs({ index: this.curTab, barPosition: BarPosition.End }) {
+      TabContent() {
+        Column() {
+          this.ScanPage()
+        }
+        .width('100%')
+        .height('100%')
+      }.tabBar(this.TabItem(this.t('扫描', 'Scan'), 0))
+
+      TabContent() {
+        Column() {
+          this.PingPage()
+        }
+        .width('100%')
+        .height('100%')
+      }.tabBar(this.TabItem(this.t('筛选', 'Filter'), 1))
+
+      TabContent() {
+        Column() {
+          this.SpeedPage()
+        }
+        .width('100%')
+        .height('100%')
+      }.tabBar(this.TabItem(this.t('测速', 'Speed test'), 2))
+TabContent() {
+  Column() {
+
+    this.SettingsPage()
+  }
+  .width('100%')
+  .height('100%')
+}.tabBar(this.TabItem(this.t('设置', 'Settings'), 3))
+    }
+    .width('100%')
+    .height('100%')
+    // 官方「沉浸光感」：HdsTabs 悬浮页签 + barFloatingStyle.systemMaterialEffect
+    // （见《鸿蒙沉浸光感》文档：barOverlap(true)/vertical(false)/barPosition(End)）
+    .vertical(false)
+    .barOverlap(true)
+    .barBackgroundColor(this.dark ? '#A61C1C22' : '#00FFFFFF')
+.barFloatingStyle(this.navFloatStyle())
+    .backgroundColor(Color.Transparent)
+    .scrollable(true)
+    // 切页动画时长：默认偏长（300ms），缩短到 200ms 让滑动/点击更跟手；
+    // 不改变切换判定，选中态仍以 onChange（真实生效的页面）为准
+    .animationDuration(200)
+    // 说明：这里只做「允许切换」的判断，不修改选中态。
+    // 手势未达阈值 / 被取消并回弹时不会触发 onChange，选中态因此保持在真实页面；
+    // 只有 onChange（切换真正生效）才会同步 navSel。
+    .onContentWillChange((cur: number, coming: number) => {
+      return true;
+    })
+    .onChange((index: number) => {
+      if (index !== this.curTab) {
+        this.anyScrollY = 0;
+        if (this.showBackTop) {
+          this.showBackTop = false;
+        }
+      }
+      this.curTab = index;
+      this.navSel = index;
+      this.navPillX = this.navTabCenter(index);
+      this.setPillScale(1.0, 0, 0);
+    })
+  }
+
+  // ===== 更新检查 / 更新日志 / 升级说明 =====
+  private updStatusText(): string {
+    if (this.updStatus === UpdateStatus.CHECKING) {
+      return this.t('正在检查…', 'Checking…');
+    }
+    if (this.updStatus === UpdateStatus.UP_TO_DATE) {
+      return this.t('已是最新版本', 'You are on the latest version');
+    }
+    if (this.updStatus === UpdateStatus.UPDATE_AVAILABLE) {
+      return this.t('发现新版本 v', 'New version available: v') + this.updLatestVersion;
+    }
+    if (this.updStatus === UpdateStatus.NO_RELEASE) {
+      return this.t('暂无可发布的正式版本', 'No published release yet');
+    }
+    if (this.updStatus === UpdateStatus.RATE_LIMITED) {
+      return this.t('请求被限流，请稍后再试', 'Requests are rate-limited; try again later');
+    }
+    if (this.updStatus === UpdateStatus.PARSE_ERROR) {
+      return this.t('返回内容无法解析，请稍后重试', 'Unexpected response; try again later');
+    }
+    if (this.updStatus === UpdateStatus.NETWORK_ERROR) {
+      return this.t('网络不可用，检查失败', 'Network unavailable; check failed');
+    }
+    return this.t('尚未检查', 'Not checked yet');
+  }
+
+  private updStatusColor(): string {
+    if (this.updStatus === UpdateStatus.UPDATE_AVAILABLE) {
+      return this.accentText();
+    }
+    if (this.updStatus === UpdateStatus.NETWORK_ERROR || this.updStatus === UpdateStatus.RATE_LIMITED ||
+      this.updStatus === UpdateStatus.PARSE_ERROR) {
+      return this.dark ? '#F0A0A0' : '#B3261E';
+    }
+    return this.txt3();
+  }
+
+  private updFailed(): boolean {
+    return this.updStatus === UpdateStatus.NETWORK_ERROR || this.updStatus === UpdateStatus.RATE_LIMITED ||
+      this.updStatus === UpdateStatus.PARSE_ERROR;
+  }
+
+  /** 手动检查更新（结果只展示，不自动下载、不覆盖安装） */
+  async checkUpdate(): Promise<void> {
+    if (this.updStatus === UpdateStatus.CHECKING) {
+      return;
+    }
+    this.updStatus = UpdateStatus.CHECKING;
+    this.updDetail = '';
+    const res: UpdateCheckResult = await UpdateChecker.check(this.appVersion);
+    this.updStatus = res.status;
+    this.updDetail = res.detail;
+    if (res.latest !== null) {
+      this.updLatestVersion = res.latest.version;
+      this.updLatestDate = res.latest.publishedAt;
+      this.updLatestNotes = res.latest.notes;
+      this.updLatestUrl = res.latest.htmlUrl;
+      this.updHasPackage = res.latest.hasHarmonyPackage;
+      this.updFromFallback = res.latest.fromFallback;
+    }
+  }
+
+  /** 首次安装不弹；升级后仅在版本变化且本地有该版本真实记录时弹一次 */
+  private maybeShowChangelog(): void {
+    const current: string = this.appVersion;
+    if (current.length === 0) {
+      return;
+    }
+    let seen: string = '';
+    try {
+      seen = ConfigStore.changelogSeen();
+    } catch (e) {
+      seen = '';
+    }
+    const entry: ChangelogEntry | null = Changelog.forCurrent(current);
+    if (seen.length === 0) {
+      // 首次安装：直接记住当前版本，不打扰用户
+      ConfigStore.saveChangelogSeen(current).catch(() => {
+      });
+      return;
+    }
+    if (seen === current) {
+      return;
+    }
+    if (AppMeta.compareVersion(current, seen) < 0) {
+      // 降级：不弹升级说明，只同步记录，避免反复打扰
+      ConfigStore.saveChangelogSeen(current).catch(() => {
+      });
+      return;
+    }
+    if (entry === null) {
+      ConfigStore.saveChangelogSeen(current).catch(() => {
+      });
+      return;
+    }
+    this.changelogVersion = current;
+    this.showChangelogDialog = true;
+  }
+
+  private confirmChangelog(): void {
+    this.showChangelogDialog = false;
+    ConfigStore.saveChangelogSeen(this.changelogVersion).catch(() => {
+    });
+  }
+
+  private openChangelog(): void {
+    this.openSub(6);
+  }
+
+  /** 更新日志默认展开最新一个版本，其余折叠 */
+  private changelogDefaultOpen(): string {
+    const es: ChangelogEntry[] = Changelog.entries();
+    return es.length > 0 ? es[0].version : '';
+  }
+
+  /** 参考项目与 AI 声明 */
+  @Builder CardStatements() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column({ space: 8 }) {
+        this.CardTitle(this.t('声明', 'Statements'), $r('sys.symbol.doc_text'))
+        Text(this.t('参考项目声明', 'Referenced projects'))
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.txt2())
+        Text(this.t(
+          '本应用为独立实现的鸿蒙原生应用，不包含从其他仓库复制的源代码。界面与材质效果的实现思路参考了：HarmonyOS 官方设计规范与 HDS 组件文档（含沉浸光感 / 系统材质能力）；Cloudflare 公开的 IP 段列表与测速端点（仅作为网络请求目标）；社区公开的 Cloudflare 优选 IP 段列表（由内置来源在线拉取，不随应用打包）。',
+          'This is an independent HarmonyOS app; it contains no source code copied from other repositories. Implementation ideas were informed by: the official HarmonyOS design guidelines and HDS component docs (including immersive material / system material); Cloudflare public IP ranges and speed-test endpoints (used only as network targets); community-maintained Cloudflare IP range lists (fetched online from built-in sources, not bundled).'))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .lineHeight(16)
+        Text(this.t('AI 辅助开发声明', 'AI-assisted development'))
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.txt2())
+          .margin({ top: 4 })
+        Text(this.t(
+          '部分界面代码、样式与中英文文案由 AI 编程助手辅助生成，随后由维护者审核、构建并在真机上验证；业务逻辑（节点扫描、质量筛选、TCPing 预检、下载测速与订阅上传）以项目自身实现为准，AI 不对其正确性负责。',
+          'Parts of the UI code, styling and bilingual copy were drafted with the help of an AI programming assistant, then reviewed, built and verified on real devices by the maintainer. Business logic (scanning, quality filtering, TCPing pre-check, download speed test and subscription upload) follows the project\'s own implementation; the AI is not responsible for its correctness.'))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .lineHeight(16)
+      }
+      .width('100%')
+      .padding(16)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+  }
+
+  @Builder ChangeItemRow(it: ChangeItem) {
+    Row({ space: 8 }) {
+      Text(Changelog.kindLabel(it.kind, this.langEn))
+        .fontSize(10)
+        .fontColor(this.accentText())
+        .textAlign(TextAlign.Center)
+        .height(18)
+        .padding({ left: 6, right: 6 })
+        .borderRadius(6)
+        .backgroundColor(this.accentSoft())
+      Text(this.langEn ? it.en : it.zh)
+        .fontSize(11)
+        .fontColor(this.txt2())
+        .lineHeight(17)
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Top)
+    .margin({ top: 6 })
+  }
+
+  /** 更新日志列表：按版本折叠，只展开一个，避免版本多了以后页面过长 */
+  @Builder ChangelogList() {
+    Column({ space: 12 }) {
+      ForEach(Changelog.entries(), (e: ChangelogEntry, idx: number) => {
+        Stack({ alignContent: Alignment.TopStart }) {
+          Column() {
+            Row({ space: 8 }) {
+              Text('v' + e.version)
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.txt())
+              Text(e.date)
+                .fontSize(11)
+                .fontColor(this.txt3())
+              Blank()
+              if (idx === 0) {
+                Text(this.t('当前版本', 'Current'))
+                  .fontSize(10)
+                  .fontColor(this.accentText())
+                  .textAlign(TextAlign.Center)
+                  .height(18)
+                  .padding({ left: 6, right: 6 })
+                  .borderRadius(6)
+                  .backgroundColor(this.accentSoft())
+              }
+              // 折叠状态：条目数 + 展开/收起箭头，点击整行切换
+              Text(this.changelogOpen === e.version
+                ? this.t('收起', 'Collapse')
+                : e.items.length.toString() + this.t(' 条更新 · 展开', ' updates · Show'))
+                .fontSize(11)
+                .fontColor(this.txt3())
+              Text(this.changelogOpen === e.version ? '▴' : '▾')
+                .fontSize(11)
+                .fontColor(this.txt3())
+            }
+            .width('100%')
+            .height(24)
+            .onClick(() => {
+              this.changelogOpen = (this.changelogOpen === e.version ? '' : e.version);
+            })
+            if (this.changelogOpen === e.version) {
+              ForEach(e.items, (it: ChangeItem) => {
+                this.ChangeItemRow(it)
+              }, (it: ChangeItem, i: number) => e.version + '-' + i.toString())
+            }
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 12, bottom: this.changelogOpen === e.version ? 16 : 12 })
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .backgroundBlurStyle(this.cardBlurStyle(),
+          { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+        .linearGradient({ angle: 145, colors: this.cardTint() })
+        .borderRadius(20)
+        .border({ width: 1, color: this.cardBorderColor() })
+        .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+      }, (e: ChangelogEntry) => e.version)
+      Text(this.t('更早版本的更新说明见 GitHub Releases。', 'Notes for older versions are on GitHub Releases.'))
+        .fontSize(11)
+        .fontColor(this.accentText())
+        .margin({ top: 2, bottom: 6 })
+        .onClick(() => {
+          this.openExternal(AppMeta.RELEASES_URL);
+        })
+    }
+    .width('100%')
+  }
+
+  /** 升级后首次启动的说明弹层 */
+  @Builder UpgradeCover() {
+    Column() {
+      Column({ space: 10 }) {
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.bolt'))
+            .fontSize(18)
+            .fontColor([this.accentText()])
+          Text(this.t('已更新到 v', 'Updated to v') + this.changelogVersion)
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.txt())
+          Blank()
+        }
+        .width('100%')
+        Text(this.t('本次更新的主要变化', 'What changed in this version'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .width('100%')
+        Scroll() {
+          Column() {
+            if (Changelog.forVersion(this.changelogVersion) !== null) {
+              ForEach((Changelog.forVersion(this.changelogVersion) as ChangelogEntry).items, (it: ChangeItem) => {
+                this.ChangeItemRow(it)
+              }, (it: ChangeItem, i: number) => 'dlg-' + i.toString())
+            }
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: 320 })
+        .scrollBar(BarState.Off)
+        .align(Alignment.TopStart)
+        Row({ space: 10 }) {
+          Text(this.t('查看完整日志', 'Full changelog'))
+            .fontSize(12)
+            .fontColor(this.accentText())
+            .textAlign(TextAlign.Center)
+            .height(this.BTN_H)
+            .layoutWeight(1)
+            .borderRadius(10)
+            .backgroundColor(this.soft())
+            .onClick(() => {
+              this.showChangelogDialog = false;
+              this.curTab = 3;
+              this.navSel = 3;
+              this.navPillX = this.navTabCenter(3);
+              setTimeout(() => {
+                this.openChangelog();
+              }, 60);
+            })
+          Text(this.t('知道了', 'Got it'))
+            .fontSize(13)
+            .fontColor(Color.White)
+            .textAlign(TextAlign.Center)
+            .height(this.BTN_H)
+            .layoutWeight(1)
+            .borderRadius(10)
+            .backgroundColor(this.accentFill())
+            .onClick(() => {
+              this.confirmChangelog();
+            })
+        }
+        .width('100%')
+        .margin({ top: 4 })
+      }
+      .width('100%')
+      .padding(18)
+      .alignItems(HorizontalAlign.Start)
+      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK,
+        { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+      .linearGradient({ angle: 145, colors: this.cardTint() })
+      .borderRadius(22)
+      .border({ width: 1, color: this.cardBorderColor() })
+      .shadow({ radius: 28, color: 'rgba(0,0,0,0.35)', offsetX: 0, offsetY: 10 })
+      .margin({ left: 24, right: 24 })
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('rgba(0,0,0,0.32)')
+  }
+
+  // ===== 设置：二级分类 =====
+  private subTitle(id: number): string {
+    if (id === 0) {
+      return this.t('外观与主题', 'Appearance');
+    }
+    if (id === 1) {
+      return this.t('沉浸材质与光感', 'Immersive material');
+    }
+    if (id === 2) {
+      return this.t('订阅与上传', 'Subscription upload');
+    }
+    if (id === 3) {
+      return this.t('运行与网络', 'Runtime & network');
+    }
+    if (id === 7) {
+      return this.t('语言 / Language', 'Language');
+    }
+    if (id === 4) {
+      return this.t('关于与更新', 'About & updates');
+    }
+    return this.t('更新日志', 'Changelog');
+  }
+
+  private openSub(id: number): void {
+    try {
+      this.settingsScrollCache = this.settingsScroller.currentOffset().yOffset;
+    } catch (e) {
+      this.settingsScrollCache = 0;
+    }
+    this.settingsSub = id;
+    if (id === 6 && this.changelogOpen === '') {
+      this.changelogOpen = this.changelogDefaultOpen();
+    }
+    setTimeout(() => {
+      try {
+        this.settingsScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      } catch (e) {
+      }
+    }, 0);
+  }
+
+  private closeSub(): void {
+    this.settingsSub = -1;
+    const y: number = this.settingsScrollCache;
+    // 首页内容比二级页高，首帧可能还没完成布局（此时 scrollTo 会被夹到较小的可滚动范围），
+    // 因此在 0 / 90 / 220ms 各校正一次，保证回到原来的滚动位置。
+    const tries: number[] = [0, 90, 220];
+    for (let i = 0; i < tries.length; i++) {
+      setTimeout(() => {
+        try {
+          if (Math.abs(this.settingsScroller.currentOffset().yOffset - y) > 1) {
+            this.settingsScroller.scrollTo({ xOffset: 0, yOffset: y });
+          }
+        } catch (e) {
+        }
+      }, tries[i]);
+    }
+  }
+
+  /** 分类入口行 */
+  @Builder SettingsRow(id: number, icon: Resource, title: string, sub: string) {
+    Row({ space: 12 }) {
+      SymbolGlyph(icon)
+        .fontSize(18)
+        .fontColor([this.accentText()])
+      Column({ space: 2 }) {
+        Text(title)
+          .fontSize(14)
+          .fontColor(this.txt())
+        Text(sub)
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      Text(this.rowTrailing(id))
+        .fontSize(14)
+        .fontColor(this.txt3())
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 11, bottom: 11 })
+    .borderRadius(14)
+    .backgroundColor(this.soft())
+    .margin({ top: 8 })
+    .onClick(() => {
+      if (this.winW >= 900) {
+        // 宽屏：左侧菜单 + 右侧内容，原地切换
+        this.settingsPane = id;
+        this.settingsSub = -1;
+        this.settingsScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      } else {
+        // 手机：进入分类详情页（返回回到菜单），不再在页面底部内嵌展开
+        this.openSub(id);
+      }
+    })
+  }
+
+  /** 二级页顶部：返回 + 标题 */
+  @Builder SubHeader() {
+    Row({ space: 10 }) {
+      Text(this.settingsSub === 6 ? '‹' : '‹')
+        .fontSize(22)
+        .fontColor(this.accentText())
+        .width(30)
+        .height(30)
+        .textAlign(TextAlign.Center)
+        .borderRadius(15)
+        .backgroundColor(this.soft())
+        .onClick(() => {
+          this.closeSub();
+        })
+      Text(this.subTitle(this.settingsSub))
+        .fontSize(17)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.txt())
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .padding({ top: 4, bottom: 10 })
+  }
+
+  /** 语言 chip */
+  @Builder LangChip(label: string, idx: number) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.langMode === idx ? Color.White : this.txt2())
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height(34)
+      .borderRadius(9)
+      .backgroundColor(this.langMode === idx ? this.accentFill() : this.soft())
+      .onClick(() => {
+        this.applyLangMode(idx);
+        this.saveUi();
+      })
+  }
+
+  /** 语言（设置首页直接可见） */
+  @Builder CardLanguage() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column({ space: 10 }) {
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.doc_text'))
+            .fontSize(15)
+            .fontColor([this.accentText()])
+          Text(this.t('语言 / Language', 'Language'))
+            .fontSize(14)
+            .fontColor(this.txt())
+        }
+        .width('100%')
+        Row({ space: 8 }) {
+          this.LangChip(this.t('跟随系统', 'System'), LangMode.SYSTEM)
+          this.LangChip('简体中文', LangMode.ZH)
+          this.LangChip('English', LangMode.EN)
+        }
+        .width('100%')
+        Text(this.t('默认跟随系统：系统为英文时用英文，其他语言回退简体中文。切换后立即生效。',
+          'Follows the system by default: English for English systems, Simplified Chinese otherwise. Applies immediately.'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .lineHeight(16)
+      }
+      .width('100%')
+      .padding(16)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+  }
+
+  /** 当前显示的分类：宽屏用 settingsPane（右栏），手机用 settingsSub（详情页） */
+  private bodyIdx(): number {
+    return this.winW >= 900 ? this.settingsPane : this.settingsSub;
+  }
+
+  /** 分类行右侧提示符：两种布局都是「进入」，统一用 › */
+  private rowTrailing(id: number): string {
+    return '›';
+  }
+
+  /** 设置首页：分类入口 */
+  @Builder SettingsHome() {
+    Column({ space: 12 }) {
+      Stack({ alignContent: Alignment.TopStart }) {
+        Column() {
+          this.CardTitle(this.t('设置', 'Settings'), $r('sys.symbol.gearshape'))
+          this.SettingsRow(0, $r('sys.symbol.paintbrush'),
+            this.t('外观与主题', 'Appearance'),
+            this.t('颜色模式 · 主题色 · 背景图', 'Color mode · accent · background'))
+          this.SettingsRow(1, $r('sys.symbol.line_3_horizontal'),
+            this.t('沉浸材质与光感', 'Immersive material'),
+            this.globalImmersion
+              ? this.t('已开启 · ', 'On · ') + this.matTypeName() + ' · ' + this.matLevelName()
+              : this.t('已关闭（卡片与导航不使用沉浸光感）', 'Off (cards and navigation use solid style)'))
+          this.SettingsRow(2, $r('sys.symbol.icloud'),
+            this.t('订阅与上传', 'Subscription upload'),
+            this.etEnabled ? this.t('自动上传已开启', 'Auto upload on') : this.t('自动上传已关闭', 'Auto upload off'))
+          this.SettingsRow(3, $r('sys.symbol.gearshape'),
+            this.t('运行与网络', 'Runtime & network'),
+            this.keepAlive ? this.t('后台保活已开启', 'Background keep-alive on') : this.t('后台保活已关闭', 'Background keep-alive off') +
+              this.t(' · 网络诊断与导出', ' · diagnostics & export'))
+          this.SettingsRow(4, $r('sys.symbol.info_circle'),
+            this.t('关于与更新', 'About & updates'),
+            'v' + this.appVersion + this.t(' · 检查更新 · 更新日志', ' · Updates · Changelog'))
+          this.SettingsRow(6, $r('sys.symbol.doc_text'),
+            this.t('更新日志', 'Changelog'),
+            this.t('查看各版本的新增、优化与修复', 'New, improved and fixed items per version'))
+          this.SettingsRow(7, $r('sys.symbol.doc_text'),
+            this.t('语言 / Language', 'Language'),
+            this.langMode === LangMode.EN ? 'English'
+              : (this.langMode === LangMode.ZH ? '简体中文' : this.t('跟随系统', 'System')))
+        }
+        .width('100%')
+        .padding(16)
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('100%')
+      .backgroundBlurStyle(this.cardBlurStyle(),
+        { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+      .linearGradient({ angle: 145, colors: this.cardTint() })
+      .borderRadius(20)
+      .border({ width: 1, color: this.cardBorderColor() })
+      .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    }
+    .width('100%')
+  }
+
+  /** 平板/电脑：左侧分类菜单 */
+  @Builder SettingsMenu() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
+        this.CardTitle(this.t('设置', 'Settings'), $r('sys.symbol.gearshape'))
+        this.SettingsRow(0, $r('sys.symbol.paintbrush'),
+          this.t('外观与主题', 'Appearance'),
+          this.t('颜色模式 · 主题色 · 背景图', 'Color mode · accent · background'))
+        this.SettingsRow(1, $r('sys.symbol.line_3_horizontal'),
+          this.t('沉浸材质与光感', 'Immersive material'),
+          this.globalImmersion
+            ? this.t('已开启 · ', 'On · ') + this.matTypeName() + ' · ' + this.matLevelName()
+            : this.t('已关闭（卡片与导航不使用沉浸光感）', 'Off (cards and navigation use solid style)'))
+        this.SettingsRow(2, $r('sys.symbol.icloud'),
+          this.t('订阅与上传', 'Subscription upload'),
+          this.etEnabled ? this.t('自动上传已开启', 'Auto upload on') : this.t('自动上传已关闭', 'Auto upload off'))
+        this.SettingsRow(3, $r('sys.symbol.gearshape'),
+          this.t('运行与网络', 'Runtime & network'),
+          this.keepAlive ? this.t('后台保活已开启', 'Background keep-alive on') : this.t('后台保活已关闭', 'Background keep-alive off') +
+              this.t(' · 网络诊断与导出', ' · diagnostics & export'))
+        this.SettingsRow(4, $r('sys.symbol.info_circle'),
+          this.t('关于与更新', 'About & updates'),
+          'v' + this.appVersion + this.t(' · 检查更新 · 更新日志', ' · Updates · Changelog'))
+          this.SettingsRow(6, $r('sys.symbol.doc_text'),
+            this.t('更新日志', 'Changelog'),
+            this.t('查看各版本的新增、优化与修复', 'New, improved and fixed items per version'))
+        this.SettingsRow(7, $r('sys.symbol.doc_text'),
+          this.t('语言 / Language', 'Language'),
+          this.langMode === LangMode.EN ? 'English'
+            : (this.langMode === LangMode.ZH ? '简体中文' : this.t('跟随系统', 'System')))
+      }
+      .width('100%')
+      .padding(16)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+  }
+
+  /** 分类内容：手机详情页与宽屏右栏共用同一份实现（读 bodyIdx() 保证响应式） */
+  @Builder CatBody() {
+    if (this.bodyIdx() === 0) {
+      this.CardAppearanceBackground()
+    } else if (this.bodyIdx() === 1) {
+      this.CardAppearanceMaterial()
+    } else if (this.bodyIdx() === 2) {
+      this.CardUpload()
+    } else if (this.bodyIdx() === 3) {
+      // 合并后的「运行与网络」：设置项 + 诊断工具
+      this.CardRuntime()
+      this.CardDiag()
+    } else if (this.bodyIdx() === 4) {
+      this.CardAbout()
+      this.CardStatements()
+    } else if (this.bodyIdx() === 6) {
+      this.ChangelogList()
+    } else if (this.bodyIdx() === 7) {
+      this.CardLanguage()
+    }
   }
 
   @Builder SettingsPage() {
     Column() {
-      Scroll(this.settingsScroller) {
-        Column() {
-          if (this.winW >= 900) {
-            Row({ space: 14 }) {
-              Column({ space: 14 }) {
-                this.CardUpload()
-              }
-              .layoutWeight(1)
-              Column({ space: 14 }) {
-                this.CardAppearanceBackground()
-                this.CardAppearanceMaterial()
-              }
-              .layoutWeight(1)
-              Column({ space: 14 }) {
-                this.CardRuntime()
-                this.CardAbout()
-                this.CardDiag()
-              }
-              .layoutWeight(1)
+      if (this.winW >= 900) {
+        // 平板/电脑：左侧菜单 + 右侧内容（右侧限宽、独立滚动）
+        Row({ space: 16 }) {
+          Scroll() {
+            Column() {
+              this.SettingsMenu()
             }
             .width('100%')
-            .alignItems(VerticalAlign.Top)
-          } else {
-            Column({ space: 14 }) {
-              this.CardUpload()
-              this.CardAppearanceMaterial()
-              this.CardAppearanceBackground()
-              this.CardRuntime()
-              this.CardAbout()
-              this.CardDiag()
-            }
-            .width('100%')
+            .padding({ top: this.contentTop(), bottom: this.pageBottomPad() })
           }
+          .width(320)
+          .height('100%')
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .align(Alignment.TopStart)
+
+          Scroll(this.settingsScroller) {
+            Column({ space: 12 }) {
+              this.CatBody()
+            }
+            .width('100%')
+            .padding({ top: this.contentTop(), bottom: this.pageBottomPad() })
+            .constraintSize({ maxWidth: 900 })
+            .alignItems(HorizontalAlign.Start)
+          }
+          .layoutWeight(1)
+          .height('100%')
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .align(Alignment.TopStart)
+          .onScroll(() => {
+            this.onPageScroll(this.settingsScroller);
+          })
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
+        .height('100%')
+        .padding({ left: 16, right: 16 })
+        .alignItems(VerticalAlign.Top)
         .constraintSize({ maxWidth: 1600 })
-      }
-      .width('100%')
-      .layoutWeight(1)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
-        .scrollBar(BarState.Off)
-      .edgeEffect(EdgeEffect.Spring)
-      .linearGradientBlur(LG_BLUR_MAX, {
-        fractionStops: this.lgStops(this.settingsVpH),
-        direction: GradientDirection.Bottom
-      })
-      .onAreaChange((_o: Area, n: Area) => {
-        const h: number = Number(n.height);
-        if (h > 0 && Math.abs(h - this.settingsVpH) > 0.5) {
-          this.settingsVpH = h;
+      } else {
+        Scroll(this.settingsScroller) {
+          Column() {
+            if (this.settingsSub >= 0) {
+              this.SubHeader()
+              Column({ space: 12 }) {
+                this.CatBody()
+              }
+              .width('100%')
+            } else {
+              this.SettingsHome()
+            }
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
+          .constraintSize({ maxWidth: 1600 })
         }
-      })
-      .onScroll(() => {
-        this.onPageScroll(this.settingsScroller);
-      })
+        .width('100%')
+        .layoutWeight(1)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+        .linearGradientBlur(LG_BLUR_MAX, {
+          fractionStops: this.lgStops(this.settingsVpH),
+          direction: GradientDirection.Bottom
+        })
+        .onAreaChange((_o: Area, n: Area) => {
+          const h: number = Number(n.height);
+          if (h > 0 && Math.abs(h - this.settingsVpH) > 0.5) {
+            this.settingsVpH = h;
+          }
+        })
+        .onScroll(() => {
+          this.onPageScroll(this.settingsScroller);
+        })
+      }
     }
     .width('100%')
     .height('100%')
@@ -4815,7 +6176,7 @@ struct Index {
       .layoutWeight(1)
       .height(this.BTN_H)
       .borderRadius(9)
-      .backgroundColor(this.etMode === idx ? this.accent() : this.soft())
+      .backgroundColor(this.etMode === idx ? this.accentFill() : this.soft())
       .onClick(() => {
         this.etMode = idx;
         this.saveEtConfig();
@@ -4829,7 +6190,7 @@ struct Index {
       .layoutWeight(1)
       .height(this.CHIP_H)
       .borderRadius(9)
-      .backgroundColor(this.etPos === idx ? this.accent() : this.soft())
+      .backgroundColor(this.etPos === idx ? this.accentFill() : this.soft())
       .fontColor(this.etPos === idx ? '#FFFFFF' : this.txt2())
       .onClick(() => {
         this.etPos = idx;
@@ -4844,7 +6205,7 @@ struct Index {
       .layoutWeight(1)
       .height(this.CHIP_H)
       .borderRadius(9)
-      .backgroundColor(this.etTopN === value ? this.accent() : this.soft())
+      .backgroundColor(this.etTopN === value ? this.accentFill() : this.soft())
       .fontColor(this.etTopN === value ? '#FFFFFF' : this.txt2())
       .onClick(() => {
         this.etTopN = value;
@@ -4859,7 +6220,7 @@ struct Index {
       .layoutWeight(1)
       .height(this.BTN_H)
       .borderRadius(9)
-      .backgroundColor(this.etWay === idx ? this.accent() : this.soft())
+      .backgroundColor(this.etWay === idx ? this.accentFill() : this.soft())
       .fontColor(this.etWay === idx ? '#FFFFFF' : this.txt2())
       .onClick(() => {
         this.etWay = idx;
@@ -4870,14 +6231,14 @@ struct Index {
   @Builder CardUpload() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle('订阅上传', $r('sys.symbol.icloud'))
+        this.CardTitle(this.t('订阅上传', 'Subscription upload'), $r('sys.symbol.icloud'))
 
         Row() {
           Column() {
-            Text('扫描完成后自动上传')
+            Text(this.t('扫描完成后自动上传', 'Auto-upload after scanning'))
               .fontSize(13)
               .fontColor(this.txt())
-            Text('把优选结果写入 edgetunnel 的 ADD.txt 订阅')
+            Text(this.t('把优选结果写入 edgetunnel 的 ADD.txt 订阅', 'Write the selection results to the edgetunnel ADD.txt subscription'))
               .fontSize(11)
               .fontColor(this.txt3())
               .margin({ top: 2 })
@@ -4896,13 +6257,13 @@ struct Index {
         .margin({ top: 12 })
 
         Row() {
-          Text('上传方式')
+          Text(this.t('上传方式', 'Upload method'))
             .fontSize(13)
             .fontColor(this.txt2())
             .width(90)
           Row({ space: 8 }) {
-            this.EtWayChip('登录上传', 0)
-            this.EtWayChip('API 直传', 1)
+            this.EtWayChip(this.t('登录上传', 'Login upload'), 0)
+            this.EtWayChip(this.t('API 直传', 'API direct upload'), 1)
           }
           .layoutWeight(1)
         }
@@ -4910,206 +6271,206 @@ struct Index {
         .margin({ top: 10 })
 
         if (this.etWay === 0) {
-          this.EtFieldRow('域名', this.etHost, 'edgetunnel.example.com', false, (v: string) => {
+          this.EtFieldRow(this.t('域名', 'Domain'), this.etHost, 'edgetunnel.example.com', false, (v: string) => {
             this.etHost = v;
             this.saveEtConfig();
           })
-          this.EtFieldRow('密码', this.etPassword, '后台登录密码', true, (v: string) => {
+          this.EtFieldRow(this.t('密码', 'Password'), this.etPassword, this.t('后台登录密码', 'Dashboard login password'), true, (v: string) => {
             this.etPassword = v;
             this.saveEtConfig();
           })
         } else {
-          this.EtFieldRow('Account ID', this.etCfAccount, 'Cloudflare 账户 ID（32 位）', false, (v: string) => {
+          this.EtFieldRow('Account ID', this.etCfAccount, this.t('Cloudflare 账户 ID（32 位）', 'Cloudflare Account ID (32 characters)'), false, (v: string) => {
             this.etCfAccount = v;
             this.saveEtConfig();
           })
-          this.EtFieldRow('命名空间 ID', this.etCfNamespace, 'Workers KV 命名空间 ID（32 位）', false, (v: string) => {
+          this.EtFieldRow(this.t('命名空间 ID', 'Namespace ID'), this.etCfNamespace, this.t('Workers KV 命名空间 ID（32 位）', 'Workers KV namespace ID (32 characters)'), false, (v: string) => {
             this.etCfNamespace = v;
             this.saveEtConfig();
           })
-          this.EtFieldRow('API Token', this.etCfToken, '需要 Workers KV 读写权限', true, (v: string) => {
+          this.EtFieldRow('API Token', this.etCfToken, this.t('需要 Workers KV 读写权限', 'Requires Workers KV read/write permission'), true, (v: string) => {
             this.etCfToken = v;
             this.saveEtConfig();
           })
         }
 
         Row() {
-          Text('上传模式')
+          Text(this.t('上传模式', 'Upload mode'))
             .fontSize(13)
             .fontColor(this.txt2())
             .width(90)
           Row({ space: 8 }) {
-            this.EtModeChip('覆盖', 0)
-            this.EtModeChip('追加', 1)
+            this.EtModeChip(this.t('覆盖', 'Overwrite'), 0)
+            this.EtModeChip(this.t('追加', 'Append'), 1)
           }
           .layoutWeight(1)
         }
         .width('100%')
         .margin({ top: 10 })
-
-        Row() {
-          Text('自定义保留')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(90)
-          Text(this.etCustom.trim().length > 0 ? ('已填 ' + this.etCustom.trim().split('\n').length.toString() + ' 行，每次上传都会带上') : '可选：每行一个域名或节点')
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .layoutWeight(1)
-        }
-        .width('100%')
-        .margin({ top: 10 })
-
-        TextArea({ text: this.etCustom, placeholder: '每行一个：cdn.example.com 或 1.2.3.4:443' })
-          .height(84)
-          .fontSize(12)
-          .borderRadius(9)
-          .backgroundColor(this.soft())
-          .padding(10)
-          .margin({ top: 6 })
-          .onChange((v: string) => {
-            this.etCustom = v;
-            this.saveEtConfig();
-          })
-
-        Row() {
-          Text('写入位置')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(90)
-          Row({ space: 8 }) {
-            this.EtPosChip('最前', 0)
-            this.EtPosChip('最后', 1)
-          }
-          .layoutWeight(1)
-        }
-        .width('100%')
-        .margin({ top: 10 })
-
-        Row() {
-          Text('上传数量')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(90)
-          TextInput({ text: this.etTopNText, placeholder: '3' })
-            .layoutWeight(1)
-            .height(40)
-            .fontSize(13)
-            .fontColor(this.txt())
-            .backgroundColor(this.soft())
-            .borderRadius(10)
-            .type(InputType.Number)
-            .onChange((v: string) => {
-              this.etTopNText = v;
-              const n: number = this.intOf(v, 0);
-              this.etTopN = Math.max(0, Math.min(999, n));
-              this.saveEtConfig();
-            })
-        }
-        .width('100%')
-        .margin({ top: 10 })
-
-        Text(this.uploadLimitHint())
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .lineHeight(16)
-          .margin({ top: 6 })
-
-        Row() {
-          Text('上传代理')
-            .fontSize(13)
-            .fontColor(this.txt2())
-            .width(90)
-          Column() {
-            Text('仅订阅上传走代理（仅支持 HTTP 代理）')
-              .fontSize(12)
-              .fontColor(this.txt())
-            Text('不影响测速与优选（请求级代理）')
+          Row() {
+            Text(this.etStatus.length > 0 ? this.etStatus : this.t('未上传', 'Not uploaded'))
               .fontSize(11)
               .fontColor(this.txt3())
-              .margin({ top: 2 })
+              .layoutWeight(1)
+            Text(this.etBusy ? this.t('上传中…', 'Uploading…') : this.t('立即上传', 'Upload now'))
+              .fontSize(13)
+              .fontColor(this.etBusy ? this.txt3() : this.accent())
+              .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+              .backgroundColor(this.soft())
+              .borderRadius(9)
+              .onClick(() => {
+                if (!this.etBusy) {
+                  this.uploadEdgeTunnel(false);
+                }
+              })
           }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
+          .width('100%')
+          .margin({ top: 12 })
 
-          Toggle({ type: ToggleType.Switch, isOn: this.etProxyOn })
-            .selectedColor(this.accent())
-            .onChange((on: boolean) => {
-              this.etProxyOn = on;
+        // 订阅上传的高级项直接展开，避免多一层折叠
+        if (true) {
+          Row() {
+            Text(this.t('自定义保留', 'Custom retained lines'))
+              .fontSize(13)
+              .fontColor(this.txt2())
+              .width(90)
+            Text(this.etCustom.trim().length > 0 ? (this.t('已填 ', 'Filled: ') + this.etCustom.trim().split('\n').length.toString() + this.t(' 行，每次上传都会带上', ' lines; included in every upload')) : this.t('可选：每行一个域名或节点', 'Optional: one domain or node per line'))
+              .fontSize(11)
+              .fontColor(this.txt3())
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .margin({ top: 10 })
+  
+          TextArea({ text: this.etCustom, placeholder: this.t('每行一个：cdn.example.com 或 1.2.3.4:443', 'One per line: cdn.example.com or 1.2.3.4:443') })
+            .height(84)
+            .fontSize(12)
+            .borderRadius(9)
+            .backgroundColor(this.soft())
+            .padding(10)
+            .margin({ top: 6 })
+            .onChange((v: string) => {
+              this.etCustom = v;
               this.saveEtConfig();
             })
-        }
-        .width('100%')
-        .margin({ top: 10 })
-
-        if (this.etProxyOn) {
-          this.EtFieldRow('代理地址', this.etProxyHost, '127.0.0.1', false, (v: string) => {
-            this.etProxyHost = v;
-            this.saveEtConfig();
-          })
-          this.EtFieldRow('代理端口', this.etProxyPort, '7890', false, (v: string) => {
-            this.etProxyPort = v;
-            this.saveEtConfig();
-          })
-          this.EtFieldRow('代理用户', this.etProxyUser, '可选，留空为无认证', false, (v: string) => {
-            this.etProxyUser = v;
-            this.saveEtConfig();
-          })
-          this.EtFieldRow('代理密码', this.etProxyPass, '可选', true, (v: string) => {
-            this.etProxyPass = v;
-            this.saveEtConfig();
-          })
-        }
-
-        Row() {
-          Text(this.etStatus.length > 0 ? this.etStatus : '未上传')
+  
+          Row() {
+            Text(this.t('写入位置', 'Write position'))
+              .fontSize(13)
+              .fontColor(this.txt2())
+              .width(90)
+            Row({ space: 8 }) {
+              this.EtPosChip(this.t('最前', 'Top'), 0)
+              this.EtPosChip(this.t('最后', 'Bottom'), 1)
+            }
+            .layoutWeight(1)
+          }
+          .width('100%')
+          .margin({ top: 10 })
+  
+          Row() {
+            Text(this.t('上传数量', 'Upload count'))
+              .fontSize(13)
+              .fontColor(this.txt2())
+              .width(90)
+            TextInput({ text: this.etTopNText, placeholder: '3' })
+              .layoutWeight(1)
+              .height(40)
+              .fontSize(13)
+              .fontColor(this.txt())
+              .backgroundColor(this.soft())
+              .borderRadius(10)
+              .type(InputType.Number)
+              .onChange((v: string) => {
+                this.etTopNText = v;
+                const n: number = this.intOf(v, 0);
+                this.etTopN = Math.max(0, Math.min(999, n));
+                this.saveEtConfig();
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+  
+          Text(this.uploadLimitHint())
             .fontSize(11)
             .fontColor(this.txt3())
+            .lineHeight(16)
+            .margin({ top: 6 })
+  
+          Row() {
+            Text(this.t('上传代理', 'Upload proxy'))
+              .fontSize(13)
+              .fontColor(this.txt2())
+              .width(90)
+            Column() {
+              Text(this.t('仅订阅上传走代理（仅支持 HTTP 代理）', 'Proxy only for subscription uploads (HTTP proxy only)'))
+                .fontSize(12)
+                .fontColor(this.txt())
+              Text(this.t('不影响测速与优选（请求级代理）', 'Does not affect speed tests or selection (per-request proxy)'))
+                .fontSize(11)
+                .fontColor(this.txt3())
+                .margin({ top: 2 })
+            }
+            .alignItems(HorizontalAlign.Start)
             .layoutWeight(1)
-          Text(this.etBusy ? '上传中…' : '立即上传')
-            .fontSize(13)
-            .fontColor(this.etBusy ? this.txt3() : this.accent())
-            .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-            .backgroundColor(this.soft())
-            .borderRadius(9)
-            .onClick(() => {
-              if (!this.etBusy) {
-                this.uploadEdgeTunnel(false);
-              }
+  
+            Toggle({ type: ToggleType.Switch, isOn: this.etProxyOn })
+              .selectedColor(this.accent())
+              .onChange((on: boolean) => {
+                this.etProxyOn = on;
+                this.saveEtConfig();
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+  
+          if (this.etProxyOn) {
+            this.EtFieldRow(this.t('代理地址', 'Proxy address'), this.etProxyHost, '127.0.0.1', false, (v: string) => {
+              this.etProxyHost = v;
+              this.saveEtConfig();
             })
+            this.EtFieldRow(this.t('代理端口', 'Proxy port'), this.etProxyPort, '7890', false, (v: string) => {
+              this.etProxyPort = v;
+              this.saveEtConfig();
+            })
+            this.EtFieldRow(this.t('代理用户', 'Proxy user'), this.etProxyUser, this.t('可选，留空为无认证', 'Optional; leave blank for no auth'), false, (v: string) => {
+              this.etProxyUser = v;
+              this.saveEtConfig();
+            })
+            this.EtFieldRow(this.t('代理密码', 'Proxy password'), this.etProxyPass, this.t('可选', 'Optional'), true, (v: string) => {
+              this.etProxyPass = v;
+              this.saveEtConfig();
+            })
+          }
+  
+          Text(this.etWay === 1
+            ? this.t('提示：上传格式为「IP:端口#地区 V4/V6中文名序号」，例如 162.159.9.26:443#SG V4新加坡1；API 直传直接读写 Worker 绑定的 KV（键 ADD.txt），Token 只保存在本机，需要该 Account 的 Workers KV 读写权限。', 'Note: the upload format is "IP:port#region V4/V6ChineseNameIndex", e.g. 162.159.9.26:443#SG V4Singapore1. API direct upload reads and writes the Worker-bound KV (key ADD.txt); the token is stored only on this device and needs Workers KV read/write permission for that account.')
+            : this.t('提示：上传格式为「IP:端口#地区 V4/V6中文名序号」，例如 162.159.9.26:443#SG V4新加坡1；edgetunnel 需把「优选订阅模式」设为自定义订阅，节点不是越多越好。', 'Note: the upload format is "IP:port#region V4/V6ChineseNameIndex", e.g. 162.159.9.26:443#SG V4Singapore1. In edgetunnel, set "Preferred subscription mode" to custom subscription; more nodes is not always better.'))
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .lineHeight(16)
+            .margin({ top: 8 })
         }
-        .width('100%')
-        .margin({ top: 12 })
-
-        Text(this.etWay === 1
-          ? '提示：上传格式为「IP:端口#地区 V4/V6中文名序号」，例如 162.159.9.26:443#SG V4新加坡1；API 直传直接读写 Worker 绑定的 KV（键 ADD.txt），Token 只保存在本机，需要该 Account 的 Workers KV 读写权限。'
-          : '提示：上传格式为「IP:端口#地区 V4/V6中文名序号」，例如 162.159.9.26:443#SG V4新加坡1；edgetunnel 需把「优选订阅模式」设为自定义订阅，节点不是越多越好。')
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .lineHeight(16)
-          .margin({ top: 8 })
+      }
       .onAreaChange((_o: Area, a: Area) => {
         this.updateMeasuredCardHeight('upload', a);
       })
       .width('100%')
-      .padding(16)
+      .alignItems(HorizontalAlign.Start)
     }
     .padding(16)
     .width('100%')
-    .alignItems(HorizontalAlign.Start)
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
-    }
-    .systemMaterial(this.cardMaterial())
   }
   @Builder LogContent(bodyH: number) {
     if (this.logs.length === 0) {
-      Text('暂无日志')
+      Text(this.t('暂无日志', 'No logs yet'))
         .fontSize(12)
         .fontColor(this.txt3())
         .margin({ top: 8 })
@@ -5146,7 +6507,7 @@ struct Index {
         this.MeasuredImmersionCard('log', 20)
       }
       Column() {
-        this.CardTitle('运行日志', $r('sys.symbol.doc_text'))
+        this.CardTitle(this.t('运行日志', 'Logs'), $r('sys.symbol.doc_text'))
         this.LogContent(bodyH)
       }
       .onAreaChange((_o: Area, a: Area) => {
@@ -5166,21 +6527,21 @@ struct Index {
     
     @Builder ToolBar() {
     Row() {
-    Text('补测速前 5')
+    Text(this.t('补测速前 5', 'Re-test top 5'))
     .fontSize(12)
     .fontColor('#FFFFFF')
     .textAlign(TextAlign.Center)
     .layoutWeight(1)
     .height(40)
-    .backgroundColor(this.accent())
+    .backgroundColor(this.accentFill())
     .borderRadius(10)
     .onClick(() => {
     this.runSpeedTop();
     })
-    Text('导出 TXT')
+    Text(this.t('导出 TXT', 'Export TXT'))
     .fontSize(12)
     .fontWeight(FontWeight.Medium)
-    .fontColor(this.accent())
+    .fontColor(this.accentText())
     .textAlign(TextAlign.Center)
     .width(88)
     .height(40)
@@ -5190,10 +6551,10 @@ struct Index {
     .onClick(() => {
     this.doExport(ExportFormat.PLAIN_COLO_DELAY);
     })
-    Text('导出 CSV')
+    Text(this.t('导出 CSV', 'Export CSV'))
     .fontSize(12)
     .fontWeight(FontWeight.Medium)
-    .fontColor(this.accent())
+    .fontColor(this.accentText())
     .textAlign(TextAlign.Center)
     .width(88)
     .height(40)
@@ -5213,113 +6574,134 @@ struct Index {
     Scroll(this.pingScroller) {
     Column() {
     Row().width('100%').height(px2vp(this.statusBarPx) + 66).hitTestBehavior(HitTestMode.None)
-    Row() {
-    Text('第一轮通过 ' + this.pingList.length.toString() + ' 个')
-    .fontSize(13)
-    .fontWeight(FontWeight.Medium)
-    .fontColor(this.txt())
-    Text(' · ' + this.groups.length.toString() + ' 个地区')
-    .fontSize(12)
-    .fontColor(this.txt3())
-    Blank()
-    Text(this.precheckActive ? '预检中…' : '开始测速')
-    .fontSize(12)
-    .fontColor('#FFFFFF')
-    .textAlign(TextAlign.Center)
-    .width(this.precheckActive ? 74 : 88)
-    .height(34)
-    .backgroundColor(this.precheckActive ? this.soft() : this.accent())
-    .borderRadius(9)
-    .onClick(() => {
-    this.onStartSpeedClick();
-    })
-    }
-    .width('100%')
-    .margin({ bottom: 10 })
-    
-    if (this.precheckActive || (this.precheckDone && this.pcMsg.length > 0)) {
-    Row() {
-    Text(this.precheckActive ? '质量预检中' : '质量预检')
-    .fontSize(12)
-    .fontColor(this.accent())
-    Blank()
-    Text('检测 ' + this.pcChecked.toString() + ' · 合格 ' +
-    (this.pcTarget > 0 && this.pcQualified > this.pcTarget ? this.pcTarget : this.pcQualified).toString() +
-    ' / 目标 ' + this.pcTarget.toString())
-    .fontSize(11)
-    .fontColor(this.txt3())
-    }
-    .width('100%')
-    .margin({ bottom: 6 })
-    
-    // 质量预检进度条：与扫描页同一套视觉（底槽 + 渐变填充）
-    Stack({ alignContent: Alignment.Start }) {
-    Row()
-    .width('100%')
-    .height(6)
-    .backgroundColor(this.soft())
-    .borderRadius(3)
-    Row()
-    .width(this.pcBarPct().toFixed(1) + '%')
-    .height(6)
-    .linearGradient({
-    angle: 90,
-    colors: this.progressTint()
-    })
-    .borderRadius(3)
-    }
-    .width('100%')
-    .height(6)
-    .margin({ bottom: 6 })
-    
-    if (this.pcMsg.length > 0) {
-    Text(this.pcMsg)
-    .fontSize(10)
-    .fontColor(this.txt3())
-    .margin({ bottom: 10 })
-    }
-    }
-    
-    Row() {
-    Text('地区码')
-    .fontSize(12)
-    .fontColor(this.txt2())
-    .width(52)
-    TextInput({ text: this.regionCode, placeholder: '可留空；如 HKG / LAX' })
-    .layoutWeight(1)
-    .height(36)
-    .fontSize(12)
-    .fontColor(this.txt())
-    .backgroundColor(this.inputBg())
-    .borderRadius(9)
-    .onChange((v: string) => {
-    this.regionCode = v.toUpperCase();
-    // 地区码变了：上一轮的预检结论作废，点「开始测速」会先重新预检
-    this.precheckDone = false;
-    })
-    }
-    .width('100%')
-    .margin({ bottom: 10 })
-    
-    Text('先看下面各地区的最快延迟，挑延迟低的地区填码，再点右上「开始测速」；留空则测全部地区。')
-    .fontSize(11)
-    .fontColor(this.txt3())
-    .margin({ bottom: 12 })
-    .systemMaterial(this.cardMaterial())
-
-        if (this.pingList.length === 0) {
-          Column() {
-            Text('还没有筛选结果')
-              .fontSize(15)
-              .fontColor(this.txt2())
-            Text('回到「扫描」页开始优选')
-              .fontSize(12)
-              .fontColor(this.txt3())
-              .margin({ top: 6 })
-          }
-          .width('100%')
-          .padding({ top: 60, bottom: 30 })
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
+        Row({ space: 6 }) {
+        Text(this.t('第一轮通过 ', 'Round 1 passed: ') + this.pingList.length.toString() + this.t(' 个', ' nodes'))
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.txt())
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(' · ' + this.groups.length.toString() + this.t(' 个地区', ' regions'))
+        .fontSize(12)
+        .fontColor(this.txt3())
+        .maxLines(1)
+        Text(this.precheckActive ? this.t('预检中…', 'Pre-checking…') : this.t('开始测速', 'Start speed test'))
+        .fontSize(12)
+        .fontColor('#FFFFFF')
+        .textAlign(TextAlign.Center)
+        .padding({ left: 12, right: 12 })
+        .constraintSize({ minWidth: 74 })
+        .height(34)
+        .backgroundColor(this.precheckActive ? this.soft() : this.accentFill())
+        .borderRadius(9)
+        .onClick(() => {
+        this.onStartSpeedClick();
+        })
         }
+        .width('100%')
+        .margin({ bottom: 10 })
+    
+        if (this.precheckActive || (this.precheckDone && this.pcMsg.length > 0)) {
+        Row() {
+        Text(this.precheckActive ? this.t('质量预检中', 'Quality pre-check in progress') : this.t('质量预检', 'Quality pre-check'))
+        .fontSize(12)
+        .fontColor(this.accentText())
+        Blank()
+        Text(this.t('检测 ', 'Checked ') + this.pcChecked.toString() + this.t(' · 合格 ', ' · Qualified ') +
+        (this.pcTarget > 0 && this.pcQualified > this.pcTarget ? this.pcTarget : this.pcQualified).toString() +
+        this.t(' / 目标 ', ' / Target ') + this.pcTarget.toString())
+        .fontSize(11)
+        .fontColor(this.txt3())
+        }
+        .width('100%')
+        .margin({ bottom: 6 })
+    
+        // 质量预检进度条：与扫描页同一套视觉（底槽 + 渐变填充）
+        Stack({ alignContent: Alignment.Start }) {
+        Row()
+        .width('100%')
+        .height(6)
+        .backgroundColor(this.soft())
+        .borderRadius(3)
+        Row()
+        .width(this.pcBarPct().toFixed(1) + '%')
+        .height(6)
+        .linearGradient({
+        angle: 90,
+        colors: this.progressTint()
+        })
+        .borderRadius(3)
+        }
+        .width('100%')
+        .height(6)
+        .margin({ bottom: 6 })
+    
+        if (this.pcMsg.length > 0) {
+        Text(this.pcMsg)
+        .fontSize(10)
+        .fontColor(this.txt3())
+        .margin({ bottom: 10 })
+        }
+        }
+    
+        Row() {
+        Text(this.t('地区码', 'Region code'))
+        .fontSize(12)
+        .fontColor(this.txt2())
+        .width(52)
+        TextInput({ text: this.regionCode, placeholder: this.t('可留空；如 HKG / LAX', 'Optional; e.g. HKG / LAX') })
+        .layoutWeight(1)
+        .height(36)
+        .fontSize(12)
+        .fontColor(this.txt())
+        .backgroundColor(this.inputBg())
+        .borderRadius(9)
+        .onChange((v: string) => {
+        this.regionCode = v.toUpperCase();
+        // 地区码变了：上一轮的预检结论作废，点「开始测速」会先重新预检
+        this.precheckDone = false;
+        })
+        }
+        .width('100%')
+        .margin({ bottom: 10 })
+    
+        Text(this.t('先看下面各地区的最快延迟，挑延迟低的地区填码，再点右上「开始测速」；留空则测全部地区。', 'Check the fastest latency for each region below, pick a low-latency region and enter its code, then tap "Start speed test" at the top right; leave blank to test all regions.'))
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .margin({ bottom: 12 })
+
+            if (this.pingList.length === 0) {
+              Column() {
+                Text(this.t('还没有筛选结果', 'No filter results yet'))
+                  .fontSize(15)
+                  .fontColor(this.txt2())
+                Text(this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection'))
+                  .fontSize(12)
+                  .fontColor(this.txt3())
+                  .margin({ top: 6 })
+              }
+              .width('100%')
+              .padding({ top: 60, bottom: 30 })
+            }
+      }
+      .onAreaChange((_o: Area, a: Area) => {
+        this.updateMeasuredCardHeight('ping', a);
+      })
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(16)
+    }
+    .width('100%')
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
 
         GridRow({
           columns: { sm: 12, md: 12, lg: 12 },
@@ -5335,7 +6717,7 @@ struct Index {
         }
         .width('100%')
 
-        Column().height(112)
+
       }
       .width('100%')
       .padding({ left: this.pageSidePad(), right: this.pageSidePad(), top: 12, bottom: this.pageBottomPad() })
@@ -5365,21 +6747,21 @@ struct Index {
     Column() {
       Row() {
         Column() {
-          Text(g.colo === 'UNK' ? 'UNK 未知地区' : (Geo.flag(g.colo) + ' ' + Geo.placeZh(g.colo)))
+          Text(g.colo === 'UNK' ? this.t('UNK 未知地区', 'UNK Unknown region') : (Geo.flag(g.colo) + ' ' + Geo.placeZh(g.colo)))
             .fontSize(14)
             .fontWeight(FontWeight.Medium)
             .fontColor(this.txt())
-          Text(g.count.toString() + ' 个 · 最快 ' + (g.minLatency > 0 ? Math.round(g.minLatency).toString() : '—') +
-            'ms · 平均 ' + (g.avgLatency > 0 ? Math.round(g.avgLatency).toString() : '—') + 'ms')
+          Text(g.count.toString() + this.t(' 个 · 最快 ', ' nodes · fastest ') + (g.minLatency > 0 ? Math.round(g.minLatency).toString() : '—') +
+            this.t('ms · 平均 ', 'ms · Avg ') + (g.avgLatency > 0 ? Math.round(g.avgLatency).toString() : '—') + 'ms')
             .fontSize(11)
             .fontColor(this.txt3())
             .margin({ top: 3 })
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
-        Text(this.expandedColos.indexOf(g.colo) >= 0 ? '收起' : '展开')
+        Text(this.expandedColos.indexOf(g.colo) >= 0 ? this.t('收起', 'Collapse') : this.t('展开', 'Expand'))
           .fontSize(12)
-          .fontColor(this.accent())
+          .fontColor(this.accentText())
       }
       .width('100%')
       .onClick(() => {
@@ -5413,11 +6795,11 @@ struct Index {
     .width('100%')
     .alignItems(HorizontalAlign.Start)
     .padding(14)
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.shouldUseCardMaterial() ? this.cardTintOr(false) : this.cardTint() })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 10 })
   }
@@ -5427,16 +6809,18 @@ struct Index {
     Scroll(this.speedScroller) {
       Column() {
             Row().width('100%').height(px2vp(this.statusBarPx) + 66).hitTestBehavior(HitTestMode.None)
+        Stack({ alignContent: Alignment.TopStart }) {
+          Column() {
         Row() {
-          Text('测速 ' + this.speedList.length.toString() + ' 个')
+          Text(this.t('测速 ', 'Speed test: ') + this.speedList.length.toString() + this.t(' 个', ' nodes'))
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
             .fontColor(this.txt())
           Blank()
-          Text('导出 TXT')
+          Text(this.t('导出 TXT', 'Export TXT'))
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
-            .fontColor(this.accent())
+            .fontColor(this.accentText())
             .textAlign(TextAlign.Center)
             .width(84)
             .height(34)
@@ -5445,10 +6829,10 @@ struct Index {
             .onClick(() => {
               this.doExport(ExportFormat.PLAIN_SPEED);
             })
-          Text('导出 CSV')
+          Text(this.t('导出 CSV', 'Export CSV'))
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
-            .fontColor(this.accent())
+            .fontColor(this.accentText())
             .textAlign(TextAlign.Center)
             .width(84)
             .height(34)
@@ -5463,7 +6847,7 @@ struct Index {
         .margin({ bottom: 8 })
 
         if (this.etEnabled) {
-          Text('自动上传：' + this.uploadLimitShort() + '（设置 → 订阅上传 可修改）')
+          Text(this.t('自动上传：', 'Auto-upload: ') + this.uploadLimitShort() + this.t('（设置 → 订阅上传 可修改）', ' (editable in Settings → Subscription upload)'))
             .fontSize(11)
             .fontColor(this.txt3())
             .margin({ bottom: 8 })
@@ -5512,9 +6896,9 @@ struct Index {
         }
 
         Row() {
-          Text(this.scanning ? '测速进行中…' : '重新测速')
+          Text(this.scanning ? this.t('测速进行中…', 'Speed test in progress…') : this.t('重新测速', 'Re-run speed test'))
             .fontSize(12)
-            .fontColor(this.accent())
+            .fontColor(this.accentText())
             .textAlign(TextAlign.Center)
             .layoutWeight(1)
             .height(34)
@@ -5529,18 +6913,36 @@ struct Index {
 
         if (this.speedList.length === 0) {
           Column() {
-            Text(this.enableSpeed ? '还没有测速结果' : '下载测速已关闭')
+            Text(this.enableSpeed ? this.t('还没有测速结果', 'No speed test results yet') : this.t('下载测速已关闭', 'Download speed test is off'))
               .fontSize(15)
               .fontColor(this.txt2())
-            Text(this.enableSpeed ? '回到「扫描」页开始优选' : '在扫描页打开「下载测速」开关')
+            Text(this.enableSpeed ? this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection') : this.t('在扫描页打开「下载测速」开关', 'Turn on "Download speed test" on the Scan tab'))
               .fontSize(12)
               .fontColor(this.txt3())
               .margin({ top: 6 })
           }
           .width('100%')
-          .padding({ top: 60, bottom: 30 })
+          .padding({ top: 26, bottom: 16 })
         }
 
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+        }
+        .width('100%')
+        .backgroundBlurStyle(this.cardBlurStyle(), {
+          colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
+        })
+        .linearGradient({ angle: 145, colors: this.cardTint() })
+        .borderRadius(20)
+        .border({ width: 1, color: this.cardBorderColor() })
+        .shadow({
+          radius: this.cardShadowR(),
+          color: this.cardShadowColor(),
+          offsetY: this.cardShadowY()
+        })
+        .margin({ bottom: 12 })
         GridRow({
           columns: { sm: 12, md: 12, lg: 12 },
           gutter: { x: 14, y: 0 },
@@ -5554,7 +6956,7 @@ struct Index {
         }
         .width('100%')
 
-        Column().height(112)
+
       }
       .width('100%')
       .padding({ left: this.pageSidePad(), right: this.pageSidePad(), top: 12, bottom: this.pageBottomPad() })
@@ -5591,7 +6993,7 @@ struct Index {
       label = Geo.cityZh(c.colo);
     }
     if (label.length === 0) {
-      label = '未知';
+      label = this.t('未知', 'Unknown');
     }
     return addr + ':' + c.port.toString() + '#' + regionCode + ' V' + family.toString() + label + index.toString();
   }
@@ -5601,26 +7003,26 @@ struct Index {
     const n: number = this.etTopN;
     if (this.speedScope === SpeedScope.PER_REGION) {
       return n > 0
-        ? '当前「全部地区」测速：每个地区最多上传排序最靠前的 ' + n.toString()
-          + ' 个（默认 3，0=全部）。只影响上传，不影响测速和结果列表。'
-        : '当前「全部地区」测速：不限制上传数量（「全部」）。只影响上传，不影响测速和结果列表。';
+        ? this.t('当前「全部地区」测速：每个地区最多上传排序最靠前的 ', 'Current "All regions" speed test: uploads at most the top ') + n.toString()
+          + this.t(' 个（默认 3，0=全部）。只影响上传，不影响测速和结果列表。', ' (default 3, 0 = all). Upload only; speed test and results are unaffected.')
+        : this.t('当前「全部地区」测速：不限制上传数量（「全部」）。只影响上传，不影响测速和结果列表。', 'Current "All regions" speed test: no upload limit ("All"). Upload only; speed test and results are unaffected.');
     }
-    const scopeName: string = this.speedScope === SpeedScope.REGION ? '地区测速' : '完全测速';
+    const scopeName: string = this.speedScope === SpeedScope.REGION ? this.t('地区测速', 'Region speed test') : this.t('完全测速', 'Full speed test');
     return n > 0
-      ? '当前「' + scopeName + '」：所有地区合计最多上传排序最靠前的 ' + n.toString()
-        + ' 个（默认 3，0=全部）。只影响上传，不影响测速和结果列表。'
-      : '当前「' + scopeName + '」：不限制上传数量（「全部」）。只影响上传，不影响测速和结果列表。';
+      ? this.t('当前「', 'Current "') + scopeName + this.t('」：所有地区合计最多上传排序最靠前的 ', '": uploads at most the top ') + n.toString()
+        + this.t(' 个（默认 3，0=全部）。只影响上传，不影响测速和结果列表。', ' (default 3, 0 = all). Upload only; speed test and results are unaffected.')
+      : this.t('当前「', 'Current "') + scopeName + this.t('」：不限制上传数量（「全部」）。只影响上传，不影响测速和结果列表。', '": no upload limit ("All"). Upload only; speed test and results are unaffected.');
   }
 
   /** 测速完成页的简短提示 */
   uploadLimitShort(): string {
     if (this.etTopN <= 0) {
-      return '全部';
+      return this.t('全部', 'All');
     }
     if (this.speedScope === SpeedScope.PER_REGION) {
-      return '每地区前 ' + this.etTopN.toString() + ' 个';
+      return this.t('每地区前 ', 'Per region, top ') + this.etTopN.toString() + this.t(' 个', ' nodes');
     }
-    return '合计前 ' + this.etTopN.toString() + ' 个';
+    return this.t('合计前 ', 'Overall, top ') + this.etTopN.toString() + this.t(' 个', ' nodes');
   }
 
   /**
@@ -5727,7 +7129,7 @@ struct Index {
   /** 改动即落盘，下次启动不用重填 */
   saveEtConfig(): void {
     ConfigStore.saveEdgeTunnel(this.currentEtConfig()).catch((e: BusinessError) => {
-      this.addLog('保存订阅上传配置失败：' + e.message);
+      this.addLog(this.t('保存订阅上传配置失败：', 'Failed to save subscription upload settings: ') + e.message);
     });
   }
 
@@ -5775,32 +7177,32 @@ struct Index {
     if (cfg.uploadWay === 'api') {
       if (cfg.cfAccountId.trim().length === 0) {
         if (!auto) {
-          this.toast('请先填 Cloudflare Account ID');
+          this.toast(this.t('请先填 Cloudflare Account ID', 'Enter the Cloudflare Account ID first'));
         }
         return;
       }
       if (cfg.cfNamespaceId.trim().length === 0) {
         if (!auto) {
-          this.toast('请先填 KV 命名空间 ID');
+          this.toast(this.t('请先填 KV 命名空间 ID', 'Enter the KV namespace ID first'));
         }
         return;
       }
       if (cfg.cfApiToken.trim().length === 0) {
         if (!auto) {
-          this.toast('请先填 API Token');
+          this.toast(this.t('请先填 API Token', 'Enter the API Token first'));
         }
         return;
       }
     } else {
       if (cfg.host.trim().length === 0) {
         if (!auto) {
-          this.toast('请先填 edgetunnel 域名');
+          this.toast(this.t('请先填 edgetunnel 域名', 'Enter the edgetunnel domain first'));
         }
         return;
       }
       if (cfg.password.length === 0) {
         if (!auto) {
-          this.toast('请先填 edgetunnel 密码');
+          this.toast(this.t('请先填 edgetunnel 密码', 'Enter the edgetunnel password first'));
         }
         return;
       }
@@ -5808,43 +7210,43 @@ struct Index {
     const payload: UploadPayload = this.buildUploadPayload();
     if (payload.nodes.length === 0 && payload.custom.length === 0) {
       if (!auto) {
-        this.toast('没有可上传的节点，请先完成测速');
+        this.toast(this.t('没有可上传的节点，请先完成测速', 'No nodes to upload. Run a speed test first.'));
       }
       return;
     }
     this.etBusy = true;
     AppBackground.hold('upload');
-    this.etStatus = '准备上传…';
-    const how: string = auto ? '自动' : '手动';
-    const modeText: string = cfg.mode === 'append' ? '追加' : '覆盖';
-    const posText: string = cfg.customPos === 'bottom' ? '最后' : '最前';
-    const wayText: string = cfg.uploadWay === 'api' ? 'API 直传' : '登录上传';
-    this.addLog('edgetunnel ' + how + '上传开始（' + wayText + '）：节点 ' + payload.nodes.length.toString()
-      + ' 个，自定义 ' + payload.custom.length.toString() + ' 行，模式 ' + modeText + '，自定义位置 ' + posText);
-    this.toast('订阅' + how + '上传中…');
+    this.etStatus = this.t('准备上传…', 'Preparing upload…');
+    const how: string = auto ? this.t('自动', 'Auto') : this.t('手动', 'Manual');
+    const modeText: string = cfg.mode === 'append' ? this.t('追加', 'Append') : this.t('覆盖', 'Overwrite');
+    const posText: string = cfg.customPos === 'bottom' ? this.t('最后', 'Bottom') : this.t('最前', 'Top');
+    const wayText: string = cfg.uploadWay === 'api' ? this.t('API 直传', 'API direct upload') : this.t('登录上传', 'Login upload');
+    this.addLog('edgetunnel ' + how + this.t('上传开始（', 'Upload started (') + wayText + this.t('）：节点 ', '): nodes: ') + payload.nodes.length.toString()
+      + this.t(' 个，自定义 ', ', custom ') + payload.custom.length.toString() + this.t(' 行，模式 ', ' lines, mode ') + modeText + this.t('，自定义位置 ', ', custom position ') + posText);
+    this.toast(this.t('订阅', 'Subscription') + how + this.t('上传中…', 'Uploading…'));
     EdgeTunnel.upload(cfg, payload, (msg: string) => {
       this.etStatus = msg;
     }).then((res: UploadResult) => {
       this.etBusy = false;
       AppBackground.release('upload');
-      this.etStatus = '上传成功（' + res.totalLines.toString() + ' 行）';
+      this.etStatus = this.t('上传成功（', 'Upload succeeded (') + res.totalLines.toString() + this.t(' 行）', ' lines)');
       const costText: string = res.way === 'api'
-        ? ('读取 ' + res.readMs.toString() + 'ms，写入 ' + res.writeMs.toString() + 'ms')
-        : ('登录 ' + res.loginMs.toString() + 'ms'
-          + (res.mode === 'append' ? '，读取 ' + res.readMs.toString() + 'ms' : '')
-          + '，写入 ' + res.writeMs.toString() + 'ms');
-      this.addLog('edgetunnel 订阅上传成功（' + (res.way === 'api' ? 'API 直传' : '登录上传') + '）：模式 '
-        + (res.mode === 'append' ? '追加' : '覆盖') + '，节点 ' + res.nodeCount.toString() + ' 个，共 '
-        + res.totalLines.toString() + ' 行 / ' + res.bytes.toString() + ' 字节，耗时 ' + costText);
+        ? (this.t('读取 ', 'Read ') + res.readMs.toString() + this.t('ms，写入 ', 'ms, write ') + res.writeMs.toString() + 'ms')
+        : (this.t('登录 ', 'Login ') + res.loginMs.toString() + 'ms'
+          + (res.mode === 'append' ? this.t('，读取 ', ', read ') + res.readMs.toString() + 'ms' : '')
+          + this.t('，写入 ', ', write ') + res.writeMs.toString() + 'ms');
+      this.addLog(this.t('edgetunnel 订阅上传成功（', 'edgetunnel subscription upload succeeded (') + (res.way === 'api' ? this.t('API 直传', 'API direct upload') : this.t('登录上传', 'Login upload')) + this.t('）：模式 ', '): mode ')
+        + (res.mode === 'append' ? this.t('追加', 'Append') : this.t('覆盖', 'Overwrite')) + this.t('，节点 ', ', nodes: ') + res.nodeCount.toString() + this.t(' 个，共 ', ', ')
+        + res.totalLines.toString() + this.t(' 行 / ', ' lines / ') + res.bytes.toString() + this.t(' 字节，耗时 ', ' bytes, took ') + costText);
       // 自动上传也弹 toast：用户这时多半停在测速页，看不到设置页的状态行
-      this.toast('订阅上传成功，共 ' + res.totalLines.toString() + ' 行');
+      this.toast(this.t('订阅上传成功，共 ', 'Subscription upload succeeded: ') + res.totalLines.toString() + this.t(' 行', ' lines'));
     }).catch((e: BusinessError) => {
       this.etBusy = false;
       AppBackground.release('upload');
       const msg: string = this.etErrText(e);
-      this.etStatus = '上传失败：' + msg;
-      this.addLog('edgetunnel 上传失败：' + msg);
-      this.toast('订阅上传失败：' + msg);
+      this.etStatus = this.t('上传失败：', 'Upload failed: ') + msg;
+      this.addLog(this.t('edgetunnel 上传失败：', 'edgetunnel upload failed: ') + msg);
+      this.toast(this.t('订阅上传失败：', 'Subscription upload failed: ') + msg);
     });
   }
   /** 把网络层错误码翻译成中文提示；EdgeTunnel 自己抛的中文错误已带阶段，直接展示 */
@@ -5852,33 +7254,33 @@ struct Index {
     const raw: string = e.message === undefined ? '' : e.message;
     const code: number = e.code === undefined ? 0 : e.code;
     if (code === 2300005) {
-      return '代理服务器域名解析失败，请检查「上传代理」地址';
+      return this.t('代理服务器域名解析失败，请检查「上传代理」地址', 'Failed to resolve the proxy domain; check the "Upload proxy" address');
     }
     if (code === 2300006) {
-      return '无法解析 edgetunnel 域名，请检查域名拼写';
+      return this.t('无法解析 edgetunnel 域名，请检查域名拼写', 'Cannot resolve the edgetunnel domain; check the spelling');
     }
     if (code === 2300007) {
-      return '无法连接 edgetunnel 服务器，请检查网络或改用「上传代理」';
+      return this.t('无法连接 edgetunnel 服务器，请检查网络或改用「上传代理」', 'Cannot connect to the edgetunnel server; check your network or use the "Upload proxy"');
     }
     if (code === 2300028) {
-      return '请求超时，请检查网络后重试';
+      return this.t('请求超时，请检查网络后重试', 'Request timed out. Check your network and try again.');
     }
     if (code === 2300047) {
-      return '重定向次数超过上限，请确认「域名」只填站点根地址';
+      return this.t('重定向次数超过上限，请确认「域名」只填站点根地址', 'Too many redirects; make sure "Domain" contains only the site root address');
     }
     if (code === 2300094) {
-      return 'TLS 认证失败，请检查域名或上传代理';
+      return this.t('TLS 认证失败，请检查域名或上传代理', 'TLS authentication failed; check the domain or upload proxy');
     }
     if (code === 2300997) {
-      return '系统禁止明文 HTTP，请使用 https 地址';
+      return this.t('系统禁止明文 HTTP，请使用 https 地址', 'The system blocks plain HTTP; use an https address');
     }
     if (code === 2300999) {
-      return '网络内部错误：' + raw;
+      return this.t('网络内部错误：', 'Internal network error: ') + raw;
     }
     if (raw.length > 0) {
       return raw;
     }
-    return '未知错误（错误码 ' + code.toString() + '）';
+    return this.t('未知错误（错误码 ', 'Unknown error (code ') + code.toString() + '）';
   }
   splitResults(list: Candidate[]): void {
     const ping: Candidate[] = [];
@@ -5910,7 +7312,7 @@ struct Index {
     this.speedList = speed;
     this.speedStates = [];
     this.buildGroups(ping);
-    let regionLog: string = '第一轮地区分布：';
+    let regionLog: string = this.t('第一轮地区分布：', 'Round 1 region distribution: ');
     const colos: string[] = [];
     const counts: number[] = [];
     for (let i = 0; i < ping.length; i++) {
@@ -5924,7 +7326,7 @@ struct Index {
       }
     }
     for (let i = 0; i < colos.length; i++) {
-      regionLog += (i > 0 ? '、' : '') + colos[i] + ' ' + counts[i].toString() + ' 个';
+      regionLog += (i > 0 ? '、' : '') + colos[i] + ' ' + counts[i].toString() + this.t(' 个', ' nodes');
     }
     this.addLog(regionLog);
   }
@@ -5997,9 +7399,9 @@ struct Index {
   copyIp(ip: string): void {
     const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, ip);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
-      this.toast('已复制 ' + ip);
+      this.toast(this.t('已复制 ', 'Copied ') + ip);
     }).catch((err: BusinessError) => {
-      this.toast('复制失败：' + err.message);
+      this.toast(this.t('复制失败：', 'Copy failed: ') + err.message);
     });
   }
 
@@ -6033,26 +7435,26 @@ struct Index {
             lines++;
           }
         }
-        this.toast('已导入 ' + lines.toString() + ' 行');
-        this.addLog('从文件导入 ' + lines.toString() + ' 行候选地址');
+        this.toast(this.t('已导入 ', 'Imported ') + lines.toString() + this.t(' 行', ' lines'));
+        this.addLog(this.t('从文件导入 ', 'Imported from file: ') + lines.toString() + this.t(' 行候选地址', ' candidate addresses'));
       } catch (err) {
         const e2: BusinessError = err as BusinessError;
-        this.toast('读取失败：' + e2.message);
+        this.toast(this.t('读取失败：', 'Read failed: ') + e2.message);
       }
     }).catch((err: BusinessError) => {
-      this.toast('选择文件失败：' + err.message);
+      this.toast(this.t('选择文件失败：', 'Failed to select file: ') + err.message);
     });
   }
   sourceBrief(): string {
     if (this.srcIdx === 0) {
-      return '内置官方段库';
+      return this.t('内置官方段库', 'Built-in official ranges');
     }
     if (this.srcIdx === 3) {
       const n: number = this.customText.split('\n').filter((l: string) => l.trim().length > 0).length;
-      return n > 0 ? ('自定义：' + n.toString() + ' 行') : '自定义：未添加来源';
+      return n > 0 ? (this.t('自定义：', 'Custom: ') + n.toString() + this.t(' 行', ' lines')) : this.t('自定义：未添加来源', 'Custom: no sources added');
     }
     const n2: number = this.customText.split('\n').filter((l: string) => l.trim().length > 0).length;
-    return (this.srcIdx === 1 ? '社区 IPv6 段库' : '社区 IPv4 段库') + (n2 > 0 ? ('：' + n2.toString() + ' 行') : '');
+    return (this.srcIdx === 1 ? this.t('社区 IPv6 段库', 'Community IPv6 ranges') : this.t('社区 IPv4 段库', 'Community IPv4 ranges')) + (n2 > 0 ? ('：' + n2.toString() + this.t(' 行', ' lines')) : '');
   }
 
   /** 从链接导入自定义 IP 列表（优选库） */
@@ -6079,7 +7481,7 @@ struct Index {
     } else if (idx === 3) {
       this.ipVersion = this.ipVersion;
       if (this.customText.trim().length === 0) {
-        this.toast('自定义为空，请添加来源');
+        this.toast(this.t('自定义为空，请添加来源', 'Custom source is empty; add a source'));
         this.importDlg.open();
       }
     }
@@ -6089,14 +7491,14 @@ struct Index {
   importIpUrl(): void {
     const url: string = this.importUrl.trim();
     if (url.length === 0) {
-      this.toast('请先填写链接');
+      this.toast(this.t('请先填写链接', 'Enter a link first'));
       return;
     }
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      this.toast('链接需以 http(s):// 开头');
+      this.toast(this.t('链接需以 http(s):// 开头', 'The link must start with http(s)://'));
       return;
     }
-    this.toast('正在拉取优选库…');
+    this.toast(this.t('正在拉取优选库…', 'Fetching the selection library…'));
     const req = http.createHttp();
     req.request(url, {
       method: http.RequestMethod.GET,
@@ -6107,12 +7509,12 @@ struct Index {
     }).then((resp: http.HttpResponse) => {
       req.destroy();
       if (resp.responseCode !== 200) {
-        this.toast('拉取失败：HTTP ' + resp.responseCode.toString());
+        this.toast(this.t('拉取失败：HTTP ', 'Fetch failed: HTTP ') + resp.responseCode.toString());
         return;
       }
       const text: string = typeof resp.result === 'string' ? resp.result as string : '';
       if (text.length === 0) {
-        this.toast('链接内容为空');
+        this.toast(this.t('链接内容为空', 'The link returned no content'));
         return;
       }
       const lines: string[] = text.split('\n');
@@ -6134,11 +7536,11 @@ struct Index {
       this.customText = merged;
       this.mode = ScanMode.CUSTOM;
       this.scheduleScanSave();
-      this.toast('已从链接导入 ' + valid.toString() + ' 行');
-      this.addLog('从链接导入 ' + valid.toString() + ' 行优选地址：' + url);
+      this.toast(this.t('已从链接导入 ', 'Imported ') + valid.toString() + this.t(' 行', ' lines'));
+      this.addLog(this.t('从链接导入 ', 'Imported ') + valid.toString() + this.t(' 行优选地址：', ' preferred addresses from link: ') + url);
     }).catch((err: BusinessError) => {
       try { req.destroy(); } catch (e) { }
-      this.toast('拉取失败：' + err.message);
+      this.toast(this.t('拉取失败：', 'Fetch failed: ') + err.message);
     });
   }
 
@@ -6164,7 +7566,7 @@ struct Index {
           .maxLines(1)
         Blank()
         if (this.isSpeedPending(index)) {
-          Text(index < this.speedStates.length && this.speedStates[index] === 1 ? '测速中…' : '待测')
+          Text(index < this.speedStates.length && this.speedStates[index] === 1 ? this.t('测速中…', 'Testing…') : this.t('待测', 'Pending'))
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
             .fontColor(index < this.speedStates.length && this.speedStates[index] === 1 ? this.accent() : this.txt3())
@@ -6194,12 +7596,11 @@ struct Index {
     .alignItems(HorizontalAlign.Start)
     .padding(16)
     // 与全站卡片同源：材质 / 背景模糊 / tint 渐变 / 描边全部复用同一套取色
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
     .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
-    .systemMaterial(this.cardMaterial())
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 10 })
     .onClick(() => {
@@ -6249,12 +7650,11 @@ struct Index {
     .alignItems(HorizontalAlign.Start)
     .padding(16)
     // 与全站卡片同源：材质 / 背景模糊 / tint 渐变 / 描边全部复用同一套取色
-    .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.NONE : this.cardBlurStyle(),
+    .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
     .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
     .borderRadius(20)
-    .border({ width: this.shouldUseCardMaterial() ? 0.5 : 1, color: this.cardBorderColor() })
-    .systemMaterial(this.cardMaterial())
+    .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 10 })
     .onClick(() => {
@@ -6272,7 +7672,7 @@ struct Index {
       return;
     }
     this.testing = true;
-    this.testInfo = '测速中 0/' + list.length.toString();
+    this.testInfo = this.t('测速中 0/', 'Testing 0/') + list.length.toString();
     const c: ScanConfig = this.buildConfig();
     const token: CancellationToken = new CancellationToken();
     Scanner.stageSpeed(c, list, new ScanHooks(), token).then(() => {
@@ -6280,11 +7680,11 @@ struct Index {
       this.results = this.results.slice();
       this.testing = false;
       this.testInfo = '';
-      this.toast('补测速完成');
+      this.toast(this.t('补测速完成', 'Re-test complete'));
     }).catch((e: BusinessError) => {
       this.testing = false;
       this.testInfo = '';
-      this.toast('补测速失败：' + e.message);
+      this.toast(this.t('补测速失败：', 'Re-test failed: ') + e.message);
     });
   }
 }

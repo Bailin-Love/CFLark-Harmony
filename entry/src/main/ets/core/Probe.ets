@@ -251,7 +251,8 @@ export class TraceProbe {
       const code: number = resp.statusCode;
       let body: string = '';
       try {
-        const s: string | null = await resp.toString();
+        // Response.toString() 是同步接口（返回 string | null），await 只是多余的语法，去掉以避免 lint 报错
+        const s: string | null = resp.toString();
         body = s === null ? '' : s;
       } catch (e) {
         body = '';

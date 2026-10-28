@@ -22,6 +22,8 @@ export interface UiConfig {
   themeColor: number;
   bgBlur: number;
   bgBright: number;
+  /** 语言模式：0 跟随系统 / 1 简体中文 / 2 English */
+  langMode: number;
 }
 
 export function defaultUiConfig(): UiConfig {
@@ -31,7 +33,8 @@ export function defaultUiConfig(): UiConfig {
     matLevel: 0,
     themeColor: 4,
     bgBlur: 25,
-    bgBright: 40
+    bgBright: 40,
+    langMode: 0
   };
   return c;
 }
@@ -88,7 +91,7 @@ export function defaultScanConfig(): ScanConfig {
     port: 443,
     sampleCount: 3000,
     customText: '',
-    pingTimes: 2,
+    pingTimes: 1,
     pingIntervalMs: 50,
     pingTimeoutMs: 1000,
     latencyLimitMs: 300,
@@ -253,6 +256,19 @@ export class ConfigStore {
     st.putSync('et_top_n', c.topN);
     await st.flush();
   }
+  /** 已展示过升级说明的版本号（空串 = 从未展示，例如首次安装） */
+  static changelogSeen(): string {
+    return ConfigStore.str('changelog_seen_version', '');
+  }
+
+  static async saveChangelogSeen(version: string): Promise<void> {
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    st.putSync('changelog_seen_version', version);
+    await st.flush();
+  }
   /** 自定义背景图（应用沙箱内的绝对路径），空串表示用默认渐变 */
   static bgPath(): string {
     return ConfigStore.str('bg_path', '');
@@ -275,7 +291,8 @@ static ui(): UiConfig {
       matLevel: ConfigStore.num('ui_mat_level', d.matLevel),
       themeColor: ConfigStore.num('ui_theme_color', d.themeColor),
       bgBlur: ConfigStore.num('ui_bg_blur', d.bgBlur),
-      bgBright: ConfigStore.num('ui_bg_bright', d.bgBright)
+      bgBright: ConfigStore.num('ui_bg_bright', d.bgBright),
+    langMode: ConfigStore.num('ui_lang', d.langMode)
     };
     return c;
   }
@@ -291,6 +308,7 @@ static ui(): UiConfig {
     await st.put('ui_theme_color', c.themeColor);
     await st.put('ui_bg_blur', c.bgBlur);
     await st.put('ui_bg_bright', c.bgBright);
+  await st.put('ui_lang', c.langMode);
     await st.flush();
   }
 

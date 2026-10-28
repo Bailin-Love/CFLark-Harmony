@@ -105,6 +105,10 @@ devecocli build --build-mode release
 
 > 工程内的 `AppScope/app.json5` 已包含版本号；构建产物位于 `entry/build/default/outputs/default/`。
 
+## 开发者文档
+
+- [沉浸光感与视觉体系约定](docs/沉浸光感与视觉体系约定.md)：材质开关的判定链（`effLevel()`）、玻璃卡片模板、控件令牌、深浅色 helper、构建与真机验证流程。
+
 ## 隐私与安全
 
 - 应用不收集、不上传任何用户数据到第三方服务器；所有扫描与测速请求均由本机直连 Cloudflare 完成。

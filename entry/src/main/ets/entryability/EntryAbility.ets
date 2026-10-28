@@ -90,8 +90,22 @@ export class BarStyle {
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppBackground.init(this.context);
+    // 先按用户保存的主题偏好设置应用 colorMode：
+    // 手动深色/浅色时强制对应模式，让 resources/dark 等限定词资源（含启动图标）与界面一致；
+    // 系统模式则保持跟随系统。这里同步读取，尽量赶在首帧绘制前生效。
+    let savedMode: number = 2;
     try {
-      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      const st0: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: 'cflark_store' });
+      savedMode = st0.getSync('themeMode', 2) as number;
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'read themeMode early failed: %{public}s', JSON.stringify(err));
+    }
+    try {
+      const cm: ConfigurationConstant.ColorMode = savedMode === 0
+        ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+        : (savedMode === 1 ? ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT
+          : ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      this.context.getApplicationContext().setColorMode(cm);
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
