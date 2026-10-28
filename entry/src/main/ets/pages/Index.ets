@@ -6994,6 +6994,12 @@ TabContent() {
     }
     if (label.length === 0) {
       label = this.t('未知', 'Unknown');
+    } else {
+      // 同一国家/地区下有多个城市时补上城市名：既保证同地区连成一块，也让序号含义更清楚
+      const city: string = Geo.cityZh(c.colo);
+      if (city.length > 0 && city !== label && label.indexOf(city) < 0) {
+        label = label + '·' + city;
+      }
     }
     return addr + ':' + c.port.toString() + '#' + regionCode + ' V' + family.toString() + label + index.toString();
   }
@@ -7060,6 +7066,20 @@ TabContent() {
         arr = fresh;
       }
       (arr as Candidate[]).push(c);
+    }
+    // 组内整理：先按城市（colo）聚拢，同城再按综合成绩从高到低。
+    // 只按成绩排会让同一国家的不同城市交替出现，订阅里看起来很乱。
+    for (let g = 0; g < order.length; g++) {
+      const row: Candidate[] | undefined = groups.get(order[g]);
+      if (row === undefined) {
+        continue;
+      }
+      (row as Candidate[]).sort((a: Candidate, b: Candidate): number => {
+        if (a.colo !== b.colo) {
+          return a.colo < b.colo ? -1 : 1;
+        }
+        return b.finalScore - a.finalScore;
+      });
     }
     const nodes: string[] = [];
     for (let g = 0; g < order.length; g++) {
