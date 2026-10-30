@@ -22,6 +22,10 @@ export interface UiConfig {
   themeColor: number;
   bgBlur: number;
   bgBright: number;
+  /** 背景图遮罩程度 0~100（0 = 完全通透，100 = 最实）；只在有背景图时生效 */
+  bgScrim: number;
+  /** 卡片通透度 0=更实 50=默认 100=最透 */
+  cardClear: number;
   /** 语言模式：0 跟随系统 / 1 简体中文 / 2 English */
   langMode: number;
 }
@@ -34,6 +38,8 @@ export function defaultUiConfig(): UiConfig {
     themeColor: 4,
     bgBlur: 25,
     bgBright: 40,
+    bgScrim: 55,
+    cardClear: 50,
     langMode: 0
   };
   return c;
@@ -65,6 +71,12 @@ export enum ThemeMode {
   SYSTEM = 2
 }
 
+/** 两套背景图快照（启动预读用） */
+export interface BgSnapshot {
+  light: string;
+  dark: string;
+}
+
 /** 第一轮并发上限：按设备形态分档，避免低端机开太猛反而更慢 */
 export function maxScanConcurrency(): number {
   // 按设备形态分档：手机 120、平板 200、电脑(2in1) 300。
@@ -84,17 +96,29 @@ export function defaultScanConcurrency(): number {
   // 默认并发 30：3000 个候选大约 1 分钟内跑完，同时避免排队放大延迟与过度发热。
   return 30;
 }
+/** 推荐参数（默认值与「应用建议」共用的唯一来源，避免 UI / 配置 / 测速三处各写一份） */
+export const REC_SAMPLE_COUNT: number = 3000;
+export const REC_PING_TIMES: number = 1;
+export const REC_LATENCY_MS: number = 300;
+export const REC_SPEED_COUNT: number = 10;
+export const REC_SPEED_PER_REGION: number = 3;
+export const REC_SPEED_ROUNDS: number = 1;
+export const REC_SPEED_WINDOW_MS: number = 6000;
+export const REC_MIN_SPEED_MBPS: number = 0.1;
+
 export function defaultScanConfig(): ScanConfig {
   const c: ScanConfig = {
     mode: ScanMode.OFFICIAL,
     ipVersion: IpVersion.V4,
     port: 443,
-    sampleCount: 3000,
+    sampleCount: REC_SAMPLE_COUNT,
     customText: '',
-    pingTimes: 1,
+    sourceGroupId: '',
+    sourceGroupName: '',
+    pingTimes: REC_PING_TIMES,
     pingIntervalMs: 50,
     pingTimeoutMs: 1000,
-    latencyLimitMs: 300,
+    latencyLimitMs: REC_LATENCY_MS,
     scanConcurrency: defaultScanConcurrency(),
     traceHost: DEFAULT_TRACE_HOST,
     tracePath: DEFAULT_TRACE_PATH,
@@ -102,14 +126,14 @@ export function defaultScanConfig(): ScanConfig {
     traceTimeoutMs: 3000,
     enableSpeed: true,
     speedScope: SpeedScope.ALL,
-    speedCount: 10,
-    speedPerRegion: 3,
-    speedRounds: 1,
+    speedCount: REC_SPEED_COUNT,
+    speedPerRegion: REC_SPEED_PER_REGION,
+    speedRounds: REC_SPEED_ROUNDS,
     speedUrl: 'https://speed.cloudflare.com/__down?bytes=50000000',
-    speedWindowMs: 6000,
+    speedWindowMs: REC_SPEED_WINDOW_MS,
     speedConcurrency: 1,
     speedGapMs: 300,
-    minSpeedMbps: 0.1,
+    minSpeedMbps: REC_MIN_SPEED_MBPS,
     domain: '',
     domainSampling: true,
     regionCode: '',
@@ -151,6 +175,24 @@ export class ConfigStore {
       return v;
     }
     return def;
+  }
+
+  /**
+   * 供 Sources 等模块复用的原始字符串读写：
+   * 这些键不参与 ScanConfig 字段映射（单独维护自己的序列化格式与版本），
+   * 但仍然落在同一个 preferences 里，避免额外存储依赖。
+   */
+  static rawStr(key: string, def: string): string {
+    return ConfigStore.str(key, def);
+  }
+
+  static async rawPut(key: string, value: string): Promise<void> {
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    await st.put(key, value);
+    await st.flush();
   }
 
   static load(): ScanConfig {
@@ -282,6 +324,74 @@ export class ConfigStore {
     st.putSync('bg_path', path);
     await st.flush();
   }
+
+  /**
+   * 按深浅色分别读取背景图（v2 数据结构）。
+   * 空串表示该模式使用默认背景（深色为深色渐变、浅色为浅色渐变）。
+   */
+  static bgPathFor(dark: boolean): string {
+    return ConfigStore.str(dark ? 'bg_path_dark' : 'bg_path_light', '');
+  }
+
+  /** 保存某一模式的背景图；同时把数据结构版本号写成 2 */
+  static async saveBgPathFor(dark: boolean, path: string): Promise<void> {
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    st.putSync(dark ? 'bg_path_dark' : 'bg_path_light', path);
+    st.putSync('bg_path_ver', 2);
+    await st.flush();
+  }
+
+  /**
+   * 旧版只有一份 `bg_path`（不分深浅色）。首次升级时把它**复制**到两套配置里，
+   * 这样升级前后背景观感完全一致，也不会因为只归入一种模式而让另一种模式突然变样。
+   * 已是 v2 或旧值为空则不做任何事；旧键保留不删，便于回滚。
+   */
+  static async migrateBgPaths(): Promise<void> {
+    ConfigStore.migrateBgPathsSync();
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    await st.flush();
+  }
+
+  /** 迁移的同步部分：页面 loadConfig 里可以安全地同步调用，避免读到半迁移状态 */
+  static migrateBgPathsSync(): void {
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    const ver: number = ConfigStore.num('bg_path_ver', 0);
+    if (ver >= 2) {
+      return;
+    }
+    const legacy: string = ConfigStore.str('bg_path', '');
+    if (legacy.length > 0) {
+      st.putSync('bg_path_light', legacy);
+      st.putSync('bg_path_dark', legacy);
+    }
+    st.putSync('bg_path_ver', 2);
+  }
+
+  /** 启动阶段同步取两套背景图（供进程创建时预读，避免首帧闪空白） */
+  static bgPathSnapshot(): BgSnapshot {
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return { light: '', dark: '' };
+    }
+    const ver: number = ConfigStore.num('bg_path_ver', 0);
+    if (ver >= 2) {
+      return {
+        light: ConfigStore.str('bg_path_light', ''),
+        dark: ConfigStore.str('bg_path_dark', '')
+      };
+    }
+    const legacy: string = ConfigStore.str('bg_path', '');
+    return { light: legacy, dark: legacy };
+  }
   /** 读取主题模式，默认「跟随系统」 */
 static ui(): UiConfig {
     const d: UiConfig = defaultUiConfig();
@@ -292,6 +402,8 @@ static ui(): UiConfig {
       themeColor: ConfigStore.num('ui_theme_color', d.themeColor),
       bgBlur: ConfigStore.num('ui_bg_blur', d.bgBlur),
       bgBright: ConfigStore.num('ui_bg_bright', d.bgBright),
+      bgScrim: ConfigStore.num('ui_bg_scrim', d.bgScrim),
+      cardClear: ConfigStore.num('ui_card_clear', d.cardClear),
     langMode: ConfigStore.num('ui_lang', d.langMode)
     };
     return c;
@@ -308,6 +420,8 @@ static ui(): UiConfig {
     await st.put('ui_theme_color', c.themeColor);
     await st.put('ui_bg_blur', c.bgBlur);
     await st.put('ui_bg_bright', c.bgBright);
+    await st.put('ui_bg_scrim', c.bgScrim);
+    await st.put('ui_card_clear', c.cardClear);
   await st.put('ui_lang', c.langMode);
     await st.flush();
   }

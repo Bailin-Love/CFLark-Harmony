@@ -32,6 +32,72 @@ export interface ChangelogEntry {
 export class Changelog {
   private static readonly DATA: ChangelogEntry[] = [
     {
+      version: '1.4.2',
+      date: '2026-10-30',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '候选来源可以自己建分组了：一个分组里能混放链接、文件和粘贴的文本，链接来源支持一键更新；官方 IP 段和社区段库始终只读，不会被误改。IPv4 与 IPv6 各存一套、互不影响，导入时按当前 IP 版本校验，贴错类型会直接告诉你原因。',
+          en: 'You can now build your own source groups: one group may mix links, files and pasted text, and link sources refresh in one tap. The official and community ranges stay read-only. IPv4 and IPv6 keep separate sets, and imports are checked against the selected IP version with a clear reason when a line does not match.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '外观和主题合并到一页：跟随系统 / 深色 / 浅色三选一，6 种主题色，9 格背景（无背景 + 7 张预设 + 自定义图片）；浅色和深色可以各用各的背景，选「跟随系统」时会真的跟着手机深浅色切换。',
+          en: 'Appearance and theme now live on one page: system / dark / light, six accent colors and a nine-cell background grid (none, seven presets, your own image). Light and dark can use different backgrounds, and following the system really follows the device.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '背景和玻璃都能自己调：背景模糊、背景明亮、背景遮罩，加上新做的「卡片通透度」——想看清壁纸就往通透调，想文字更稳就往扎实调，深浅色各自记忆。',
+          en: 'Background and glass are yours to tune: background blur, brightness, scrim, plus the new card clarity slider. Push toward clear to see the wallpaper, toward solid to keep text steady; both themes remember their own values.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '平板和电脑上：扫描页改成左右两列四张卡；设置页改成左边菜单、右边内容（默认停在「订阅与上传」）；窗口变窄会自动退回单列。',
+          en: 'On tablets and PCs the scan page uses two columns with four cards, settings uses a left menu with content on the right (opening on Subscription upload), and narrow windows fall back to a single column.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '扫描、筛选、测速三个页面的进度条统一了：都在各自卡片里，显示当前阶段、已完成数量和百分比，停止后明确显示「已停止」。',
+          en: 'Progress bars on scan, filter and speed pages are now consistent: each sits in its own card and shows the stage, completed count and percentage, with a clear stopped state.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '来源管理改成卡片式列表，和主页面同一套玻璃质感；筛选页的地区分组展开一张卡时，只把同一列下面的卡片挤下去，旁边的列保持不动。',
+          en: 'Source management now uses cards with the same glass look as the main pages, and expanding a region card only shifts the cards below it in the same column.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '七个「ⓘ」说明统一成同一种弹窗：中英双语、正文可滚动，点遮罩、「知道了」或系统返回键都能关闭。',
+          en: 'The seven info buttons share one dialog now: bilingual text, scrollable body, closable by tapping the scrim, the button or the system back key.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '下载测速不再有开关，测速参数始终可见；旧的冗余代码一并清理，应用更轻。',
+          en: 'The speed test switch is gone and its parameters are always visible; a batch of unused legacy code was removed as well.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修好浅色主题配深色壁纸时标题和文字看不清的问题；切换深浅色后，状态栏图标与窗口底色也会跟着变。',
+          en: 'Fixed unreadable titles and text when a light theme sat on a dark wallpaper, and the status bar icons plus window background now follow theme changes.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修好直接写 IPv6 地址（例如 2606:4700::1）被当成「地址:端口」拆开、导致节点悄悄丢失的问题。',
+          en: 'Fixed bare IPv6 addresses such as 2606:4700::1 being split into address and port, which silently dropped nodes.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修好「停止」按钮和进度条显示成另一项任务的问题：扫描、质量预检和测速现在各管各的状态。',
+          en: 'Fixed the stop button and progress strip sometimes showing another task; scanning, quality pre-check and speed testing now track their own state.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修好平板/电脑点「查看完整日志」没反应、改完参数马上退出会丢最后一次修改、背景图读取失败会清空已选背景这几处问题。',
+          en: 'Fixed the changelog link doing nothing on tablets and PCs, the last parameter edit being lost when quitting immediately, and a background read failure clearing the saved background.'
+        }
+      ]
+    },
+    {
       version: '1.4.1',
       date: '2026-10-28',
       items: [
@@ -170,6 +236,137 @@ export class Changelog {
           kind: ChangeKind.FIX,
           zh: '修复深色模式悬浮导航发白与屏幕底部亮带。',
           en: 'Fixed a washed-out bottom navigation and a bright band at the bottom edge in dark mode.'
+        }
+      ]
+    },
+    {
+      version: '1.3.9',
+      date: '2026-10-26',
+      items: [
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '测速域名的采样改为自动：解析 A 与 AAAA 记录后直接并入候选，不再需要手动打开「域名解析采样」。',
+          en: 'Speed test domain sampling is automatic now: A and AAAA records are resolved and added to candidates, so the old toggle is gone.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修复域名采样开关在不同设备上状态不一致的问题。',
+          en: 'Fixed the domain sampling switch keeping different states across devices.'
+        }
+      ]
+    },
+    {
+      version: '1.3.8',
+      date: '2026-10-26',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '设置新增「运行」卡片：后台保持运行（数据传输连续任务）与域名解析采样。',
+          en: 'New Runtime card in settings: keep running in background with a data transfer task, plus domain resolution sampling.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '网络诊断增强：IPv4 与 IPv6 双自检、结果可复制，并加入 120 秒看门狗避免长时间卡住。',
+          en: 'Enhanced diagnostics: separate IPv4 and IPv6 self checks, copyable results, and a 120 second watchdog.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '参数默认值与分档上限：延迟上限 300ms，并发默认 20，上限手机 120、平板 200、电脑 300。',
+          en: 'New defaults and per-device caps: latency cap 300ms, concurrency default 20 with caps of 120 on phones, 200 on tablets and 300 on PCs.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '性能优化：日志条数上限、结果 120ms 合并刷新、进度 80ms 合并、日志 100ms 合并。',
+          en: 'Performance: capped log lines and batched result, progress and log updates.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修复底部导航占用视口、页面底边被裁切的问题。',
+          en: 'Fixed the bottom navigation covering part of the viewport and clipping page bottoms.'
+        }
+      ]
+    },
+    {
+      version: '1.3.7',
+      date: '2026-10-25',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '新增「合格速度」门槛（默认 0.1MB/s），测速结果按该门槛判定是否可用。',
+          en: 'New minimum speed threshold (0.1MB/s by default) used to judge whether a result is usable.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '订阅上传数量可自定义（默认 3 个）。',
+          en: 'Configurable upload count for subscription uploads (3 by default).'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '测速地址数默认改为 10；第一轮进度显示「通过 X、未通过 Y」。',
+          en: 'Speed test addresses default to 10, and the first round shows passed and failed counts.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '平板设置页重新分组，IPv4 自检入口补齐。',
+          en: 'Regrouped the tablet settings page and added an IPv4 self check.'
+        }
+      ]
+    },
+    {
+      version: '1.3.6',
+      date: '2026-10-25',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '扫描测速参数持久化，重启后保留上次的填写内容。',
+          en: 'Scan and speed parameters persist across restarts.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '参数建议值与「应用建议」按钮，IPv4 与 IPv6 分别给出推荐默认。',
+          en: 'Suggested parameter values with an Apply button, tuned separately for IPv4 and IPv6.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '阶段一失败分类统计更清晰，便于判断是超时、不可达还是被拒绝。',
+          en: 'Clearer failure breakdown in the first stage so timeouts, unreachable and rejected results are easy to tell apart.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修复切换 IP 版本或应用建议后输入框不刷新的问题。',
+          en: 'Fixed inputs not refreshing after switching IP version or applying suggestions.'
+        }
+      ]
+    },
+    {
+      version: '1.3.5',
+      date: '2026-10-25',
+      items: [
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '悬浮导航交互优化：轻点不触发回弹与扫光，拖动才跟手，松手后淡出。',
+          en: 'Floating navigation tuning: taps no longer trigger bounce or shine, dragging follows the finger, and it fades after release.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '内容上下边缘改为渐变虚化过渡，滚动时不再出现生硬的蒙层。',
+          en: 'Top and bottom content edges use a gradient fade instead of a hard overlay while scrolling.'
+        }
+      ]
+    },
+    {
+      version: '1.3.4',
+      date: '2026-10-25',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '关于页新增「GitHub 项目主页」与「下载最新版本」入口。',
+          en: 'About now links to the GitHub project page and the latest release download.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '新增免责声明，说明工具用途与使用风险。',
+          en: 'Added a disclaimer about the intended use and its risks.'
         }
       ]
     }

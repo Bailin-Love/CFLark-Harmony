@@ -15,13 +15,39 @@ import { uiMaterial } from '@kit.ArkUI';
 import { hdsMaterial, HdsTabs, HdsTabsFloatingStyle, SystemMaterialParams } from '@kit.UIDesignKit';
 import { BarStyle } from '../entryability/EntryAbility';
 import { Candidate, ScanConfig, ScanMode, IpVersion, Verdict, Stage, DomainInfo, SpeedScope } from '../core/Types';
-import { ConfigStore, ThemeMode, UiConfig, defaultUiConfig, defaultScanConfig, PORT_OPTIONS, LIB_SOURCES, LibSource, maxScanConcurrency, defaultScanConcurrency } from '../core/ConfigStore';
+import {
+  ConfigStore,
+  ThemeMode,
+  UiConfig,
+  defaultUiConfig,
+  defaultScanConfig,
+  PORT_OPTIONS,
+  LIB_SOURCES,
+  LibSource,
+  maxScanConcurrency,
+  defaultScanConcurrency,
+  REC_LATENCY_MS,
+  REC_MIN_SPEED_MBPS,
+  REC_PING_TIMES,
+  REC_SAMPLE_COUNT,
+  REC_SPEED_COUNT,
+  REC_SPEED_PER_REGION,
+  REC_SPEED_ROUNDS,
+  REC_SPEED_WINDOW_MS
+} from '../core/ConfigStore';
 import { I18n, LangMode } from '../core/I18n';
 import { UpdateChecker, UpdateStatus, UpdateCheckResult, ReleaseInfo } from '../core/UpdateChecker';
 import { Changelog, ChangelogEntry, ChangeItem, ChangeKind } from '../core/Changelog';
 import { AppMeta } from '../core/AppMeta';
 import { AppBackground } from '../core/AppBackground';
 import { Scanner, ScanHooks, CancellationToken, PrecheckResult } from '../core/Scanner';
+import {
+  Sources, SourceGroup, SourceItem, SourceChoice, GroupStats, CompileResult, ImportOutcome,
+  AddSourceResult, OpResult, LineClass, QuarantineItem, SourceReject,
+  SRC_FAM_V4, SRC_FAM_V6, SRC_ID_OFFICIAL, SRC_ID_COMMUNITY,
+  SRC_KIND_LINK, SRC_KIND_FILE, SRC_KIND_TEXT, SRC_STATUS_OK, SRC_STATUS_PARTIAL, SRC_STATUS_FAILED
+} from '../core/Sources';
+import { HelpText, HELP_FILTER, HELP_SOURCE, HELP_SPEED, HELP_UPLOAD, HELP_MATERIAL, HELP_DIAG, HELP_RUNTIME } from '../core/HelpText';
 import { Ranker } from '../core/Ranker';
 import { EdgeTunnel, EdgeTunnelConfig, defaultEdgeTunnelConfig, UploadPayload, UploadResult } from '../core/EdgeTunnel';
 import { Exporter, ExportFormat, defaultExportOptions } from '../core/Exporter';
@@ -32,6 +58,7 @@ import { Diag } from '../core/Diag';
 import { picker } from '@kit.CoreFileKit';
 import { connection, http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 
 interface RegionGroup {
   colo: string;
@@ -40,6 +67,12 @@ interface RegionGroup {
   minLatency: number;
   avgLatency: number;
   items: Candidate[];
+}
+
+/** 手机设置二级页的一层浏览记录：分类 id + 离开该层时的滚动位置 */
+interface SettingsFrame {
+  id: number;
+  scrollY: number;
 }
 
 const OK_C: string = '#10B981';
@@ -60,329 +93,12 @@ const PRIMARY: string = '#4F46E5';
 // 独立的、只有透明底的子节点上（承载层），由它铺满卡片。
 // ============================================================================
 
-/** 材质对象缓存：避免每次 build 都 new ImmersiveMaterial（真机会掉帧） */
-class MatStore {
-  private static cache: Map<string, uiMaterial.Material> = new Map();
-
-  /** 惰性构造沉浸材质；任何异常都退化为 Material.empty（组件级关闭材质） */
-  static immersive(style: uiMaterial.ImmersiveStyle, dark: boolean, alpha: number,
-    liquid: boolean, shadow: boolean, light: string): uiMaterial.Material {
-    const key: string = style.toString() + '|' + (dark ? '1' : '0') + '|' + alpha.toFixed(3) +
-      '|' + (liquid ? '1' : '0') + '|' + (shadow ? '1' : '0') + '|' + light;
-    const hit: uiMaterial.Material | undefined = MatStore.cache.get(key);
-    if (hit !== undefined) {
-      return hit;
-    }
-    let made: uiMaterial.Material = uiMaterial.Material.empty;
-    try {
-      const tint: string = dark ? 'rgba(20,22,30,' + alpha.toFixed(3) + ')'
-        : 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
-      if (liquid) {
-        const optLiquid: uiMaterial.ImmersiveOptions = {
-          style: style,
-          materialColor: tint,
-          colorInvert: false,
-          applyShadow: shadow,
-          interactive: true,
-          lightEffect: { color: light.length > 0 ? light : '#33FFFFFF' }
-        };
-        made = new uiMaterial.ImmersiveMaterial(optLiquid);
-      } else {
-        const optStatic: uiMaterial.ImmersiveOptions = {
-          style: style,
-          materialColor: tint,
-          colorInvert: false,
-          applyShadow: shadow,
-          interactive: false
-        };
-        made = new uiMaterial.ImmersiveMaterial(optStatic);
-      }
-    } catch (e) {
-      made = uiMaterial.Material.empty;
-    }
-    MatStore.cache.set(key, made);
-    return made;
-  }
-}
-
-/**
- * 材质属性修饰器。
- * systemMaterial 必须在 applyNormalAttribute 回调里设置，且修饰器对象要在
- * 每次 build 时重新构造，这样才能读到最新的响应式状态（开关/档位）。
- */
-class GlassCarrierModifier implements AttributeModifier<ToggleAttribute> {
-  private mat: uiMaterial.Material | undefined = undefined;
-  private radius: number = 20;
-
-  constructor(mat: uiMaterial.Material | undefined, radius: number) {
-    this.mat = mat;
-    this.radius = radius;
-  }
-
-  applyNormalAttribute(instance: ToggleAttribute): void {
-    instance.borderRadius(this.radius);
-    instance.clip(true);
-    instance.backgroundColor(Color.Transparent);
-    instance.hitTestBehavior(HitTestMode.None);
-    if (this.mat !== undefined && this.mat !== uiMaterial.Material.empty) {
-      instance.systemMaterial(this.mat);
-    }
-  }
-}
-
-/**
- * 玻璃承载层：铺满父容器，只负责「系统沉浸材质」。
- * 用 Toggle(Button) 而不是普通容器承载，是因为按钮类组件才有完整的
- * 系统材质表面（普通容器只设 systemMaterial 在真机上不出材质）。
- * 必须显式 matchParent 尺寸，否则塌缩为 0 宽高。
- */
-@Component
-struct GlassCarrier {
-  /** 是否启用系统沉浸材质 */
-  @Prop enabledMat: boolean = true;
-  /** 材质厚度：0 ULTRA_THIN / 1 THIN / 2 REGULAR / 3 THICK / 4 ULTRA_THICK */
-  @Prop thickness: number = 1;
-  @Prop carrierRadius: number = 20;
-  @Prop darkMode: boolean = true;
-  /** 着色浓度 0~0.6，越小越通透 */
-  @Prop tintAlpha: number = 0.20;
-  /** 交互流光（悬浮导航等可交互表面） */
-  @Prop liquid: boolean = false;
-  @Prop lightColor: string = '';
-  /** 承载层高度（vp）：由卡片实测高度传入，避免 matchParent 把卡片撑满屏幕 */
-  @Prop carrierHeight: number = 0;
-
-  private styleOf(): uiMaterial.ImmersiveStyle {
-    if (this.thickness <= 0) {
-      return uiMaterial.ImmersiveStyle.ULTRA_THIN;
-    }
-    if (this.thickness === 1) {
-      return uiMaterial.ImmersiveStyle.THIN;
-    }
-    if (this.thickness === 2) {
-      return uiMaterial.ImmersiveStyle.REGULAR;
-    }
-    if (this.thickness === 3) {
-      return uiMaterial.ImmersiveStyle.THICK;
-    }
-    return uiMaterial.ImmersiveStyle.ULTRA_THICK;
-  }
-
-  build() {
-    Stack() {
-      if (this.enabledMat) {
-        Toggle({ type: ToggleType.Button, isOn: false }) {
-          Text('')
-            .fontSize(0)
-        }
-        .width(LayoutPolicy.matchParent)
-        .height(LayoutPolicy.matchParent)
-        .backgroundColor(Color.Transparent)
-        .enabled(false)
-        .focusable(false)
-        .hitTestBehavior(HitTestMode.None)
-        .attributeModifier(new GlassCarrierModifier(
-          MatStore.immersive(this.styleOf(), this.darkMode, this.tintAlpha, this.liquid, false, this.lightColor),
-          this.carrierRadius))
-      }
-    }
-    .width('100%')
-    .height(this.carrierHeight)
-    .hitTestBehavior(HitTestMode.None)
-  }
-}
-
-@CustomDialog
-struct CustomImportDialog {
-  controller?: CustomDialogController;
-  initialUrl: string = '';
-  initialText: string = '';
-  /** 跟随页面主题：深色 / 浅色 */
-  darkMode: boolean = false;
-  /** 跟随页面主题色（主按钮用） */
-  accentColor: string = '#C9A3A6';
-  /** 是否英文界面（跟随全局 AppStorage，切换语言后立即生效） */
-  @StorageProp('lang_en') langEn: boolean = false;
-  onUrl: (u: string) => void = () => {};
-  onFile: () => void = () => {};
-  onSave: (t: string) => void = () => {};
-  @State mode: number = 0;
-  @State url: string = '';
-  @State draft: string = '';
-
-  private t(zh: string, en: string): string {
-    return this.langEn ? en : zh;
-  }
-
-  aboutToAppear(): void {
-    this.url = this.initialUrl;
-    this.draft = this.initialText;
-  }
-
-  // ---------- 深色 / 浅色两套色 ----------
-  private dlgBg(): string {
-    return this.darkMode ? '#E81E1E24' : '#EEFFFFFF';
-  }
-  private optBg(): string {
-    return this.darkMode ? '#2A2A31' : '#F4F5F8';
-  }
-  private lineC(): string {
-    return this.darkMode ? '#17FFFFFF' : '#12121218';
-  }
-  private t1(): string {
-    return this.darkMode ? '#F2F2F5' : '#111114';
-  }
-  private t2(): string {
-    return this.darkMode ? '#C9CAD2' : '#333338';
-  }
-  private t3(): string {
-    return this.darkMode ? '#8E8F99' : '#77777F';
-  }
-  private softC(): string {
-    return this.darkMode ? '#33333C' : '#E9EAEE';
-  }
-
-  @Builder Btn(label: string, primary: boolean, w: string, act: () => void) {
-    Text(label)
-      .fontSize(13)
-      .fontWeight(FontWeight.Medium)
-      .fontColor(primary ? '#FFFFFF' : this.t2())
-      .textAlign(TextAlign.Center)
-      .width(w)
-      .height(40)
-      .backgroundColor(primary ? this.accentColor : this.softC())
-      .borderRadius(12)
-      .onClick(act)
-  }
-
-  /** 一级选项行：标题 + 说明 + 箭头 */
-  @Builder OptionRow(title: string, hint: string, act: () => void) {
-    Row() {
-      Column() {
-        Text(title)
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.t1())
-        Text(hint)
-          .fontSize(11)
-          .fontColor(this.t3())
-          .margin({ top: 3 })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      Text('›')
-        .fontSize(18)
-        .fontColor(this.t3())
-        .margin({ left: 8 })
-    }
-    .width('100%')
-    .padding({ left: 14, right: 12, top: 11, bottom: 11 })
-    .backgroundColor(this.optBg())
-    .borderRadius(12)
-    .margin({ bottom: 8 })
-    .onClick(act)
-  }
-
-  @Builder FieldLabel(label: string) {
-    Text(label)
-      .fontSize(12)
-      .fontColor(this.t3())
-      .width('100%')
-      .margin({ top: 12 })
-  }
-
-  build() {
-    Column() {
-      Row() {
-        Text(this.t('自定义导入', 'Custom import'))
-          .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.t1())
-        Blank()
-        Text('✕')
-          .fontSize(13)
-          .fontColor(this.t3())
-          .textAlign(TextAlign.Center)
-          .width(28)
-          .height(28)
-          .backgroundColor(this.softC())
-          .borderRadius(14)
-          .onClick(() => { if (this.controller) { this.controller.close(); } })
-      }
-      .width('100%')
-
-      if (this.mode === 0) {
-        Text(this.t('选择导入方式：来源需一行一个地址或 CIDR，可用 # 注释。', 'Choose an import method: one address or CIDR per line; # starts a comment.'))
-          .fontSize(11)
-          .fontColor(this.t3())
-          .width('100%')
-          .margin({ top: 10, bottom: 12 })
-        Column() {
-          this.OptionRow(this.t('链接导入', 'Import from link'), this.t('从网址拉取 IP 列表，自动识别 v4 / v6', 'Fetch an IP list from a URL; v4/v6 detected automatically'), () => { this.mode = 1; })
-          this.OptionRow(this.t('文件导入', 'Import from file'), this.t('选择本地的 txt / csv 文件', 'Choose a local txt / csv file'), () => {
-            this.onFile();
-            if (this.controller) { this.controller.close(); }
-          })
-          this.OptionRow(this.t('文本粘贴 / 编辑', 'Paste / edit text'), this.t('直接粘贴或手动修改来源文本', 'Paste directly or edit the source text manually'), () => { this.mode = 2; })
-        }
-        .width('100%')
-      } else if (this.mode === 1) {
-        this.FieldLabel(this.t('链接地址', 'Link URL'))
-        TextInput({ text: this.url, placeholder: 'https://example.com/ips-v6' })
-          .width('100%')
-          .height(40)
-          .fontSize(12)
-          .fontColor(this.t1())
-          .placeholderColor(this.t3())
-          .backgroundColor(this.optBg())
-          .borderRadius(10)
-          .margin({ top: 8 })
-          .onChange((v: string) => { this.url = v; })
-        Row() {
-          this.Btn(this.t('返回', 'Back'), false, '48%', () => { this.mode = 0; })
-          this.Btn(this.t('拉取导入', 'Fetch and import'), true, '48%', () => {
-            this.onUrl(this.url.trim());
-            if (this.controller) { this.controller.close(); }
-          })
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.SpaceBetween)
-        .margin({ top: 14 })
-      } else {
-        this.FieldLabel(this.t('来源文本', 'Source text'))
-        TextArea({ text: this.draft, placeholder: this.t('每行一个：1.2.3.4 / 1.2.3.4:8443 / [2001:db8::1]:443 / CIDR', 'One per line: 1.2.3.4 / 1.2.3.4:8443 / [2001:db8::1]:443 / CIDR') })
-          .width('100%')
-          .height(176)
-          .fontSize(12)
-          .fontColor(this.t1())
-          .placeholderColor(this.t3())
-          .backgroundColor(this.optBg())
-          .borderRadius(10)
-          .margin({ top: 8 })
-          .onChange((v: string) => { this.draft = v; })
-        Row() {
-          this.Btn(this.t('清空', 'Clear'), false, '48%', () => { this.draft = ''; })
-          this.Btn(this.t('保存并启用', 'Save and enable'), true, '48%', () => {
-            this.onSave(this.draft);
-            if (this.controller) { this.controller.close(); }
-          })
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.SpaceBetween)
-        .margin({ top: 14 })
-      }
-    }
-    .width('92%')
-    .constraintSize({ maxWidth: 400 })
-    .padding(18)
-    .backgroundColor(this.dlgBg())
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: this.darkMode ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
-    })
-    .borderRadius(22)
-    .border({ width: 1, color: this.lineC() })
-    .alignItems(HorizontalAlign.Start)
-  }
+interface ProgressInfo {
+  pct: number;
+  stage: string;
+  counter: string;
+  running: boolean;
+  finished: boolean;
 }
 
 @Entry
@@ -443,6 +159,10 @@ struct Index {
   @State bgBlurPct: number = 0;
   /** 背景图明亮程度 0~100（50 = 原亮度） */
   @State bgBrightPct: number = 50;
+  /** 背景图遮罩程度 0~100（0 = 完全通透看得见图，100 = 最实）；用户自选，默认偏薄 */
+  @State bgScrimPct: number = 55;
+  /** 卡片通透度：0=更实，50=默认，100=最透 */
+  @State cardClearPct: number = 50;
   /** 光感等级 0=弱 1=标准 2=强 3=极致 */
   @State glassLevel: number = 1;
 
@@ -479,6 +199,9 @@ struct Index {
 
   // 扫描状态
   @State scanning: boolean = false;
+  // 当前任务类型：0=空闲 1=第一轮扫描 2=质量预检 3=正式测速
+  // 三页进度条与「停止」按钮按它区分归属，避免扫描页显示测速进度、停止误杀别的阶段
+  @State taskKind: number = 0;
   @State phaseText: string = '';
   @State done: number = 0;
   @State total: number = 0;
@@ -504,66 +227,73 @@ struct Index {
   @State customText: string = '';
   @State importUrl: string = 'https://www.cloudflare.com/ips-v6/';
   @State libIdx: number = 0;
-  @State srcIdx: number = 0;
-  importDlg: CustomDialogController = new CustomDialogController({
-    builder: CustomImportDialog({
-      initialUrl: this.importUrl,
-      initialText: this.customText,
-      darkMode: this.dark,
-      accentColor: this.accent(),
-      onUrl: (u: string) => {
-        this.importUrl = u;
-        this.importIpUrl();
-      },
-      onFile: () => { this.importIpFile(); },
-      onSave: (t: string) => {
-        this.customText = t.trim();
-        this.mode = ScanMode.CUSTOM;
-        this.srcIdx = 3;
-        this.scheduleScanSave();
-        this.toast(this.customText.length > 0 ? this.t('已保存自定义来源', 'Custom source saved') : this.t('自定义来源已清空', 'Custom source cleared'));
-      }
-    }),
-    autoCancel: true,
-    customStyle: true
-  });
+  // ===== 候选来源分组管理 =====
+  // V4 / V6 的选择、分组、来源分别在 Sources 里独立保存（selV4/selV6、按 family 分组），
+  // 这里所有界面都只读当前 IP 族的数据，切换 V4/V6 = 换一整套来源。
+  /** 来源模型版本号：Sources 变更后 +1，用来强制刷新依赖它的只读数据 */
+  @State srcRev: number = 0;
+  /** 分组管理页是否打开 */
+  @State srcMgr: boolean = false;
+  /** 0=分组列表 1=分组详情 2=添加链接 3=粘贴文本 4=编辑来源内容 */
+  @State srcMgrView: number = 0;
+  /** 当前管理的分组 id（仅自定义分组） */
+  @State srcMgrGid: string = '';
+  @State srcMgrBusy: boolean = false;
+  /** 管理页内的结果提示（成功/拒绝数量、错误原因） */
+  @State srcMgrMsg: string = '';
+  @State srcNewName: string = '';
+  @State srcNameDraft: string = '';
+  @State srcRename: boolean = false;
+  @State srcLinkDraft: string = '';
+  @State srcPasteDraft: string = '';
+  /** 删除分组的内联二次确认 */
+  @State srcConfirmGroup: boolean = false;
+  /** 待删除来源 id（'' = 没有待确认的删除） */
+  @State srcConfirmSrc: string = '';
+  @State srcShowQuarantine: boolean = false;
+  /** 正在编辑内容的来源 id（'' = 未进入编辑） */
+  @State srcEditSid: string = '';
+  /** 来源内容编辑草稿（按行；保存时按当前 IP 版本重新校验） */
+  @State srcEditDraft: string = '';
   @State sampleText: string = '2000';
   @State cfgRev: number = 0;
   /** 扫描页「高级选项」是否展开（默认收起，压缩页面长度） */
   @State advParamOpen: boolean = false;
-  @State showParamNotes: boolean = false;
+  /** 当前打开的功能说明：空字符串表示关闭（title/正文统一由 HelpText 提供） */
+  @State helpKey: string = '';
   /** 冷启动时的应用内启动页：用应用主题渲染，覆盖系统启动窗口与首帧之间的空档 */
-  /** 宽屏扫描页左列实测高度（vp），用于把第二列卡片底部撑到同一水平线 */
-  @State scanLeftColH: number = 0;
-
-  /** 宽屏下第二列卡片的最小高度：左列高度减去卡片自身下外边距；手机端返回 0（不干预） */
-  private speedCardMinH(): number {
-    if (this.winW < 900 || this.scanLeftColH <= 12) {
-      return 0;
-    }
-    return this.scanLeftColH - 12;
-  }
   /** 更新日志中当前展开的版本号，空串表示全部折叠 */
   @State changelogOpen: string = '';
   /** 测速页「高级选项」是否展开 */
-  @State advSpeedOpen: boolean = false;
   @State advUploadOpen: boolean = false;
   @State bgAdvancedOpen: boolean = false;
   @State concurrencyText: string = defaultScanConcurrency().toString();
-  @State latencyText: string = '300';
+  @State latencyText: string = REC_LATENCY_MS.toString();
   /** 延迟上限建议提示（随 IPv4/IPv6 变化） */
   @State latencyHint: string = '';
+  /** 当前实际生效的背景图（渲染用：跟随实际深浅色自动取 bgLight / bgDark） */
   @State bgPath: string = '';
+  /** 本次运行内背景图加载失败（只临时回落渐变，不改用户配置） */
+  @State bgLoadFailed: boolean = false;
+  /** 浅色模式背景图（空串=该模式使用默认背景） */
+  @State bgLight: string = '';
+  /** 深色模式背景图（空串=该模式使用默认背景） */
+  @State bgDark: string = '';
+  /** 背景图编辑目标：false=正在设置浅色背景，true=正在设置深色背景 */
+  /** 系统深浅色变化计数（EntryAbility 在「跟随系统」时递增） */
+  @StorageLink('sysThemeTick') @Watch('onSysThemeTick') sysThemeTick: number = 0;
+  /** 系统深浅色（EntryAbility 里 Environment.envProp 订阅，跟随系统时用它重算） */
+  @StorageProp('colorMode') @Watch('onSysColorMode') colorMode: number = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
   /** 底部胶囊拖动时的指尖 x（-1 表示未触摸） */
-  @State pingText: string = '1';
-  @State speedCountText: string = '10';
-  @State speedRoundsText: string = '1';
-  @State speedWindowText: string = '3000';
+  @State pingText: string = REC_PING_TIMES.toString();
+  @State speedCountText: string = REC_SPEED_COUNT.toString();
+  @State speedRoundsText: string = REC_SPEED_ROUNDS.toString();
+  @State speedWindowText: string = REC_SPEED_WINDOW_MS.toString();
   /** 合格速度（MB/s），低于该值的测速结果会被淘汰，默认 0.1 */
-  @State minSpeedText: string = '0.1';
+  @State minSpeedText: string = REC_MIN_SPEED_MBPS.toString();
   @State enableSpeed: boolean = true;
   @State speedScope: number = SpeedScope.ALL;
-  @State speedPerRegionText: string = '3';
+  @State speedPerRegionText: string = REC_SPEED_PER_REGION.toString();
   @State domain: string = '';
   @State keepAlive: boolean = false;
   @State domainSampling: boolean = false;
@@ -591,9 +321,11 @@ struct Index {
   /** 手机：当前内嵌展开的分类（默认展开「外观与主题」） */
   @State settingsAccordion: number = 0;   // 已废弃：手机改为分类详情页，保留字段避免其他地方引用报错
   /** 平板/电脑：左侧菜单选中的分类（默认外观与主题） */
-  @State settingsPane: number = 0;
-  private settingsSubScroller: Scroller = new Scroller();
+  /** 平板/电脑右侧默认展示「订阅与上传」（2），手机默认不展开任何分类 */
+  @State settingsPane: number = 2;
   private settingsScrollCache: number = 0;
+  /** 手机设置二级页的浏览历史（首页不压栈），用于系统返回与返回按钮逐级回退 */
+  private settingsStack: SettingsFrame[] = [];
   // ===== 更新检查 =====
   @State updStatus: number = UpdateStatus.IDLE;
   @State updDetail: string = '';
@@ -777,6 +509,12 @@ struct Index {
     // EntryAbility 已在进程启动时同步读过主题偏好；拿不到才退回系统颜色
     const cached: boolean | undefined = AppStorage.get<boolean>('initialDark');
     this.dark = cached !== undefined ? cached : this.systemDark();
+    // 背景图同样用进程启动时的预读值，首帧就是用户上次选的那张，不会先画渐变再跳图
+    const gl: string | undefined = AppStorage.get<string>('initialBgLight');
+    const gd: string | undefined = AppStorage.get<string>('initialBgDark');
+    this.bgLight = gl !== undefined ? gl : '';
+    this.bgDark = gd !== undefined ? gd : '';
+    this.applyEffectiveBg();
     this.checkNetwork();
     this.checkProxyEnv();
     ConfigStore.init(this.ctx).then(() => {
@@ -829,10 +567,34 @@ struct Index {
       clearTimeout(this.entranceTimer);
       this.entranceTimer = -1;
     }
+    // 退出前把还压在防抖队列里的参数落盘，避免「改完立刻退出」丢掉最后一次输入
+    if (this.scanSaveTimer >= 0) {
+      clearTimeout(this.scanSaveTimer);
+      this.scanSaveTimer = -1;
+      ConfigStore.save(this.buildConfig()).then(() => {
+        return;
+      }).catch(() => {
+      });
+    }
+    this.clearScanTimers();
+    this.stopHeartbeat();
     this.token.cancel();
   }
   /** 系统当前是否深色 */
   private systemDark(): boolean {
+    // 能力侧（EntryAbility.onCreate / onForeground / onConfigurationUpdate）会刷新这个值，
+    // 它比页面自己的缓存更早拿到系统变更，因此优先用它。
+    const sd: boolean | undefined = AppStorage.get<boolean>('sysDark');
+    if (sd !== undefined) {
+      return sd;
+    }
+    const cm: number | undefined = AppStorage.get<number>('colorMode');
+    if (cm === ConfigurationConstant.ColorMode.COLOR_MODE_DARK) {
+      return true;
+    }
+    if (cm === ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT) {
+      return false;
+    }
     try {
       const c: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
       return c.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
@@ -852,6 +614,8 @@ struct Index {
     }
     BarStyle.apply(this.dark);
     this.syncSystemColorMode();
+    // 主题变了就切换到同一模式的背景图（浅色图/深色图互不覆盖）
+    this.applyEffectiveBg();
     this.runEntrance(false);
   }
 
@@ -890,7 +654,6 @@ struct Index {
     this.cfg = c;
     this.mode = c.mode;
     this.ipVersion = c.ipVersion;
-    this.srcIdx = this.mode === ScanMode.OFFICIAL ? 0 : 3;
     this.port = c.port;
     this.customText = c.customText;
     this.sampleText = c.sampleCount.toString();
@@ -901,7 +664,8 @@ struct Index {
     this.speedRoundsText = c.speedRounds.toString();
     this.speedWindowText = c.speedWindowMs.toString();
     this.minSpeedText = c.minSpeedMbps.toString();
-    this.enableSpeed = c.enableSpeed;
+    // 下载测速开关已移除：始终开启（旧配置里被关闭的也一律恢复）
+    this.enableSpeed = true;
     this.speedScope = c.speedScope;
     this.speedPerRegionText = c.speedPerRegion.toString();
     this.domain = c.domain;
@@ -910,16 +674,101 @@ struct Index {
     AppBackground.enabled = this.keepAlive;
     this.regionCode = c.regionCode;
     this.latencyHint = this.t('建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）', 'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
-    this.bgPath = ConfigStore.bgPath();
+    // v1→v2：旧版单一背景图复制进浅色/深色两套（同步完成，避免读到半迁移状态）
+    ConfigStore.migrateBgPathsSync();
+    this.bgLight = ConfigStore.bgPathFor(false);
+    this.bgDark = ConfigStore.bgPathFor(true);
+    this.applyEffectiveBg();
+    // 来源分组模型：读取（首次启动时迁移旧版 scan_custom），迁移提示与当前选中项异常都进日志。
+    // 注意这里是异步的：Sources 未就绪前页面不生成候选文本，startScan 里还会按当前族重编译一次兜底。
+    Sources.load(c).then((note: string) => {
+      this.srcRev++;
+      const err: string = this.applySelection(false);
+      if (note.length > 0) {
+        this.addLog(note);
+        this.toast(note);
+      }
+      if (err.length > 0) {
+        this.addLog(this.t('候选来源：', 'Candidate source: ') + err);
+      }
+    }).catch((e: BusinessError) => {
+      this.addLog(this.t('读取候选来源失败：', 'Failed to load sources: ') + e.message);
+    });
   }
 
-  /** 选择一张本地图片作为应用背景（复制进沙箱，卸载前一直可用） */
+  /** 当前生效的背景图：跟随实际深浅色取对应那一套 */
+  private applyEffectiveBg(): void {
+    this.bgPath = this.dark ? this.bgDark : this.bgLight;
+    this.bgLoadFailed = false;
+  }
+
+  /** 指定模式的背景图路径（空串 = 该模式默认渐变背景） */
+  private bgFor(dark: boolean): string {
+    return dark ? this.bgDark : this.bgLight;
+  }
+
+  /** 写入某一模式的背景图并持久化；另一套保持不变 */
+  private async setModeBg(dark: boolean, path: string): Promise<void> {
+    if (dark) {
+      this.bgDark = path;
+    } else {
+      this.bgLight = path;
+    }
+    this.applyEffectiveBg();
+    await ConfigStore.saveBgPathFor(dark, path);
+  }
+
+  /** 当前模式的自定义图片路径：深浅色各一个文件，互不覆盖 */
+  private customPathFor(dark: boolean): string {
+    const dir: string = this.ctx !== undefined ? this.ctx.filesDir : '';
+    return dir + (dark ? '/bg_custom_dark.jpg' : '/bg_custom_light.jpg');
+  }
+
+  /** 当前模式是否已经有自定义图片（文件真的存在才算） */
+  private hasCustomImage(): boolean {
+    if (this.ctx === undefined) {
+      return false;
+    }
+    try {
+      // accessSync 直接返回 boolean（文件不存在不抛异常）
+      return fileIo.accessSync(this.customPathFor(this.dark));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 当前背景是否就是当前模式的自定义图片（自定义格子选中态） */
+  private isCustomSelected(): boolean {
+    return this.bgPath.length > 0 && this.bgPath === this.customPathFor(this.dark);
+  }
+
+  /** 系统深浅色变化（AppStorage sysThemeTick，仅「跟随系统」时生效） */
+  private onSysThemeTick(): void {
+    if (this.themeMode !== ThemeMode.SYSTEM) {
+      return;
+    }
+    this.applyThemeMode();
+  }
+
+  /** 系统深浅色变化（AppStorage colorMode，Environment.envProp 订阅） */
+  private onSysColorMode(): void {
+    if (this.themeMode !== ThemeMode.SYSTEM) {
+      return;
+    }
+    this.applyThemeMode();
+  }
+
+  /**
+   * 从图库选一张图片：它成为**当前模式**的专属背景（另一个模式不受影响）。
+   * 用户取消选择或读取失败时不改动已有背景。
+   */
   private async pickBackground(): Promise<void> {
     const ctx = this.ctx;
     if (ctx === undefined) {
       this.toast(this.t('应用上下文未就绪', 'App context not ready'));
       return;
     }
+    const dark: boolean = this.dark;
     try {
       const ph: picker.PhotoViewPicker = new picker.PhotoViewPicker();
       const opt: picker.PhotoSelectOptions = new picker.PhotoSelectOptions();
@@ -929,77 +778,89 @@ struct Index {
       if (res.photoUris.length === 0) {
         return;
       }
-      const dst: string = ctx.filesDir + '/bg_custom.jpg';
+      const dst: string = this.customPathFor(dark);
       const f = fileIo.openSync(res.photoUris[0], fileIo.OpenMode.READ_ONLY);
       fileIo.copyFileSync(f.fd, dst);
       fileIo.closeSync(f);
-      this.bgPath = dst;
-      await ConfigStore.saveBgPath(dst);
-      this.addLog(this.t('已设置自定义背景图', 'Custom background image set'));
-      this.toast(this.t('背景已更新', 'Background updated'));
+      await this.setModeBg(dark, dst);
+      const which: string = dark ? this.t('深色', 'dark') : this.t('浅色', 'light');
+      this.addLog(which + this.t('模式已设置自定义背景图', ' mode custom background set'));
+      this.toast(which + this.t('模式背景已更新', ' background updated'));
     } catch (e) {
       const err = e as BusinessError;
       this.toast(this.t('选择背景失败：', 'Failed to select background: ') + err.message);
     }
   }
 
-  /** 恢复默认渐变背景 */
+  /** 「无」格子：清掉**当前模式**的背景选择（只回落到该模式的默认渐变） */
   private async clearBackground(): Promise<void> {
-    this.bgPath = '';
-    await ConfigStore.saveBgPath('');
-    this.addLog(this.t('已恢复默认渐变背景', 'Default gradient background restored'));
-    this.toast(this.t('已恢复默认背景', 'Default background restored'));
+    const dark: boolean = this.dark;
+    await this.setModeBg(dark, '');
+    const which: string = dark ? this.t('深色', 'dark') : this.t('浅色', 'light');
+    this.addLog(which + this.t('模式已恢复默认背景', ' mode default background restored'));
+    this.toast(which + this.t('模式已恢复默认背景', ' mode default background restored'));
   }
 
-  /** 当前生效的预设背景序号，-1 表示未使用预设 */
+  /** 当前模式正在使用的内置预设序号，-1 表示不是预设背景 */
   private presetBgIndex(): number {
-    if (this.bgPath.length === 0) {
+    const p: string = this.bgPath;
+    if (p.length === 0) {
       return -1;
     }
     for (let i = 1; i <= 7; i++) {
-      if (this.bgPath.indexOf('bg_preset_' + i + '.jpg') >= 0) {
+      if (p.indexOf('bg_preset_' + i + '.jpg') >= 0 || p.indexOf('bg_preset_' + i + '_') >= 0) {
         return i - 1;
       }
     }
     return -1;
   }
 
-  /** 背景图状态文案 */
+  /** 当前模式的背景状态文案 */
   private bgPathLabel(): string {
+    if (this.bgPath.length === 0) {
+      return this.dark
+        ? this.t('当前：默认深色渐变背景', 'Current: default dark gradient')
+        : this.t('当前：默认浅色渐变背景', 'Current: default light gradient');
+    }
     const p: number = this.presetBgIndex();
     if (p >= 0) {
       return this.t('当前：预设背景 ', 'Current: preset background ') + (p + 1);
     }
-    if (this.bgPath.length > 0) {
-      return this.t('当前：图库自定义图片', 'Current: custom image from gallery');
-    }
-    return this.t('默认使用渐变背景', 'Uses the gradient background by default');
+    return this.t('当前：图库自定义图片', 'Current: custom image from gallery');
   }
 
-  /** 应用内置预设背景：从 rawfile 复制进沙箱，与图库选择共用同一条渲染/持久化路径 */
+  /** 当前模式是否已有背景（「无」格子的选中态） */
+  private hasBg(): boolean {
+    return this.bgPath.length > 0;
+  }
+
+  /** 应用内置预设背景：复制进沙箱，文件按深浅色分开，和自定义图片共用同一条渲染/持久化路径 */
   private async usePresetBackground(index: number): Promise<void> {
     const ctx = this.ctx;
     if (ctx === undefined) {
       this.toast(this.t('应用上下文未就绪', 'App context not ready'));
       return;
     }
+    const dark: boolean = this.dark;
     try {
       const raw: string = 'bg/preset' + (index + 1) + '.jpg';
       const buf: Uint8Array = ctx.resourceManager.getRawFileContentSync(raw);
-      const dst: string = ctx.filesDir + '/bg_preset_' + (index + 1) + '.jpg';
+      const dst: string = ctx.filesDir + '/bg_preset_' + (index + 1) +
+        (dark ? '_dark' : '_light') + '.jpg';
       const f = fileIo.openSync(dst,
         fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
       fileIo.writeSync(f.fd, buf.buffer as ArrayBuffer);
       fileIo.closeSync(f);
-      this.bgPath = dst;
-      await ConfigStore.saveBgPath(dst);
-      this.addLog(this.t('已应用预设背景 ', 'Preset background applied: ') + (index + 1));
-      this.toast(this.t('背景已更新', 'Background updated'));
+      await this.setModeBg(dark, dst);
+      const which: string = dark ? this.t('深色', 'dark') : this.t('浅色', 'light');
+      this.addLog(which + this.t('模式已应用预设背景 ', ' mode preset applied: ') + (index + 1));
+      this.toast(which + this.t('模式背景已更新', ' background updated'));
     } catch (e) {
       const err = e as BusinessError;
       this.toast(this.t('应用预设背景失败：', 'Failed to apply preset background: ') + err.message);
     }
   }
+
   /** 进度条左侧文案：同时显示成功/失败数，避免「整数进度」看不出失败 */
   progressLabel(): string {
     if (this.total <= 0) {
@@ -1043,8 +904,12 @@ struct Index {
       mode: this.mode === ScanMode.CUSTOM ? ScanMode.CUSTOM : ScanMode.OFFICIAL,
       ipVersion: this.ipVersion === IpVersion.V6 ? IpVersion.V6 : IpVersion.V4,
       port: this.port,
-      sampleCount: Math.max(1, this.intOf(this.sampleText, d.sampleCount)),
+      // 0 = 不抽样，直接把全部段各取 1 个地址（社区段库 / 官方段库全量候选）
+      sampleCount: Math.min(50000, Math.max(0, this.intOf(this.sampleText, d.sampleCount))),
       customText: this.customText,
+      // 记录当前分组，仅用于扫描日志/诊断；真正的候选文本是 customText（由 Sources.compile 生成）
+      sourceGroupId: this.curSel(),
+      sourceGroupName: Sources.selectionLabel(this.curFam(), this.curSel()),
       pingTimes: Math.max(1, Math.min(5, this.intOf(this.pingText, d.pingTimes))),
       pingIntervalMs: d.pingIntervalMs,
       pingTimeoutMs: this.ipVersion === IpVersion.V6 ? 3000 : d.pingTimeoutMs,
@@ -1112,19 +977,55 @@ struct Index {
     if (field === 'minSpeed') {
       return this.minSpeedText;
     }
+    if (field === 'perRegion') {
+      return this.speedPerRegionText;
+    }
+    if (field === 'speedCount') {
+      return this.speedCountText;
+    }
+    if (field === 'rounds') {
+      return this.speedRoundsText;
+    }
+    if (field === 'window') {
+      return this.speedWindowText;
+    }
+    if (field === 'domain') {
+      return this.domain;
+    }
     return '';
   }
 
-  private applySuggestedParams(): void {
-    this.sampleText = '3000';
-    this.concurrencyText = '30';
-    this.latencyText = '300';
-    this.pingText = '1';
-    this.minSpeedText = '0.1';
-    // 全部写完再换一次 id：TextInput 的 text 只作初值，需重建才能回显被抳截/规范化后的值
+  private async applySuggestedParams(): Promise<void> {
+    this.sampleText = REC_SAMPLE_COUNT.toString();
+    this.concurrencyText = defaultScanConcurrency().toString();
+    this.latencyText = REC_LATENCY_MS.toString();
+    this.pingText = REC_PING_TIMES.toString();
+    this.minSpeedText = REC_MIN_SPEED_MBPS.toString();
+    // 全部写完再换一次 id：TextInput 的 text 只作初值，需重建才能回显被裁截/规范化后的值
     this.cfgRev++;
-    this.scheduleScanSave();
-    this.toast(this.t('已应用建议参数：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s（IPv4/IPv6 统一）', 'Applied recommended settings: 3000 samples, 30 threads, 300ms latency cap, 1 ping, 0.1MB/s min speed (same for IPv4/IPv6)'));
+    try {
+      await ConfigStore.save(this.buildConfig());
+      this.toast(this.t('已应用建议参数：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s（IPv4/IPv6 统一）', 'Applied recommended settings: 3000 samples, 30 threads, 300ms latency cap, 1 ping, 0.1MB/s min speed (same for IPv4/IPv6)'));
+    } catch (e) {
+      const be: BusinessError = e as BusinessError;
+      this.toast(this.t('应用建议失败：保存参数出错（', 'Failed to apply: saving settings failed (') + be.message + ')');
+    }
+  }
+
+  /** 「下载测速」卡的应用建议：只改测速相关参数，扫描参数不动 */
+  private async applySpeedSuggestions(): Promise<void> {
+    this.speedCountText = REC_SPEED_COUNT.toString();
+    this.speedPerRegionText = REC_SPEED_PER_REGION.toString();
+    this.speedRoundsText = REC_SPEED_ROUNDS.toString();
+    this.speedWindowText = REC_SPEED_WINDOW_MS.toString();
+    this.cfgRev++;
+    try {
+      await ConfigStore.save(this.buildConfig());
+      this.toast(this.t('已应用建议：每地址 1 次、窗口 6000ms、地址数 10（地区测速每地区 3 个）', 'Applied recommendations: 1 round per address, 6000ms window, 10 addresses (3 per region for region mode)'));
+    } catch (e) {
+      const be: BusinessError = e as BusinessError;
+      this.toast(this.t('应用建议失败：保存参数出错（', 'Failed to apply: saving settings failed (') + be.message + ')');
+    }
   }
 
   /** 滚动回调：只在跨越阈值时改 @State，避免滚动过程中每帧重建整个页面 */
@@ -1239,6 +1140,26 @@ struct Index {
       this.toast(this.t('没有网络连接，无法开始扫描', 'No network connection; cannot start scanning'));
       return;
     }
+    // 扫描前按当前 IP 族重新编译一次来源：历史数据、缓存、异常配置都会在这里再过一遍严格校验。
+    // 当前族没有可用来源时明确报错并中止，绝不自动回退到另一族来源。
+    const sel: string = this.curSel();
+    this.mode = sel === SRC_ID_OFFICIAL ? ScanMode.OFFICIAL : ScanMode.CUSTOM;
+    if (sel !== SRC_ID_OFFICIAL) {
+      const cr: CompileResult = Sources.compile(this.curFam(), sel);
+      if (!cr.ok || cr.lineCount === 0) {
+        const why: string = cr.error.length > 0 ? cr.error : this.t('当前来源没有可用候选数据', 'The selected source has no usable candidates');
+        this.toast(why);
+        this.addLog(this.t('无法开始扫描：', 'Cannot start scanning: ') + why);
+        return;
+      }
+      this.customText = cr.text;
+      this.hlog('[SRC] scan fam=' + this.curFam().toString() + ' group=' + cr.label +
+        ' sources=' + cr.sourceCount.toString() + '/' + cr.enabledCount.toString() +
+        ' lines=' + cr.lineCount.toString() + ' wrong=' + cr.wrongFamily.toString());
+      if (cr.wrongFamily > 0) {
+        this.addLog(this.t('类型校验：来源中剔除了 ', 'Type check: dropped ') + cr.wrongFamily.toString() + this.t(' 行不属于当前 IP 版本的地址', ' lines not belonging to the current IP version'));
+      }
+    }
     const c: ScanConfig = this.buildConfig();
     this.cfg = c;
     ConfigStore.save(c).then(() => {
@@ -1253,6 +1174,7 @@ struct Index {
     const myToken: CancellationToken = this.token;
     this.clearScanTimers();
     this.scanning = true;
+    this.taskKind = 1;
     AppBackground.hold('scan');
     setTimeout(() => { this.addLog(this.t('后台保活：', 'Background keep-alive: ') + AppBackground.lastState); }, 1500);
     this.startHeartbeat(gen);
@@ -1396,6 +1318,7 @@ struct Index {
   /** 第一轮结束后：对通过节点做质量预检；达标足够才进正式测速 */
   private async runPrecheck(gen: number, c: ScanConfig, myToken: CancellationToken): Promise<void> {
     this.precheckActive = true;
+    this.taskKind = 2;
     this.precheckDone = false;
     this.pcChecked = 0;
     this.pcQualified = 0;
@@ -1456,12 +1379,17 @@ struct Index {
     try {
       const res: PrecheckResult = await Scanner.stagePrecheck(c, this.pingList.slice(), hooks, myToken);
       if (!alive()) {
+        // 被停止或被新一轮顶掉：必须复位预检态，否则按钮会永远卡在「预检中…」
+        this.precheckActive = false;
         return;
       }
       this.precheckActive = false;
       this.precheckDone = true;
       this.scanning = false;
       if (res.cancelled) {
+        // 取消不算「预检完成」，否则下次点开始测速会直接跳过质量预检
+        this.precheckDone = false;
+        this.taskKind = 0;
         this.phaseText = this.t('已停止', 'Stopped');
         this.pcMsg = this.t('预检已取消', 'Pre-check cancelled');
         this.addLog(this.t('已停止：质量预检未完成', 'Stopped: quality pre-check not finished'));
@@ -1469,6 +1397,9 @@ struct Index {
         return;
       }
       if (res.list.length === 0) {
+        // 0 个达标同样不算完成：保留 0 达标提示，但不给「已预检」资格
+        this.precheckDone = false;
+        this.taskKind = 0;
         this.pcMsg = this.t('预检后没有达标节点', 'No nodes met the target after pre-check');
         this.phaseText = this.t('预检完成：0 个达标', 'Pre-check complete: 0 met target');
         this.addLog(this.t('质量预检结束：检测 ', 'Quality pre-check finished: checked ') + res.checked.toString() + this.t(' 个，0 个达标；可调低「合格速度」或检查网络', ' nodes, 0 met target; lower "Min speed" or check your network'));
@@ -1501,6 +1432,12 @@ struct Index {
   /** 筛选页「开始测速」：没预检过就先预检，预检过就直接测速 */
   onStartSpeedClick(): void {
     if (this.scanning) {
+      // 不许静默失败：告诉用户为什么点不动、去哪看当前进度
+      this.toast(this.taskKind === 3
+        ? this.t('测速进行中，可先停止当前测速', 'A speed test is running; stop it first')
+        : (this.taskKind === 2
+          ? this.t('质量预检进行中，请稍候', 'Quality pre-check is running, please wait')
+          : this.t('扫描进行中，等第一轮筛选完成后再测速', 'Scanning is running; wait for round 1 to finish')));
       return;
     }
     if (this.pingList.length === 0) {
@@ -1550,6 +1487,7 @@ struct Index {
     const myToken: CancellationToken = this.token;
     this.clearScanTimers();
     this.scanning = true;
+    this.taskKind = 3;
     this.startHeartbeat(gen);
     this.done = 0;
     this.total = 0;
@@ -1656,15 +1594,33 @@ struct Index {
     // 1) 递增代次：让所有旧任务的回调（进度/结果/日志/阶段）立刻失效；
     // 2) 取消本轮令牌：正在执行的并发池在安全点停下；
     // 3) 清掉节流定时器与心跳，避免停后还有一次“迟到写入”。
+    const kind: number = this.taskKind;
     this.scanGen++;
     this.token.cancel();
     this.scanning = false;
+    this.taskKind = 0;
     this.clearScanTimers();
     this.stopHeartbeat();
     this.phaseText = this.t('已停止', 'Stopped');
-    this.addLog(this.t('用户停止了扫描', 'User stopped the scan'));
+    this.addLog(kind === 2
+      ? this.t('用户停止了质量预检', 'User stopped the quality pre-check')
+      : (kind === 3 ? this.t('用户停止了测速', 'User stopped the speed test') : this.t('用户停止了扫描', 'User stopped the scan')));
     AppBackground.release('scan');
     AppBackground.release('speed');
+  }
+
+  /** 扫描页主按钮文案：按当前任务类型区分「停止什么」，空闲时是开始入口 */
+  private scanButtonLabel(): string {
+    if (!this.scanning) {
+      return this.t('开始优选', 'Start selection');
+    }
+    if (this.taskKind === 3) {
+      return this.t('停止测速', 'Stop speed test');
+    }
+    if (this.taskKind === 2) {
+      return this.t('停止预检', 'Stop pre-check');
+    }
+    return this.t('停止', 'Stop');
   }
 
   /** 清掉进度/结果/日志的节流定时器，防止旧一轮的迟到刷新覆盖新任务 */
@@ -1716,6 +1672,10 @@ struct Index {
     this.failed = this.failedRaw;
     if (this.scanning && this.progTimer < 0) {
       this.scheduleProgressSync();
+    }
+    // 跟随系统：回到前台时按最新系统深浅色重算一次（后台期间用户可能在系统里切过主题）
+    if (this.themeMode === ThemeMode.SYSTEM) {
+      this.applyThemeMode();
     }
   }
 
@@ -1810,7 +1770,7 @@ struct Index {
     Stack({ alignContent: Alignment.BottomEnd }) {
       // 页面底色：有自定义背景图时用图片（objectFit Cover 自适应手机/平板/电脑），
       // 并在其上叠一层半透明蒙版保证文字可读；没设置时回落到渐变。
-      if (this.bgPath.length > 0) {
+      if (this.bgPath.length > 0 && !this.bgLoadFailed) {
         Image('file://' + this.bgPath)
           .width('100%')
           .height('100%')
@@ -1818,11 +1778,18 @@ struct Index {
           .blur(this.bgBlurPx())
           .brightness(this.bgBrightFactor())
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        // 自定义背景图模式：不再叠加整屏主题遮罩，保留图片原始色彩与明暗；
-        // 可读性由卡片自身材质/文字颜色保证（cardLevelAlpha/cardTint 已针对图片模式抬高）
-        Blank()
+          .onError(() => {
+            // 背景文件被删/损坏：本次运行先回落到渐变，但不动用户已保存的背景设置
+            this.bgLoadFailed = true;
+            this.toast(this.t('背景图读取失败，已临时使用默认背景', 'Failed to load the background; using the default for now'));
+          })
+        // 可读性薄纱：浅色压白、深色压黑，保留模糊与图片层次
+        Column()
           .width('100%')
-          .height(0)
+          .height('100%')
+          .backgroundColor(this.bgScrim())
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .hitTestBehavior(HitTestMode.None)
       } else {
         Column()
           .width('100%')
@@ -1872,18 +1839,19 @@ struct Index {
                 Blank()
                 Text(this.themeLabel())
                   .fontSize(12)
-                  .fontColor(this.txt2())
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.txt())
                   .textAlign(TextAlign.Center)
                   .height(this.CHIP_H)
-                  .padding({ left: 12, right: 12 })
+                  .padding({ left: 14, right: 14 })
                   .borderRadius(this.CHIP_H / 2)
-                  .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : this.soft())
+                  .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : this.floatFallbackBg())
                   .linearGradient({ angle: 180, colors: this.floatSheen() })
-                  .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.COMPONENT_THIN : BlurStyle.NONE)
+                  .backgroundBlurStyle(this.floatBlur())
                   .border({ width: 1, color: this.navGlassBorder() })
                 .shadow({
-                  radius: this.dark ? 12 : 14,
-                  color: this.dark ? 'rgba(0,0,0,0.5)' : 'rgba(15,23,42,0.12)',
+                  radius: this.floatShadowR(),
+                  color: this.floatShadowColor(),
                   offsetX: 0,
                   offsetY: 4
                 })
@@ -1948,13 +1916,13 @@ struct Index {
         .width(this.fabSize())
         .height(this.fabSize())
         .borderRadius(this.fabSize() / 2)
-        .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : (this.dark ? 'rgba(39,39,46,0.92)' : 'rgba(255,255,255,0.94)'))
+        .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : this.floatFallbackBg())
         .linearGradient({ angle: 180, colors: this.floatSheen() })
-        .backgroundBlurStyle(this.shouldUseCardMaterial() ? BlurStyle.COMPONENT_THIN : BlurStyle.NONE)
+        .backgroundBlurStyle(this.floatBlur())
         .border({ width: 1, color: this.navGlassBorder() })
         .shadow({
-          radius: this.dark ? 16 : 18,
-          color: this.dark ? 'rgba(0,0,0,0.55)' : 'rgba(15,23,42,0.16)',
+          radius: this.floatShadowR(),
+          color: this.floatShadowColor(),
           offsetX: 0,
           offsetY: 6
         })
@@ -1976,9 +1944,14 @@ struct Index {
         })
       }
 
-      // 参数说明：整屏轻量弹窗（点击遮罩或「知道了」关闭，输入内容不受影响）
-      if (this.showParamNotes) {
-        this.ParamNotesSheet()
+      // 来源分组管理：整屏面板（在参数说明弹窗之下，保证参数说明仍可盖住它）
+      if (this.srcMgr) {
+        this.SourceManager()
+      }
+
+      // 功能说明：统一入口，整屏轻量弹窗（点击遮罩或「知道了」关闭，输入内容不受影响）
+      if (this.helpKey.length > 0) {
+        this.HelpSheet()
       }
     }
     .width('100%')
@@ -2013,50 +1986,113 @@ struct Index {
     .padding({ left: 20, right: 20 })
   }
 
-  @Builder ActionBar() {
+  /** 全局进度区：扫描 / 筛选 / 测速三页共用同一套视觉（纤细、无卡片容器） */
+  @Builder ProgressStrip(kind: number) {
     Column() {
-
-      // 进度条独占一行；说明文字放到进度条下方，避免和进度条抢宽度
-      Column() {
-        Stack({ alignContent: Alignment.Start }) {
-          Row()
-            .width('100%')
-            .height(9)
-            .backgroundColor(this.soft())
-            .borderRadius(3)
-          Row()
-            .width(((this.total > 0 ? this.done / this.total : 0) * 100).toFixed(1) + '%')
-            .height(9)
-            .linearGradient({
-              angle: 90,
-              colors: this.progressTint()
-            })
-            .borderRadius(3)
-        }
-        .width('100%')
-        .height(9)
-        Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
-          Text(this.progressLabel())
-            .fontSize(12)
-            .fontColor(this.txt3())
-            .margin({ right: 12, top: 6 })
-          if (this.pingList.length > 0) {
-            Text(this.t('可用 ', 'Available ') + this.pingList.length.toString() + this.t(' 个', ' nodes'))
-              .fontSize(12)
-              .fontColor(this.txt3())
-              .margin({ top: 6 })
-          }
-        }
-        .width('100%')
+      Row() {
+        Text(this.progStage(kind))
+          .fontSize(12)
+          .lineHeight(16)
+          .fontColor(this.progRunning(kind) ? this.accentText() : this.txt2())
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        Text(this.progCounter(kind))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ left: 8 })
       }
       .width('100%')
-      .alignItems(HorizontalAlign.Start)
-      .margin({ top: 10 })
+
+      Stack({ alignContent: Alignment.Start }) {
+        Row()
+          .width('100%')
+          .height(8)
+          .backgroundColor(this.soft())
+          .borderRadius(4)
+        Row()
+          .width(this.progPct(kind).toFixed(1) + '%')
+          .height(8)
+          .linearGradient({ angle: 90, colors: this.progressTint() })
+          .borderRadius(4)
+      }
+      .width('100%')
+      .height(8)
+      .margin({ top: 6 })
     }
     .width('100%')
-    .constraintSize({ maxWidth: 1600 })
-    .padding({ left: 0, right: 0, top: 0, bottom: 14 })
+    .alignItems(HorizontalAlign.Start)
   }
+
+  /** 扫描页进度：阶段 + 计数（含通过/未通过与可用数）+ 百分比 */
+  /** 进度数据按 kind 分派：0=扫描 1=筛选预检 2=测速（供 ProgressStrip 在 builder 内读取，保证状态依赖成立） */
+  private progInfo(kind: number): ProgressInfo {
+    if (kind === 1) {
+      return this.precheckProgress();
+    }
+    if (kind === 2) {
+      return this.speedProgress();
+    }
+    return this.scanProgress();
+  }
+
+  private progStage(kind: number): string {
+    return this.progInfo(kind).stage;
+  }
+
+  private progCounter(kind: number): string {
+    return this.progInfo(kind).counter;
+  }
+
+  private progPct(kind: number): number {
+    return this.progInfo(kind).pct;
+  }
+
+  private progRunning(kind: number): boolean {
+    return this.progInfo(kind).running;
+  }
+
+  private scanProgress(): ProgressInfo {
+    const pct: number = this.total > 0 ? Math.min(100, this.done * 100 / this.total) : 0;
+    const running: boolean = this.scanning;
+    const finished: boolean = !running && this.total > 0 && this.done >= this.total;
+    let stage: string = this.t('待开始', 'Not started');
+    if (running) {
+      stage = this.phaseText.length > 0 ? this.phaseText : this.progressLabel();
+    } else if (this.total > 0) {
+      stage = finished ? this.t('已完成', 'Finished') : this.t('已停止', 'Stopped');
+    }
+    let counter: string = this.done.toString() + ' / ' + this.total.toString() + ' · ' + pct.toFixed(1) + '%';
+    if (this.pingList.length > 0) {
+      counter += this.t(' · 可用 ', ' · available ') + this.pingList.length.toString();
+    }
+    return { pct: pct, stage: stage, counter: counter, running: running, finished: finished };
+  }
+
+  /** 筛选页质量预检进度 */
+  private precheckProgress(): ProgressInfo {
+    const pct: number = this.pcBarPct();
+    const running: boolean = this.precheckActive;
+    const finished: boolean = !running && this.precheckDone;
+    const stage: string = running ? this.t('质量预检中', 'Quality pre-check in progress') : this.t('质量预检', 'Quality pre-check');
+    const qual: number = (this.pcTarget > 0 && this.pcQualified > this.pcTarget ? this.pcTarget : this.pcQualified);
+    const counter: string = this.t('检测 ', 'Checked ') + this.pcChecked.toString() +
+      this.t(' · 合格 ', ' · Qualified ') + qual.toString() +
+      this.t(' / 目标 ', ' / Target ') + this.pcTarget.toString() + ' · ' + pct.toFixed(1) + '%';
+    return { pct: pct, stage: stage, counter: counter, running: running, finished: finished };
+  }
+
+  /** 测速页进度 */
+  private speedProgress(): ProgressInfo {
+    const pct: number = this.total > 0 ? Math.min(100, this.done * 100 / this.total) : 0;
+    const running: boolean = this.scanning;
+    const finished: boolean = !running && this.total > 0 && this.done >= this.total;
+    const stage: string = this.phaseText.length > 0 ? this.phaseText : this.t('测速进行中…', 'Speed test in progress…');
+    return { pct: pct, stage: stage, counter: this.progressLabel() + ' · ' + pct.toFixed(1) + '%', running: running, finished: finished };
+  }
+
   /**
    * 光感等级 → 底部胶囊的系统毛玻璃材质。
    * 只在这 64vp 的小面积上用 BlurStyle —— 卡片之前用 COMPONENT_THICK 时，
@@ -2087,35 +2123,8 @@ struct Index {
   }
 
   /** 材质着色浓度：越薄越淡，让背景透上来 */
-  private glassTintAlpha(): number {
-    const t: number = this.glassThickness();
-    if (this.dark) {
-      return t <= 1 ? 0.10 : (t === 2 ? 0.14 : 0.18);
-    }
-    return t <= 1 ? 0.08 : (t === 2 ? 0.12 : 0.16);
-  }
 
-  private glassStyleOf(th: number): uiMaterial.ImmersiveStyle {
-    if (th <= 0) {
-      return uiMaterial.ImmersiveStyle.ULTRA_THIN;
-    }
-    if (th === 1) {
-      return uiMaterial.ImmersiveStyle.THIN;
-    }
-    if (th === 2) {
-      return uiMaterial.ImmersiveStyle.REGULAR;
-    }
-    if (th === 3) {
-      return uiMaterial.ImmersiveStyle.THICK;
-    }
-    return uiMaterial.ImmersiveStyle.ULTRA_THICK;
-  }
 
-  private glassModifier(radius: number): AttributeModifier<ToggleAttribute> {
-    const th: number = this.glassThickness();
-    return new GlassCarrierModifier(
-      MatStore.immersive(this.glassStyleOf(th), this.dark, this.glassTintAlpha(), false, false, ''), radius);
-  }
 
   /**
    * 卡片玻璃底：用 Toggle(ToggleType.Button) 承载系统材质。
@@ -2123,26 +2132,6 @@ struct Index {
    * 普通容器（Stack/Column/Row）在内容区设置材质不会渲染。
    * 放在 background 层：不参与布局，不会把卡片撑高，也不拦截交互。
    */
-  @Builder GlassBackdrop() {
-    Stack() {
-      if (this.shouldUseCardMaterial()) {
-        Toggle({ type: ToggleType.Button, isOn: false }) {
-          Text('')
-            .fontSize(0)
-        }
-        .width(LayoutPolicy.matchParent)
-        .height(LayoutPolicy.matchParent)
-        .backgroundColor(Color.Transparent)
-        .enabled(false)
-        .focusable(false)
-        .hitTestBehavior(HitTestMode.None)
-        .attributeModifier(this.glassModifier(20))
-      }
-    }
-    .width('100%')
-    .height('100%')
-    .hitTestBehavior(HitTestMode.None)
-  }
 
   /** 任意 hex 色 + 透明度 → rgba 字符串 */
   private hueRgba(hex: string, alpha: number): string {
@@ -2469,8 +2458,6 @@ struct Index {
    * 把卡片撑高、在页面底部留下大片空白。材质已改由卡片自身的 backgroundBlurStyle + 渐变底色实现，
    * 因此这里保留空实现，只为兼容既有调用点。
    */
-  @Builder MeasuredImmersionCard(cardId: string, cardRadius: number) {
-  }
 
   /** 光感等级对卡片厚度的影响：等级越高卡片越实、阴影越深 */
   /**
@@ -2678,6 +2665,31 @@ struct Index {
     return this.bgBrightPct / 50;
   }
 
+  /**
+   * 背景图之上的可读性蒙版。
+   *
+   * 底图是用户自选的（内置预设多数本身偏暗），浅色主题却仍用深色文字，
+   * 没有蒙版时标题/返回/卡片辅助文字会完全糊在图上。
+   * 这里只叠一层薄纱：模糊、亮度、图片层次全部保留，换来的是一致的最低对比度。
+   */
+  private bgScrim(): ResourceColor {
+    // 上限 0.8，留一点余光；0% 时完全不加纱，喜欢看背景的用户可以拉到最低
+    // 0% 也保留 6% 的薄纱、最高 80%：两头都留余量，避免背景完全压不住文字
+    const a: number = 0.06 + Math.max(0, Math.min(100, this.bgScrimPct)) / 100 * 0.74;
+    return this.dark ? 'rgba(6,8,14,' + a.toFixed(3) + ')' : 'rgba(248,250,253,' + a.toFixed(3) + ')';
+  }
+
+  /**
+   * 模态面（来源管理 / 功能说明 / 更新说明）统一的半透明底。
+   *
+   * 三个弹层此前各用一套「近不透明底 + 模糊 + 渐变」的组合，互相稀释，
+   * 看起来比卡片更厚重。这里只保留一层固定薄纱，其余材质交给
+   * cardBlurStyle / cardTint / cardBorderColor / cardShadow*，与卡片同源。
+   */
+  private modalVeil(): ResourceColor {
+    return this.dark ? 'rgba(18,21,29,0.72)' : 'rgba(250,251,254,0.84)';
+  }
+
   /** 就地双语：zh 为唯一键，en 为英文文案 */
   private t(zh: string, en: string): string {
     return this.langEn ? en : zh;
@@ -2717,6 +2729,8 @@ struct Index {
     this.themeColorIdx = c.themeColor;
     this.bgBlurPct = c.bgBlur;
     this.bgBrightPct = c.bgBright;
+    this.bgScrimPct = c.bgScrim;
+    this.cardClearPct = c.cardClear;
     this.applyLangMode(c.langMode);
   }
 
@@ -2728,6 +2742,8 @@ struct Index {
       themeColor: this.themeColorIdx,
       bgBlur: this.bgBlurPct,
       bgBright: this.bgBrightPct,
+      bgScrim: this.bgScrimPct,
+      cardClear: this.cardClearPct,
       langMode: this.langMode
     };
     ConfigStore.saveUi(c).catch((e: BusinessError) => {
@@ -2737,6 +2753,17 @@ struct Index {
 
   setThemeMode(m: number): void {
     this.themeMode = m;
+    if (m === ThemeMode.SYSTEM) {
+      // 从手动模式切回「跟随系统」时，AppStorage.sysDark 可能还是上一次强制
+      // setColorMode 的结果（例如强制深色把 sysDark 覆成了 true）。先用系统真实
+      // 配置校正一次，否则当帧会按旧值渲染出错误主题，看起来像闪屏。
+      try {
+        const c: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+        AppStorage.setOrCreate<boolean>('sysDark',
+          c.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
+      } catch (e) {
+      }
+    }
     this.applyThemeMode();
     ConfigStore.saveTheme(m).catch((e: BusinessError) => {
       this.addLog(this.t('保存主题失败：', 'Failed to save theme: ') + e.message);
@@ -2798,6 +2825,18 @@ struct Index {
    * 叠在 backgroundBlurStyle 的模糊底之上，才有"有厚度的玻璃"而不是"糊了一层白"。
    * 关闭材质：实心不透明底座，保证任何背景/图片下文字都稳。
    */
+  /** 卡片通透度 → 白纱强度与照片提亮系数：50=默认，0=更实，100=最透 */
+  private cardClearK(): CardClearK {
+    const p: number = Math.max(0, Math.min(100, this.cardClearPct));
+    const d: number = (p - 50) / 50;
+    // 按用户要求把可调幅度翻倍：最透 ≈0.56 倍（纯玻璃）、最实 ≈1.30 倍（厚白纱）
+    const alpha: number = d >= 0 ? (1 - 0.44 * d) : (1 - 0.30 * d);
+    // 照片提亮同步放大：最实时 1.6 倍，最透时归零
+    const lift: number = d >= 0 ? (1 - d) : (1 - d * 0.6);
+    const out: CardClearK = { alpha: alpha, lift: lift };
+    return out;
+  }
+
   private cardTint(): Array<[ResourceColor, number]> {
     const e: number = this.effLevel();
     const photo: number = this.bgPath.length > 0 ? 1 : 0;
@@ -2805,10 +2844,11 @@ struct Index {
       if (e < 0) {
         return [['rgba(36,39,49,0.97)', 0.0], ['rgba(32,35,44,0.97)', 0.55], ['rgba(29,32,40,0.97)', 1.0]];
       }
-      const lift: number = photo * 0.05;
-      const a0: number = (e === 0 ? 0.12 : (e === 1 ? 0.10 : 0.08)) + lift;
-      const a1: number = (e === 0 ? 0.05 : (e === 1 ? 0.045 : 0.04)) + lift * 0.5;
-      const a2: number = e === 0 ? 0.22 : (e === 1 ? 0.18 : 0.14);
+      const ck: CardClearK = this.cardClearK();
+      const lift: number = photo * 0.05 * ck.lift;
+      const a0: number = Math.max(0.03, Math.min(0.99, ((e === 0 ? 0.12 : (e === 1 ? 0.10 : 0.08)) + lift) * ck.alpha));
+      const a1: number = Math.max(0.02, Math.min(0.97, ((e === 0 ? 0.05 : (e === 1 ? 0.045 : 0.04)) + lift * 0.5) * ck.alpha));
+      const a2: number = Math.max(0.06, Math.min(0.99, (e === 0 ? 0.22 : (e === 1 ? 0.18 : 0.14)) * ck.alpha));
       return [['rgba(255,255,255,' + a0.toFixed(3) + ')', 0.0],
         ['rgba(255,255,255,' + a1.toFixed(3) + ')', 0.46],
         ['rgba(8,10,16,' + a2.toFixed(3) + ')', 1.0]];
@@ -2816,10 +2856,11 @@ struct Index {
     if (e < 0) {
       return [['rgba(255,255,255,0.99)', 0.0], ['rgba(252,253,255,0.99)', 0.55], ['rgba(248,250,253,0.99)', 1.0]];
     }
-    const lift: number = photo * 0.06;
-    const b0: number = Math.min(0.82, (e === 0 ? 0.30 : (e === 1 ? 0.40 : 0.52)) + lift);
-    const b1: number = Math.min(0.78, (e === 0 ? 0.20 : (e === 1 ? 0.30 : 0.42)) + lift);
-    const b2: number = Math.min(0.74, (e === 0 ? 0.12 : (e === 1 ? 0.20 : 0.30)) + lift);
+    const ck: CardClearK = this.cardClearK();
+    const lift: number = photo * 0.06 * ck.lift;
+    const b0: number = Math.max(0.10, Math.min(0.99, ((e === 0 ? 0.30 : (e === 1 ? 0.40 : 0.52)) + lift) * ck.alpha));
+    const b1: number = Math.max(0.07, Math.min(0.97, ((e === 0 ? 0.20 : (e === 1 ? 0.30 : 0.42)) + lift) * ck.alpha));
+    const b2: number = Math.max(0.04, Math.min(0.95, ((e === 0 ? 0.12 : (e === 1 ? 0.20 : 0.30)) + lift) * ck.alpha));
     return [['rgba(255,255,255,' + b0.toFixed(3) + ')', 0.0],
       ['rgba(255,255,255,' + b1.toFixed(3) + ')', 0.46],
       ['rgba(255,255,255,' + b2.toFixed(3) + ')', 1.0]];
@@ -3178,114 +3219,6 @@ struct Index {
   }
 
   /** 底部悬浮导航：原生 Tabs（隐藏系统页签）作页面宿主，导航层只负责切页，不做拖动、不做柔光 */
-  @Builder BottomNav() {
-    Row() {
-      Stack() {
-        // ① 系统沉浸材质（对标 OA homeTabsFloatingStyle 的 systemMaterialEffect）
-        // 玻璃背板：材质挂在胶囊本体上（官方 path A：Tabs.barFloatingStyle.systemMaterial），
-        // 拖动中置 undefined + BlurStyle.NONE + 0.25 白，离手恢复 THIN + 0.15 白
-        Column()
-          .width('100%')
-          .height('100%')
-          // §1.5 材质动态切换：拖动关模糊保证跟手，静止恢复 Thin
-          .backgroundBlurStyle(
-            this.navPillDragging ? BlurStyle.NONE : BlurStyle.Thin,
-            { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT }
-          )
-          .backgroundColor(this.navPillDragging
-            ? 'rgba(255,255,255,0.25)'
-            : 'rgba(255,255,255,0.15)')
-        // ② 光感：顶部受光高光 → 中段淡出 → 底边极轻的暗面，形成厚度与弧面感
-        Column()
-          .width('100%')
-          .height('100%')
-          .linearGradient({
-            angle: 180,
-            colors: [
-              [this.dark ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.46)', 0.0],
-              [this.dark ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.16)', 0.42],
-              [this.dark ? 'rgba(0,0,0,0.12)' : 'rgba(15,23,42,0.06)', 1.0]
-            ]
-          })
-        // ③ 光效并入高亮胶囊自身（外发光 + 内高光），天然跟手，不会溢出胶囊
-        // ④ 高亮胶囊：位置与形变只由 navPillX / setPillScale 驱动
-        Column()
-          .width(this.navPillW())
-          .height(46)
-          .borderRadius(23)
-          .backgroundColor(this.accentRgba(this.navGlowOn ? (this.dark ? 0.42 : 0.38) : (this.dark ? 0.30 : 0.26)))
-          .border({ width: 1, color: this.accentRgba(this.navGlowOn ? (this.dark ? 0.55 : 0.50) : (this.dark ? 0.38 : 0.34)) })
-          // 光效只在拖动期存在，静止态 radius 0 完全无光
-          .shadow({
-            radius: this.navGlowOn ? 26 : 0,
-            color: this.accentRgba(this.navGlowOn ? 0.38 : 0),
-            offsetX: 0,
-            offsetY: 0
-          })
-          .scale({ x: this.navPillScaleX(), y: this.navPillScaleY() })
-          .position({ x: this.navPillX - this.navPillW() / 2, y: 8 })
-          .hitTestBehavior(HitTestMode.None)
-        // 胶囊内高光：顶部亮 → 底部弱，读起来是凸起的高亮块
-        Column()
-          .width(this.navPillW())
-          .height(46)
-          .borderRadius(23)
-          .linearGradient({
-            angle: 180,
-            colors: [[this.dark ? 'rgba(255,255,255,0.30)' : 'rgba(255,255,255,0.85)', 0.0],
-              [this.dark ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.30)', 0.55],
-              [this.dark ? 'rgba(255,255,255,0.02)' : 'rgba(255,255,255,0.05)', 1.0]]
-          })
-          .opacity(this.curTab >= 0 ? 0.55 : 0.55)
-          .scale({ x: this.navPillScaleX(), y: this.navPillScaleY() })
-          .position({ x: this.navPillX - this.navPillW() / 2, y: 8 })
-          .hitTestBehavior(HitTestMode.None)
-        // ⑤ 内容层
-        Row() {
-          this.NavItem(0)
-          this.NavItem(1)
-          this.NavItem(2)
-          this.NavItem(3)
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: 6, right: 6, top: 6, bottom: 6 })
-      }
-      .width('100%')
-      .constraintSize({ maxWidth: 360 })
-      .height(62)
-      .borderRadius(31)
-      .clip(true)
-      .systemMaterial(this.navPillDragging ? undefined : this.navMaterial())
-      .border({ width: 1, color: this.navGlassBorder() })
-      .shadow({
-        radius: this.dark ? 20 : 22,
-        color: this.dark ? 'rgba(0,0,0,0.55)' : 'rgba(15,23,42,0.16)',
-        offsetX: 0,
-        offsetY: 8
-      })
-      .gesture(
-        PanGesture({ distance: 1 })
-          .onActionStart((e: GestureEvent) => {
-            this.navPanStart(e);
-          })
-          .onActionUpdate((e: GestureEvent) => {
-            this.navPanUpdate(e);
-          })
-          .onActionEnd(() => {
-            this.navPanEnd();
-          })
-          .onActionCancel(() => {
-            this.navPanEnd();
-          })
-      )
-    }
-    .width('100%')
-    .padding({ left: 24, right: 24 })
-    .justifyContent(FlexAlign.Center)
-    .margin({ bottom: px2vp(this.navBarPx) + 26 })
-    .zIndex(10)
-  }
 
   /** 导航胶囊玻璃：深色更薄、浅色更厚，保证两套主题都能读出层次 */
   /** 悬浮控件受光渐变：与 FloatingNav 的 ② 光感层同源 */
@@ -3314,6 +3247,20 @@ struct Index {
   private navGlassBorder(): string {
     return this.dark ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.85)';
   }
+  /** 悬浮小控件（顶部主题胶囊 / 回到顶部按钮）：与底部悬浮导航同一套「浮起玻璃」配方 */
+  private floatBlur(): BlurStyle {
+    // 与底部悬浮导航一致：薄玻璃（导航用系统材质，实际观感接近 COMPONENT_THIN），不再自加厚玻璃
+    return this.shouldUseCardMaterial() ? BlurStyle.COMPONENT_THIN : BlurStyle.NONE;
+  }
+  private floatFallbackBg(): ResourceColor {
+    return this.dark ? 'rgba(39,39,46,0.92)' : 'rgba(255,255,255,0.94)';
+  }
+  private floatShadowR(): number {
+    return this.dark ? 16 : 18;
+  }
+  private floatShadowColor(): string {
+    return this.dark ? 'rgba(0,0,0,0.55)' : 'rgba(15,23,42,0.16)';
+  }
   /** 单个页签：选中时只加一层淡色圆角底 + 主题色图标/文字，不做发光 */
   /** 选中光：中心亮、四周完全渐隐的径向柔光（没有矩形边界） */
   private navSelGlow(): Array<[ResourceColor, number]> {
@@ -3321,77 +3268,167 @@ struct Index {
     return [[this.accentRgba(hi), 0.0], [this.accentRgba(0.0), 1.0]];
   }
 
-  @Builder NavItem(index: number) {
-    Column() {
-      Stack() {
-        Column() {
-          SymbolGlyph(this.tabIcon(index))
-            .fontSize(20)
-            .fontColor([this.navSel === index ? this.accentText() : this.txt3()])
-          Text(this.tabLabel(index))
-            .fontSize(10)
-            .margin({ top: 2 })
-            .fontWeight(this.navSel === index ? FontWeight.Medium : FontWeight.Normal)
-            .fontColor(this.navSel === index ? this.txt() : this.txt3())
-        }
-        .width('100%')
-        .height(46)
-        .justifyContent(FlexAlign.Center)
-        .backgroundColor(this.navSel === index ? this.soft() : Color.Transparent)
-        .borderRadius(14)
-        .animation({ duration: 180, curve: Curve.EaseOut })
-      }
-      .width('100%')
-      .height(46)
+
+  // ——————————————————— 候选来源：分组模型接线 ———————————————————
+  // 页面上只保留「当前 IP 版本 → 选中来源 → 编译后的候选文本」这一条链路，
+  // 真正的来源数据（分组 / 每条来源 / 启用状态 / 隔离区）都在 Sources 里按 IP 族独立维护。
+
+  /** 当前 IP 版本对应的来源族 */
+  private curFam(): number {
+    return this.ipVersion === IpVersion.V6 ? SRC_FAM_V6 : SRC_FAM_V4;
+  }
+
+  private famText(fam: number): string {
+    return fam === SRC_FAM_V6 ? 'IPv6' : 'IPv4';
+  }
+
+  /** 当前族选中的来源 id（V4 / V6 各存一份，互不影响） */
+  private curSel(): string {
+    return Sources.selected(this.curFam());
+  }
+
+  /**
+   * 建立 @State 依赖：来源数据存在 Sources 的静态表里，改完后靠 srcRev 通知页面刷新。
+   * 任何在 build 路径里读取 Sources 的方法都应该先调一次，否则数据变了界面不会重绘。
+   */
+  private srcTick(): void {
+    if (this.srcRev < 0) {
+      return;
     }
-    .layoutWeight(1)
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
-    .onClick(() => {
-      this.switchTab(index);
-    })
   }
 
-  /** 来源名称 */
+  /**
+   * 来源链路的命令行可观测日志：分组/来源/编译/启停的关键决策都走这里，
+   * 便于 `devecocli log` 或 hdc hilog 验证「V4 只读 V4 来源」是否真的成立。
+   */
+  private hlog(msg: string): void {
+    hilog.info(0x0001, 'cflark', '%{public}s', msg);
+  }
+
+  /** 来源名称（下拉按钮上的文案） */
   private srcLabel(): string {
-    return [this.t('CF 官方 IP 段', 'CF official IP ranges'), this.t('社区 IPv6 段库', 'Community IPv6 ranges'), this.t('社区 IPv4 段库', 'Community IPv4 ranges'), this.t('自定义（文件 / 链接）', 'Custom (file / link)')][this.srcIdx];
+    this.srcTick();
+    return Sources.selectionLabel(this.curFam(), this.curSel());
   }
 
-  /** 来源弹层：与卡片同族玻璃底，选项之间只有发丝分隔线、没有独立圆角 */
+  private menuChoices(): SourceChoice[] {
+    this.srcTick();
+    return Sources.choices(this.curFam());
+  }
+
+  /** 选中项变了：重新编译候选文本、同步扫描模式；返回错误提示（空串=成功） */
+  private applySelection(persist: boolean): string {
+    const fam: number = this.curFam();
+    const sel: string = Sources.selected(fam);
+    const cr: CompileResult = Sources.compile(fam, sel);
+    this.mode = sel === SRC_ID_OFFICIAL ? ScanMode.OFFICIAL : ScanMode.CUSTOM;
+    this.customText = cr.text;
+    this.srcRev++;
+    this.cfgRev++;
+    this.hlog('[SRC] select fam=' + fam.toString() + ' id=' + sel + ' mode=' + this.mode.toString() +
+      ' ok=' + (cr.ok ? '1' : '0') + ' lines=' + cr.lineCount.toString() + ' wrong=' + cr.wrongFamily.toString());
+    if (persist) {
+      this.scheduleScanSave();
+    }
+    return cr.error;
+  }
+
+  /** 切换选中来源；社区段库为空时按当前族自动拉一次（失败就明确报错，不回退另一族） */
+  private async onPickSource(id: string): Promise<void> {
+    const fam: number = this.curFam();
+    if (id === SRC_ID_COMMUNITY && Sources.communityLineCount(fam) === 0) {
+      this.toast(this.t('社区段库为空，正在拉取…', 'Community ranges are empty; fetching…'));
+      const got: boolean = await this.fetchCommunity(fam);
+      if (!got) {
+        return;
+      }
+    }
+    const err: string = await Sources.setSelected(fam, id);
+    if (err.length > 0) {
+      this.toast(err);
+      this.addLog(this.t('切换来源失败：', 'Failed to switch source: ') + err);
+      return;
+    }
+    const cerr: string = this.applySelection(true);
+    if (cerr.length > 0) {
+      this.toast(cerr);
+      this.addLog(this.t('候选来源：', 'Candidate source: ') + cerr);
+    }
+  }
+
+  /** 切换 IP 版本 = 换一整套来源：回到列表根视图，并按新族的选择重新编译候选文本 */
+  private onFamSwitch(ver: number): void {
+    if (this.ipVersion === ver) {
+      return;
+    }
+    this.ipVersion = ver;
+    this.maybeAutoSuggest(ver === IpVersion.V6);
+    this.srcMgrView = 0;
+    this.srcMgrGid = '';
+    this.srcRename = false;
+    this.srcConfirmGroup = false;
+    this.srcConfirmSrc = '';
+    // 切族后上一族的候选、结果、预检资格全部作废：
+    // 否则可能拿旧族的节点去做质量预检/正式测速，进度与结果都会串族
+    this.results = [];
+    this.pingList = [];
+    this.speedList = [];
+    this.groups = [];
+    this.done = 0;
+    this.total = 0;
+    this.doneRaw = 0;
+    this.totalRaw = 0;
+    this.precheckActive = false;
+    this.precheckDone = false;
+    this.pcChecked = 0;
+    this.pcQualified = 0;
+    this.pcTarget = 0;
+    this.pcMsg = '';
+    const e: string = this.applySelection(true);
+    this.srcMgrMsg = e;
+  }
+
+  /** 来源弹层：只列当前 IP 族的官方 / 社区 / 自定义分组，末尾是管理入口 */
   @Builder SourceMenu() {
     Column() {
-      ForEach([0, 1, 2, 3], (i: number) => {
+      ForEach(this.menuChoices(), (ch: SourceChoice) => {
         Column() {
           Row() {
-            Text([this.t('CF 官方 IP 段', 'CF official IP ranges'), this.t('社区 IPv6 段库', 'Community IPv6 ranges'), this.t('社区 IPv4 段库', 'Community IPv4 ranges'), this.t('自定义（文件 / 链接）', 'Custom (file / link)')][i])
+            Text(ch.label)
               .fontSize(13)
-              .fontColor(i === this.srcIdx ? this.accent() : this.txt())
-              .fontWeight(i === this.srcIdx ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(ch.id === this.curSel() ? this.accent() : this.txt())
+              .fontWeight(ch.id === this.curSel() ? FontWeight.Medium : FontWeight.Normal)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
-            if (i === this.srcIdx) {
+            if (ch.builtin) {
+              Text(this.t('内置', 'Built-in'))
+                .fontSize(10)
+                .fontColor(this.txt3())
+                .margin({ left: 6 })
+            }
+            if (ch.id === this.curSel()) {
               Text('✓')
                 .fontSize(12)
                 .fontColor(this.accentText())
+                .margin({ left: 6 })
             }
           }
           .width('100%')
           .height(40)
           .padding({ left: 14, right: 14 })
           .onClick(() => {
-            this.applySource(i);
+            this.onPickSource(ch.id);
           })
-
-          if (i < 3) {
-            Divider()
-              .color(this.lineC())
-              .strokeWidth(0.5)
-              .margin({ left: 14, right: 14 })
-          }
+          Divider()
+            .color(this.lineC())
+            .strokeWidth(0.5)
+            .margin({ left: 14, right: 14 })
         }
         .width('100%')
-      }, (i: number) => 'src' + i.toString())
+      }, (ch: SourceChoice) => ch.id + '|' + ch.label + '|' + ch.stats.lineCount.toString())
     }
-    .width(212)
+    .width(240)
     .backgroundColor(this.dark ? '#F21F1F26' : '#F2FFFFFF')
     .backgroundBlurStyle(this.cardBlurStyle(), {
       colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
@@ -3580,69 +3617,35 @@ struct Index {
     Column() {
         // 顶部透明占位：约六行字符高度，纯透明，仅用于把下方卡片整体下移
       if (this.winW >= 900) {
-        // 平板 / 电脑：左侧全是参数，右侧是「开始优选 + 进度条 + 运行日志」
+        // 平板 / 电脑：两列，左右各两张卡（左：候选来源 / 快速筛选参数，右：下载测速 / 运行日志）
+        // 四张卡按阅读顺序两两分配到两列，避免出现「三卡挤一列 + 单卡占一列」的不对称
         Scroll(this.scanScroller) {
           Row() {
-            Column() {
-              Row({ space: 14 }) {
-                Column({ space: 14 }) {
+            Column({ space: 20 }) {
+              Row({ space: 20 }) {
+                Column({ space: 20 }) {
                   this.CardSource()
                   this.CardParam()
                 }
                 .layoutWeight(1)
-                .onAreaChange((_o: Area, a: Area) => {
-                  const h: number = Number(a.height);
-                  if (Math.abs(h - this.scanLeftColH) > 0.5) {
-                    this.scanLeftColH = h;
-                  }
-                })
-                Column({ space: 14 }) {
+                .alignItems(HorizontalAlign.Start)
+
+                Column({ space: 20 }) {
                   this.CardSpeed()
+                  this.CardLog(false, 240, true)
                 }
                 .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
               }
               .width('100%')
               .alignItems(VerticalAlign.Top)
-
-
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
-            .constraintSize({ maxWidth: 1080 })
-            .width(this.tabLeftZoneW())
-
-            Column({ space: 14 }) {
-              if (this.scanning || this.total > 0) {
-                this.ActionBar()
-              }
-              Column() {
-                Stack({ alignContent: Alignment.TopStart }) {
-                  Column() {
-                    this.CardLog(true, 240, false)
-                  }
-                  .onAreaChange((_o: Area, a: Area) => {
-                    this.updateMeasuredCardHeight('tablog', a);
-                  })
-                  .width('100%')
-                  .alignItems(HorizontalAlign.Start)
-                  .constraintSize({ minHeight: 240 })
-                  .padding(16)
-                }
-                .width('100%')
-                .backgroundBlurStyle(this.cardBlurStyle(),
-                  { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-                .constraintSize({ maxHeight: 520 })
-                .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
-                .borderRadius(20)
-                .border({ width: 1, color: this.cardBorderColor() })
-                .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-                .margin({ bottom: 16 })
-              }
-              .width('100%')
-            }
-            .width(this.tabColW())
-            .padding({ left: 16, right: 16, top: this.contentTop(), bottom: this.pageBottomPad() })
-    }
+            .padding({ left: 20, right: 20, top: this.contentTop(), bottom: this.pageBottomPad() })
+          }
+          .width('100%')
+          .justifyContent(FlexAlign.Center)
+          .alignItems(VerticalAlign.Top)
     .alignItems(VerticalAlign.Top)
     .justifyContent(FlexAlign.Center)
     .constraintSize({ maxWidth: 1600 })
@@ -3670,11 +3673,8 @@ struct Index {
     Scroll(this.scanScroller) {
     Column() {
     
-    Column() {
+    Column({ space: 16 }) {
     this.CardSource()
-    if (this.scanning || this.total > 0) {
-    this.ActionBar()
-    }
     this.CardParam()
     this.CardSpeed()
     this.CardLog(false, 180, true)
@@ -3826,6 +3826,25 @@ struct Index {
     }
     .width('100%')
     }
+
+    /** 带功能说明入口的卡片标题：标题左、感叹号右，与「快速筛选参数」一致 */
+    @Builder CardTitleWithHelp(title: string, icon: Resource, key: string) {
+    Row() {
+    SymbolGlyph(icon)
+    .fontSize(16)
+    .fontColor([this.txt2()])
+    .margin({ right: 8 })
+    Text(title)
+    .fontSize(15)
+    .fontWeight(FontWeight.Medium)
+    .fontColor(this.txt())
+    .layoutWeight(1)
+    .maxLines(1)
+    .textOverflow({ overflow: TextOverflow.Ellipsis })
+    this.InfoDot(key)
+    }
+    .width('100%')
+    }
     
     @Builder FieldRow(label: string, value: string, onChange: (v: string) => void) {
     Row() {
@@ -3882,7 +3901,7 @@ struct Index {
     }
     
     @Builder SourceHint() {
-    Text(this.srcIdx >= 1 ? this.sourceBrief() : this.t('内置官方段库，无需导入；选「自定义」后可自行导入', 'Built-in official ranges, no import needed; choose "Custom" to import your own'))
+    Text(this.sourceHintText())
     .fontSize(11)
     .fontColor(this.txt3())
     .width('100%')
@@ -3891,14 +3910,800 @@ struct Index {
     .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     
+  // ——————————————————— 来源分组管理页：视图栈（列表 → 分组详情 → 加链接/加文本） ———————————————————
+  // 用整屏面板而不是把所有编辑控件堆在一张卡片里；V4/V6 切换在面板顶部，切换即换整套来源数据。
+
+  @Builder SrcMgrHeaderBtn(label: string) {
+    Text(label)
+      .fontSize(16)
+      .fontColor(this.txt2())
+      .width(34)
+      .height(34)
+      .textAlign(TextAlign.Center)
+      .borderRadius(17)
+      .accessibilityText(this.srcMgrView === 0 ? this.t('关闭来源分组管理', 'Close source groups') :
+        this.t('返回上一级', 'Back'))
+      .onClick(() => {
+        this.srcMgrBack();
+      })
+  }
+
+  @Builder SrcFamChip(label: string, ver: number) {
+    Text(label)
+      .fontSize(11)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(this.ipVersion === ver ? '#FFFFFF' : this.txt2())
+      .height(26)
+      .padding({ left: 10, right: 10 })
+      .backgroundColor(this.ipVersion === ver ? this.accentFill() : this.soft())
+      .borderRadius(8)
+      .margin({ left: 6 })
+      .onClick(() => {
+        this.onFamSwitch(ver);
+      })
+  }
+
+  @Builder SrcMgrHeader() {
+    Column() {
+      Row() {
+        this.SrcMgrHeaderBtn(this.srcMgrView === 0 ? '✕' : '‹')
+        Column() {
+          Text(this.srcMgrTitle())
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.txt())
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.srcMgrSub())
+            .fontSize(10)
+            .fontColor(this.txt3())
+            .margin({ top: 2 })
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        .margin({ left: 6, right: 6 })
+        Row() {
+          this.SrcFamChip('IPv4', IpVersion.V4)
+          this.SrcFamChip('IPv6', IpVersion.V6)
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      if (this.srcMgrMsg.length > 0) {
+        Text(this.srcMgrMsg)
+          .fontSize(10)
+          .fontColor(this.accentText())
+          .width('100%')
+          .padding({ top: 6, bottom: 6, left: 10, right: 10 })
+          .backgroundColor(this.soft())
+          .borderRadius(8)
+          .margin({ top: 8 })
+      }
+      Divider()
+        .color(this.lineC())
+        .strokeWidth(0.5)
+        .margin({ top: 8 })
+    }
+    .width('100%')
+  }
+
+  @Builder SrcSectionTitle(text: string) {
+    Text(text)
+      .fontSize(10)
+      .fontColor(this.txt3())
+      .width('100%')
+      .margin({ top: 10, bottom: 6 })
+  }
+
+  @Builder SrcChoiceRow(ch: SourceChoice) {
+    Row() {
+      Column() {
+        Row() {
+          Text(ch.label)
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.txt())
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (ch.builtin) {
+            Text(this.t('只读', 'Read-only'))
+              .fontSize(9)
+              .fontColor(this.txt3())
+              .margin({ left: 6 })
+          }
+        }
+        Text(this.choiceStatText(ch))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .margin({ top: 2 })
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      if (ch.builtin && ch.id === SRC_ID_COMMUNITY) {
+        Text(this.srcMgrBusy ? this.t('更新中', 'Updating') : this.t('更新', 'Update'))
+          .fontSize(11)
+          .fontColor(this.accentText())
+          .height(26)
+          .padding({ left: 10, right: 10 })
+          .backgroundColor(this.soft())
+          .borderRadius(8)
+          .onClick(() => {
+            this.fetchCommunity(this.curFam());
+          })
+      }
+      Text(ch.id === this.curSel() ? this.t('使用中', 'In use') : this.t('使用', 'Use'))
+        .fontSize(11)
+        .fontColor(ch.id === this.curSel() ? this.txt3() : this.accentText())
+        .height(26)
+        .padding({ left: 10, right: 10 })
+        .backgroundColor(this.soft())
+        .borderRadius(8)
+        .margin({ left: 6 })
+        .onClick(() => {
+          this.onPickSource(ch.id);
+        })
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Center)
+    .padding({ top: 14, bottom: 14, left: 16, right: 16 })
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+    .onClick(() => {
+      if (ch.builtin) {
+        this.onPickSource(ch.id);
+      } else {
+        this.openGroup(ch.id);
+      }
+    })
+  }
+
+  @Builder SrcMgrList() {
+    Scroll() {
+      Column() {
+        this.SrcSectionTitle(this.t('内置来源（受保护，不可编辑或删除）', 'Built-in sources (protected, read-only)'))
+        ForEach(this.builtinChoices(), (ch: SourceChoice) => {
+          this.SrcChoiceRow(ch)
+        }, (ch: SourceChoice) => 'b|' + ch.id + '|' + ch.label + '|' + this.srcRev.toString())
+
+        this.SrcSectionTitle(this.t('自定义分组（点一行进入管理）', 'Custom groups (tap a row to manage)'))
+        if (this.customChoices().length === 0) {
+          Text(this.t('还没有自定义分组', 'No custom groups yet'))
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .width('100%')
+            .padding({ top: 2, bottom: 8 })
+        }
+        ForEach(this.customChoices(), (ch: SourceChoice) => {
+          this.SrcChoiceRow(ch)
+        }, (ch: SourceChoice) => 'c|' + ch.id + '|' + ch.label + '|' + this.srcRev.toString())
+
+        Row() {
+          TextInput({ text: this.srcNewName, placeholder: this.t('新分组名称', 'New group name') })
+            .fontSize(12)
+            .fontColor(this.txt())
+            .placeholderColor(this.txt3())
+            .height(36)
+            .layoutWeight(1)
+            .backgroundColor(this.inputBg())
+            .borderRadius(10)
+            .onChange((v: string) => {
+              this.srcNewName = v;
+            })
+          Text(this.t('新建', 'Create'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.accentText())
+            .height(36)
+            .padding({ left: 14, right: 14 })
+            .backgroundColor(this.soft())
+            .borderRadius(10)
+            .margin({ left: 8 })
+            .onClick(() => {
+              this.createGroupNow();
+            })
+        }
+        .width('100%')
+        .margin({ top: 4 })
+
+        if (Sources.quarantines.length > 0) {
+          Row() {
+            Text(this.t('隔离区：', 'Quarantine: ') + Sources.quarantines.length.toString() + this.t(' 行无法识别的旧数据（保留不丢弃，不参与扫描）', ' unrecognised legacy lines (kept, not used for scanning)'))
+              .fontSize(10)
+              .fontColor(this.txt3())
+              .layoutWeight(1)
+            Text(this.srcShowQuarantine ? this.t('收起', 'Hide') : this.t('查看', 'View'))
+              .fontSize(10)
+              .fontColor(this.accentText())
+              .padding({ left: 8, right: 8 })
+              .onClick(() => {
+                this.srcShowQuarantine = !this.srcShowQuarantine;
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+          .alignItems(VerticalAlign.Center)
+          if (this.srcShowQuarantine) {
+            Text(Sources.quarantineSummary())
+              .fontSize(9)
+              .fontColor(this.txt3())
+              .width('100%')
+              .padding(8)
+              .backgroundColor(this.soft())
+              .borderRadius(8)
+              .margin({ top: 6 })
+            Text(this.t('清空隔离区', 'Clear quarantine'))
+              .fontSize(10)
+              .fontColor(BAD_C)
+              .padding({ top: 6, bottom: 6 })
+              .onClick(() => {
+                this.clearQuarantineNow();
+              })
+          }
+        }
+
+        Row() {
+          Text(this.t('逻辑自检（校验官方保护 / 类型隔离 / 去重 / 编译）', 'Logic self-check (protection, isolation, dedupe, compile)'))
+            .fontSize(10)
+            .fontColor(this.txt3())
+            .layoutWeight(1)
+          Text(this.t('运行', 'Run'))
+            .fontSize(10)
+            .fontColor(this.accentText())
+            .padding({ left: 10, right: 10 })
+            .onClick(() => {
+              this.runSelfCheck();
+            })
+        }
+        .width('100%')
+        .margin({ top: 12, bottom: 12 })
+        .alignItems(VerticalAlign.Center)
+      }
+      .width('100%')
+      .padding({ left: 2, right: 2 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
+    .margin({ top: 4 })
+  }
+
+  @Builder SrcItemRow(s: SourceItem) {
+    Column() {
+      Row() {
+        Text(Sources.kindLabel(s.kind))
+          .fontSize(9)
+          .fontColor(this.txt2())
+          .height(18)
+          .padding({ left: 6, right: 6 })
+          .backgroundColor(this.inputBg())
+          .borderRadius(5)
+        Column() {
+          Text(s.name)
+            .fontSize(12)
+            .fontColor(this.txt())
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.sourceStatText(s))
+            .fontSize(9)
+            .fontColor(s.status === SRC_STATUS_FAILED ? BAD_C : this.txt3())
+            .margin({ top: 2 })
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        .margin({ left: 8, right: 6 })
+        .onClick(() => {
+          this.openSourceEdit(s.id);
+        })
+        Text(this.t('编辑', 'Edit'))
+          .fontSize(10)
+          .fontColor(this.txt2())
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor(this.inputBg())
+          .borderRadius(6)
+          .margin({ right: 6 })
+          .onClick(() => {
+            this.openSourceEdit(s.id);
+          })
+        if (s.kind === SRC_KIND_LINK) {
+          Text(this.t('更新', 'Refresh'))
+            .fontSize(10)
+            .fontColor(this.accentText())
+            .height(24)
+            .padding({ left: 8, right: 8 })
+            .backgroundColor(this.inputBg())
+            .borderRadius(6)
+            .margin({ right: 6 })
+            .onClick(() => {
+              this.refreshLink(s.id, false);
+            })
+        }
+        if (s.status === SRC_STATUS_FAILED) {
+          Text(this.t('失败', 'Failed'))
+            .fontSize(10)
+            .fontColor(BAD_C)
+            .height(24)
+            .padding({ left: 8, right: 8 })
+            .backgroundColor(this.inputBg())
+            .borderRadius(6)
+        } else {
+          Text(s.enabled ? this.t('已启用', 'On') : this.t('已停用', 'Off'))
+            .fontSize(10)
+            .fontColor(s.enabled ? this.accentText() : this.txt3())
+            .height(24)
+            .padding({ left: 8, right: 8 })
+            .backgroundColor(this.inputBg())
+            .borderRadius(6)
+            .onClick(() => {
+              this.toggleSource(s.id);
+            })
+        }
+        Text(this.srcConfirmSrc === s.id ? this.t('确认', 'Sure') : '✕')
+          .fontSize(10)
+          .fontColor(BAD_C)
+          .width(40)
+          .height(24)
+          .textAlign(TextAlign.Center)
+          .borderRadius(6)
+          .backgroundColor(this.srcConfirmSrc === s.id ? this.inputBg() : Color.Transparent)
+          .onClick(() => {
+            this.removeSource(s.id);
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ top: 14, bottom: 14, left: 14, right: 14 })
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+  }
+
+  @Builder SrcAddBtn(label: string, target: number) {
+    Text(label)
+      .fontSize(11)
+      .fontColor(this.accentText())
+      .height(36)
+      .layoutWeight(1)
+      .textAlign(TextAlign.Center)
+      .backgroundColor(this.soft())
+      .borderRadius(10)
+      .margin({ left: 4, right: 4 })
+      .onClick(() => {
+        if (target === 0) {
+          this.addFileSource();
+        } else {
+          this.openAddView(target);
+        }
+      })
+  }
+
+  @Builder SrcMgrDetail() {
+    Scroll() {
+      Column() {
+        if (this.srcRename) {
+          Row() {
+            TextInput({ text: this.srcNameDraft, placeholder: this.t('分组名称', 'Group name') })
+              .fontSize(12)
+              .fontColor(this.txt())
+              .height(36)
+              .layoutWeight(1)
+              .backgroundColor(this.inputBg())
+              .borderRadius(10)
+              .onChange((v: string) => {
+                this.srcNameDraft = v;
+              })
+            Text(this.t('保存', 'Save'))
+              .fontSize(12)
+              .fontColor(this.accentText())
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor(this.soft())
+              .borderRadius(10)
+              .margin({ left: 8 })
+              .onClick(() => {
+                this.commitRename();
+              })
+            Text(this.t('取消', 'Cancel'))
+              .fontSize(12)
+              .fontColor(this.txt2())
+              .height(32)
+              .padding({ left: 10, right: 10 })
+              .onClick(() => {
+                this.srcRename = false;
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+          .alignItems(VerticalAlign.Center)
+        } else {
+          Row() {
+            Text(this.groupNameOf(this.srcMgrGid))
+              .fontSize(14)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.txt())
+              .layoutWeight(1)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(this.t('改名', 'Rename'))
+              .fontSize(11)
+              .fontColor(this.accentText())
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor(this.soft())
+              .borderRadius(10)
+              .onClick(() => {
+                this.srcNameDraft = this.groupNameOf(this.srcMgrGid);
+                this.srcRename = true;
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+          .alignItems(VerticalAlign.Center)
+        }
+
+        Text(this.groupStatText(this.srcMgrGid))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 6 })
+
+        this.SrcSectionTitle(this.t('来源列表（点来源可编辑内容，点状态切换启用，✕ 删除）',
+          'Sources (tap to edit content, tap state to toggle, ✕ to delete)'))
+        if (this.curGroupSources().length === 0) {
+          Text(this.t('这个分组还没有来源，用下面三个按钮添加', 'No sources yet; add one with the buttons below'))
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .width('100%')
+            .padding({ top: 2, bottom: 8 })
+        }
+        ForEach(this.curGroupSources(), (s: SourceItem) => {
+          this.SrcItemRow(s)
+        }, (s: SourceItem) => s.id + '|' + this.srcRev.toString())
+
+        Row() {
+          this.SrcAddBtn(this.t('+ 链接', '+ Link'), 2)
+          this.SrcAddBtn(this.t('+ 文件', '+ File'), 0)
+          this.SrcAddBtn(this.t('+ 文本', '+ Text'), 3)
+        }
+        .width('100%')
+        .margin({ top: 10 })
+
+        if (this.groupLinkCount() > 0) {
+          Row() {
+            Text(this.t('链接来源可一键更新：重新拉取并按当前 IP 版本校验，成功才替换内容', 'Link sources can be refreshed: refetch, revalidate for the current IP version, replace only on success'))
+              .fontSize(9)
+              .fontColor(this.txt3())
+              .layoutWeight(1)
+              .maxLines(2)
+            Text(this.t('更新全部链接', 'Refresh all'))
+              .fontSize(11)
+              .fontColor(this.accentText())
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor(this.soft())
+              .borderRadius(10)
+              .margin({ left: 8 })
+              .onClick(() => {
+                this.refreshAllLinks();
+              })
+          }
+          .width('100%')
+          .margin({ top: 8 })
+          .alignItems(VerticalAlign.Center)
+        }
+
+        Divider()
+          .color(this.lineC())
+          .strokeWidth(0.5)
+          .margin({ top: 16, bottom: 10 })
+
+        if (this.srcConfirmGroup) {
+          Row() {
+            Text(this.t('确认删除整个分组？此操作不影响官方 IP 段', 'Delete this whole group? Official ranges are unaffected'))
+              .fontSize(11)
+              .fontColor(BAD_C)
+              .layoutWeight(1)
+            Text(this.t('删除分组', 'Delete'))
+              .fontSize(11)
+              .fontColor('#FFFFFF')
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor(BAD_C)
+              .borderRadius(10)
+              .onClick(() => {
+                this.deleteGroupNow();
+              })
+            Text(this.t('取消', 'Cancel'))
+              .fontSize(11)
+              .fontColor(this.txt2())
+              .height(32)
+              .padding({ left: 10, right: 10 })
+              .onClick(() => {
+                this.srcConfirmGroup = false;
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        } else {
+          Text(this.t('删除分组', 'Delete group'))
+            .fontSize(11)
+            .fontColor(BAD_C)
+            .height(32)
+            .padding({ left: 12, right: 12 })
+            .borderRadius(10)
+            .border({ width: 0.5, color: BAD_C })
+            .onClick(() => {
+              this.srcConfirmGroup = true;
+            })
+        }
+      }
+      .width('100%')
+      .padding({ bottom: 16 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
+    .margin({ top: 4 })
+  }
+
+  @Builder SrcMgrAddLink() {
+    Scroll() {
+      Column() {
+        Text(this.t('填写一个 http(s) 链接，拉取成功后按当前 IP 版本校验并加入分组。解析失败会作为失败来源留在列表里，不会当成有效数据。', 'Enter an http(s) link. The content is validated against the current IP version. Failed imports are kept as failed sources, never as valid data.'))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 12, bottom: 10 })
+        TextInput({ text: this.srcLinkDraft, placeholder: 'https://example.com/ips-v4.txt' })
+          .fontSize(12)
+          .fontColor(this.txt())
+          .placeholderColor(this.txt3())
+          .height(38)
+          .width('100%')
+          .backgroundColor(this.inputBg())
+          .borderRadius(10)
+          .onChange((v: string) => {
+            this.srcLinkDraft = v;
+          })
+        Row() {
+          Text(this.srcMgrBusy ? this.t('拉取中…', 'Fetching…') : this.t('添加链接', 'Add link'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.srcMgrBusy ? this.txt3() : '#FFFFFF')
+            .height(36)
+            .layoutWeight(1)
+            .textAlign(TextAlign.Center)
+            .backgroundColor(this.srcMgrBusy ? this.soft() : this.accentFill())
+            .borderRadius(10)
+            .onClick(() => {
+              if (!this.srcMgrBusy) {
+                this.addLinkSource();
+              }
+            })
+        }
+        .width('100%')
+        .margin({ top: 12 })
+        Text(this.t('也可以直接在分组详情的「+ 文件」「+ 文本」里添加，三种方式可以混用。', 'You can also add files or pasted text from the group detail view; all three kinds can be mixed.'))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 12 })
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
+    .margin({ top: 4 })
+  }
+
+  @Builder SrcMgrEditSource() {
+    Column() {
+      Text(this.t('来源', 'Source'))
+        .fontSize(10)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 12 })
+      Text(this.editSourceName())
+        .fontSize(13)
+        .fontColor(this.txt())
+        .width('100%')
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .margin({ top: 2 })
+      Text(this.t('每行一条网段或地址：可直接改写，也可以删掉整行来移除该段。保存时按当前 IP 版本重新校验，无法识别的行会被拒绝并给出原因。',
+        'One range or address per line: edit in place, or delete lines to drop them. Saving revalidates against the current IP version; invalid lines are rejected with a reason.'))
+        .fontSize(10)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 8, bottom: 8 })
+      TextArea({ text: this.srcEditDraft })
+        .fontSize(11)
+        .fontColor(this.txt())
+        .width('100%')
+        .height(220)
+        .backgroundColor(this.inputBg())
+        .borderRadius(10)
+        .onChange((v: string) => {
+          this.srcEditDraft = v;
+        })
+      Row() {
+        Text(this.t('保存修改', 'Save'))
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#FFFFFF')
+          .height(36)
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .backgroundColor(this.accentFill())
+          .borderRadius(10)
+          .onClick(() => {
+            this.saveSourceEdit();
+          })
+        Text(this.t('取消', 'Cancel'))
+          .fontSize(12)
+          .fontColor(this.txt2())
+          .height(36)
+          .padding({ left: 14, right: 14 })
+          .textAlign(TextAlign.Center)
+          .backgroundColor(this.inputBg())
+          .borderRadius(10)
+          .margin({ left: 8 })
+          .onClick(() => {
+            this.srcMgrBack();
+          })
+      }
+      .width('100%')
+      .margin({ top: 12 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .padding({ bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder SrcMgrAddText() {
+    Column() {
+      Text(this.t('粘贴 IP 段 / 地址文本；支持的写法与原有导入一致（# 注释、CIDR、IP:端口）。混合了另一种 IP 类型时，错误行会被拒绝并给出原因。', 'Paste ranges or addresses; same formats as before (# comments, CIDR, IP:port). Lines of the other IP version are rejected with a reason.'))
+        .fontSize(10)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 12, bottom: 10 })
+      TextArea({ text: this.srcPasteDraft, placeholder: '1.2.3.0/24\n2001:db8::/32' })
+        .fontSize(11)
+        .fontColor(this.txt())
+        .placeholderColor(this.txt3())
+        .width('100%')
+        .height(200)
+        .backgroundColor(this.inputBg())
+        .borderRadius(10)
+        .onChange((v: string) => {
+          this.srcPasteDraft = v;
+        })
+      Text(this.t('添加文本来源', 'Add text source'))
+        .fontSize(12)
+        .fontWeight(FontWeight.Medium)
+        .fontColor('#FFFFFF')
+        .height(36)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .backgroundColor(this.accentFill())
+        .borderRadius(10)
+        .margin({ top: 12 })
+        .onClick(() => {
+          this.addTextSource();
+        })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .padding({ bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 候选来源：整屏管理面板（遮罩点击关闭；平板/PC 居中定宽，手机全屏） */
+  @Builder SourceManager() {
+    Stack() {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(0,0,0,0.38)')
+        .zIndex(0)
+        .onClick(() => {
+          this.closeSrcMgr();
+        })
+      Stack({ alignContent: Alignment.TopStart }) {
+        Column() {
+          this.SrcMgrHeader()
+          if (this.srcMgrView === 0) {
+            this.SrcMgrList()
+          } else if (this.srcMgrView === 1) {
+            this.SrcMgrDetail()
+          } else if (this.srcMgrView === 2) {
+            this.SrcMgrAddLink()
+          } else if (this.srcMgrView === 3) {
+            this.SrcMgrAddText()
+          } else if (this.srcMgrView === 4) {
+            this.SrcMgrEditSource()
+          } else {
+            this.SrcMgrDetail()
+          }
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ left: 16, right: 16, top: px2vp(this.statusBarPx) + 10, bottom: 12 })
+        .justifyContent(FlexAlign.Start)
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width(this.winW >= 900 ? 720 : '100%')
+      .height(this.winW >= 900 ? this.srcMgrPanelH() : '100%')
+      .constraintSize({ maxHeight: this.winW >= 900 ? '86%' : '100%' })
+      .zIndex(1)
+      .backgroundBlurStyle(this.cardBlurStyle(), {
+        colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
+      })
+      .backgroundColor(this.modalVeil())
+      .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
+      .borderRadius(this.winW >= 900 ? 20 : 0)
+      .border({ width: this.winW >= 900 ? 1 : 0, color: this.cardBorderColor() })
+      .shadow({
+        radius: this.winW >= 900 ? this.cardShadowR() : 0,
+        color: this.cardShadowColor(),
+        offsetX: 0,
+        offsetY: this.cardShadowY()
+      })
+    }
+    .width('100%')
+    .height('100%')
+    .zIndex(50)
+  }
+
   /** 候选来源：来源 / IP 版本 / 端口 三组参数合并为一张卡片，减少卡片数与纵向占用 */
+  /** 单个端口 chip（宽屏两行、手机一行共用） */
+  @Builder PortChip(p: number) {
+    Text(p.toString())
+      .fontSize(this.CHIP_FS)
+      .fontColor(this.port === p ? '#FFFFFF' : this.txt2())
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height(this.CHIP_H)
+      .backgroundColor(this.port === p ? this.accentFill() : this.soft())
+      .borderRadius(this.CHIP_R)
+      .onClick(() => {
+        this.port = p;
+        this.scheduleScanSave();
+      })
+  }
+
   @Builder CardSource() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle(this.t('候选来源', 'Candidate source'), $r('sys.symbol.wifi'))
+        this.CardTitleWithHelp(this.t('候选来源', 'Candidate source'), $r('sys.symbol.wifi'), HELP_SOURCE)
 
         // 开始优选：主操作，视觉权重最高
-        Text(this.scanning ? this.t('停止', 'Stop') : this.t('开始优选', 'Start selection'))
+        Text(this.scanButtonLabel())
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
           .fontColor('#FFFFFF')
@@ -3915,6 +4720,23 @@ struct Index {
               this.startScan();
             }
           })
+
+        // 扫描进度：并入卡片内部；预检/测速阶段进度归属各自页面，这里只给一句指引
+        if (this.scanning && this.taskKind !== 1) {
+          Text(this.taskKind === 2
+            ? this.t('质量预检进行中 · 进度见「筛选」页', 'Quality pre-check running · see the "Filter" tab')
+            : this.t('测速进行中 · 进度见「测速」页', 'Speed test running · see the "Speed" tab'))
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .width('100%')
+            .margin({ top: 10, bottom: 2 })
+        } else {
+          Column() {
+            this.ProgressStrip(0)
+          }
+          .width('100%')
+          .margin({ top: 12, bottom: 2 })
+        }
 
         Row() {
           Text(this.t('来源', 'Source'))
@@ -3943,30 +4765,24 @@ struct Index {
           .bindMenu(this.SourceMenu(), {
             backgroundColor: Color.Transparent
           })
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-        .margin({ top: 12 })
-
-        // 官方来源无需按钮；社区库=更新来源；自定义=自定义导入
-        if (this.srcIdx !== 0) {
-          Text((this.srcIdx === 1 || this.srcIdx === 2) ? this.t('更新来源', 'Update source') : this.t('自定义导入', 'Custom import'))
+          Text(this.t('编辑分组', 'Groups'))
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
             .fontColor(this.accentText())
             .textAlign(TextAlign.Center)
-            .width('100%')
-            .height(34)
+            .height(36)
+            .padding({ left: 12, right: 12 })
             .backgroundColor(this.soft())
-            .borderRadius(9)
-            .margin({ top: 8 })
+            .borderRadius(10)
+            .margin({ left: 8 })
+            .accessibilityText(this.t('编辑来源分组', 'Edit source groups'))
             .onClick(() => {
-              if (this.srcIdx === 3 && this.customText.trim().length === 0) {
-                this.toast(this.t('自定义为空，请添加来源', 'Custom source is empty; add a source'));
-              }
-              this.importDlg.open();
+              this.openSrcMgr();
             })
         }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        .margin({ top: 12 })
 
         Row() {
           Text(this.t('IP 版本', 'IP version'))
@@ -3983,8 +4799,7 @@ struct Index {
               .backgroundColor(this.ipVersion === IpVersion.V4 ? this.accentFill() : this.soft())
               .borderRadius(this.CHIP_R)
               .onClick(() => {
-                this.ipVersion = IpVersion.V4;
-                this.maybeAutoSuggest(false);
+                this.onFamSwitch(IpVersion.V4);
               })
             Text('IPv6')
               .fontSize(12)
@@ -3996,8 +4811,7 @@ struct Index {
               .borderRadius(this.CHIP_R)
               .margin({ left: 6 })
               .onClick(() => {
-                this.ipVersion = IpVersion.V6;
-                this.maybeAutoSuggest(true);
+                this.onFamSwitch(IpVersion.V6);
               })
           }
           .layoutWeight(1)
@@ -4010,22 +4824,32 @@ struct Index {
             .fontSize(13)
             .fontColor(this.txt2())
             .width(72)
-          Row() {
-            ForEach(PORT_OPTIONS, (p: number, index: number) => {
-              Text(p.toString())
-                .fontSize(this.CHIP_FS)
-                .fontColor(this.port === p ? '#FFFFFF' : this.txt2())
-                .textAlign(TextAlign.Center)
-                .layoutWeight(1)
-                .height(this.CHIP_H)
-                .backgroundColor(this.port === p ? this.accentFill() : this.soft())
-                .borderRadius(this.CHIP_R)
-                .margin({ right: index === PORT_OPTIONS.length - 1 ? 0 : 4 })
-                .onClick(() => {
-                  this.port = p;
-                  this.scheduleScanSave();
-                })
-            }, (p: number, index: number) => p.toString())
+            .alignSelf(ItemAlign.Start)
+            .margin({ top: 8 })
+          Column({ space: 6 }) {
+            if (this.winW >= 900) {
+              // 宽屏：端口排两行（3 + 3），与右侧卡片底部对齐
+              Row({ space: 4 }) {
+                ForEach(PORT_OPTIONS.slice(0, 3), (p: number, index: number) => {
+                  this.PortChip(p)
+                }, (p: number, index: number) => p.toString())
+              }
+              .width('100%')
+
+              Row({ space: 4 }) {
+                ForEach(PORT_OPTIONS.slice(3), (p: number, index: number) => {
+                  this.PortChip(p)
+                }, (p: number, index: number) => p.toString())
+              }
+              .width('100%')
+            } else {
+              Row({ space: 4 }) {
+                ForEach(PORT_OPTIONS, (p: number, index: number) => {
+                  this.PortChip(p)
+                }, (p: number, index: number) => p.toString())
+              }
+              .width('100%')
+            }
           }
           .layoutWeight(1)
         }
@@ -4054,7 +4878,7 @@ struct Index {
     .borderRadius(20)
     .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    .margin({ bottom: 12 })
+    .margin({ bottom: 0 })
   }
 
 
@@ -4101,15 +4925,58 @@ struct Index {
     .onClick(onTap)
   }
 
-  /** 参数说明弹窗：轻量、居中、可关闭，不改动页面布局 */
-  @Builder ParamNotesSheet() {
+  /** 功能说明入口：与「快速筛选参数」原有样式一致（28×28 胶囊底 + 强调色感叹号） */
+  @Builder InfoDot(key: string) {
+    Text('ⓘ')
+      .fontSize(13)
+      .fontColor(this.accentText())
+      .textAlign(TextAlign.Center)
+      .width(28)
+      .height(28)
+      .borderRadius(14)
+      .backgroundColor(this.soft())
+      .margin({ left: 8 })
+      .accessibilityText(HelpText.title(key, this.langEn))
+      .onClick(() => {
+        this.openHelp(key);
+      })
+  }
+
+  private openHelp(key: string): void {
+    this.helpKey = key;
+  }
+
+  private closeHelp(): void {
+    this.helpKey = '';
+  }
+
+  /** 说明正文：把占位符替换成当前真实状态，保证说明与实际配置一致 */
+  private helpParagraphs(): string[] {
+    const raw: string[] = HelpText.body(this.helpKey, this.langEn);
+    const out: string[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      let line: string = raw[i];
+      if (line === '{latency}') {
+        line = this.latencyHint;
+      }
+      line = line.replace('{cap}', maxScanConcurrency().toString());
+      line = line.replace('{ping}', this.pingText);
+      line = line.replace('{rounds}', this.speedRoundsText);
+      line = line.replace('{window}', this.speedWindowText);
+      out.push(line);
+    }
+    return out;
+  }
+
+  /** 功能说明弹窗：沿用原「参数说明」的视觉与关闭行为，长文本在弹窗内滚动 */
+  @Builder HelpSheet() {
     Stack({ alignContent: Alignment.Center }) {
       Column()
         .width('100%')
         .height('100%')
         .backgroundColor('rgba(0,0,0,0.38)')
         .onClick(() => {
-          this.showParamNotes = false;
+          this.closeHelp();
         })
       Stack({ alignContent: Alignment.TopStart }) {
         Column({ space: 10 }) {
@@ -4117,14 +4984,36 @@ struct Index {
             SymbolGlyph($r('sys.symbol.info_circle'))
               .fontSize(16)
               .fontColor([this.accentText()])
-            Text(this.t('参数说明', 'Parameter notes'))
+            Text(HelpText.title(this.helpKey, this.langEn))
               .fontSize(15)
               .fontWeight(FontWeight.Medium)
               .fontColor(this.txt())
               .layoutWeight(1)
           }
           .width('100%')
-          this.ParamNotesBody()
+
+          Scroll() {
+            Column({ space: 8 }) {
+              ForEach(this.helpParagraphs(), (line: string, index: number) => {
+                Text(line)
+                  .fontSize(12)
+                  .lineHeight(19)
+                  .fontColor(this.txt2())
+                  .width('100%')
+              }, (line: string, index: number) => index.toString() + '#' + line)
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+          // 短屏（横屏/分屏）时正文让位给标题与「知道了」按钮，避免整卡被裁掉底部按钮
+          .constraintSize({
+            maxHeight: Math.max(120,
+              (this.winH > 0 ? this.winH : 780) * 0.80 - 210)
+          })
+          .scrollBar(BarState.Off)
+          .align(Alignment.TopStart)
+
           Row() {
             Text(this.t('知道了', 'Got it'))
               .fontSize(13)
@@ -4135,7 +5024,7 @@ struct Index {
               .borderRadius(10)
               .backgroundColor(this.accentFill())
               .onClick(() => {
-                this.showParamNotes = false;
+                this.closeHelp();
               })
           }
           .width('100%')
@@ -4146,48 +5035,16 @@ struct Index {
       }
       .width('86%')
       .constraintSize({ maxWidth: 460 })
+      .backgroundColor(this.modalVeil())
       .backgroundBlurStyle(this.cardBlurStyle(),
         { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
       .linearGradient({ angle: 145, colors: this.cardTint() })
       .borderRadius(20)
       .border({ width: 1, color: this.cardBorderColor() })
-      .shadow({ radius: 24, color: this.cardShadowColor(), offsetX: 0, offsetY: 10 })
+      .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     }
     .width('100%')
     .height('100%')
-  }
-
-  /** 参数说明正文（弹窗内使用） */
-  @Builder ParamNotesBody() {
-    Column() {
-      Text(this.t('采样数：IPv4/IPv6 统一 3000；随机地址命中率偏低时可改用域名 AAAA 采样。', 'Samples: 3000 for both IPv4 and IPv6; if random addresses have a low hit rate, sample domain AAAA records instead.'))
-        .fontSize(11)
-        .fontColor(this.txt3())
-        .width('100%')
-      Text(this.t('并发上限：手机 120 / 平板 200 / 电脑 300（当前设备 ', 'Concurrency cap: 120 on phones / 200 on tablets / 300 on computers (this device: ') + maxScanConcurrency().toString() +
-        this.t('），超过会自动改回上限。', '). Values above it are reset to the cap automatically.'))
-        .fontSize(11)
-        .fontColor(this.txt3())
-        .width('100%')
-        .margin({ top: 6 })
-      Text(this.latencyHint)
-        .fontSize(11)
-        .fontColor(this.txt3())
-        .width('100%')
-        .margin({ top: 6 })
-      Text(this.t('每个 IP 连 ', 'Each IP gets ') + this.pingText + this.t(' 次 TCP 取最小值；超过延迟上限直接淘汰，IPv4/IPv6 共用同一上限。', ' TCP samples, keeping the minimum; nodes above the latency cap are dropped. IPv4 and IPv6 share the same cap.'))
-        .fontSize(11)
-        .fontColor(this.txt3())
-        .width('100%')
-        .margin({ top: 6 })
-      Text(this.t('合格速度：低于该值的节点在第一轮初筛后按延迟从低到高逐个淘汰，凑不满会提前中止（0 = 不淘汰）。', 'Min speed: after the round 1 pre-filter, nodes below this value are eliminated one by one in ascending latency order, and the process stops early if the target cannot be filled (0 = no elimination).'))
-        .fontSize(11)
-        .fontColor(this.txt3())
-        .width('100%')
-        .margin({ top: 6 })
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder CardParam() {
@@ -4206,87 +5063,46 @@ struct Index {
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           // 说明入口固定在卡片右上角，与「应用建议」不再重复
-          Text('ⓘ')
-            .fontSize(13)
-            .fontColor(this.accentText())
-            .textAlign(TextAlign.Center)
-            .width(28)
-            .height(28)
-            .borderRadius(14)
-            .backgroundColor(this.soft())
-            .margin({ left: 8 })
-            .accessibilityText(this.t('参数说明', 'Parameter notes'))
-            .onClick(() => {
-              this.showParamNotes = true;
-            })
+          this.InfoDot(HELP_FILTER)
         }
         .width('100%')
 
-        if (this.winW >= 900) {
-          Row({ space: 10 }) {
-            this.ParamCell(this.t('采样数', 'Samples'), 'sample', 'sample-' + this.cfgRev.toString(), true, (v: string) => {
-              this.sampleText = v;
-              this.scheduleScanSave();
-            })
-            this.ParamCell(this.t('并发线程', 'Threads'), 'conc', 'conc-' + this.cfgRev.toString(), true, (v: string) => {
-              const lim: number = maxScanConcurrency();
-              const n: number = parseInt(v);
-              if (!isNaN(n) && n > lim) {
-                this.concurrencyText = lim.toString();
-                // TextInput 的 text 只作初值，必须换 id 触发重建才能把上限值回显到输入框
-                this.cfgRev++;
-                this.toast(this.t('并发上限为 ', 'Concurrency cap is ') + lim.toString() + this.t('，已按上限执行', '; the limit has been applied'));
-              } else {
-                this.concurrencyText = v;
-              }
-              this.scheduleScanSave();
-            })
-            this.ParamCell(this.t('延迟上限 ms', 'Latency cap ms'), 'lat', 'lat-' + this.cfgRev.toString(), true, (v: string) => {
-              this.latencyText = v;
-              this.scheduleScanSave();
-            })
-            this.ParamCell(this.t('Ping 次数', 'Ping count'), 'ping', 'ping-' + this.cfgRev.toString(), true, (v: string) => {
-              this.pingText = v;
-              this.scheduleScanSave();
-            })
-          }
-          .width('100%')
-          .margin({ top: 12 })
-        } else {
-          Row({ space: 10 }) {
-            this.ParamCell(this.t('采样数', 'Samples'), 'sample', 'sample-' + this.cfgRev.toString(), true, (v: string) => {
-              this.sampleText = v;
-              this.scheduleScanSave();
-            })
-            this.ParamCell(this.t('并发线程', 'Threads'), 'conc', 'conc-' + this.cfgRev.toString(), true, (v: string) => {
-              const lim: number = maxScanConcurrency();
-              const n: number = parseInt(v);
-              if (!isNaN(n) && n > lim) {
-                this.concurrencyText = lim.toString();
-                // TextInput 的 text 只作初值，必须换 id 触发重建才能把上限值回显到输入框
-                this.cfgRev++;
-                this.toast(this.t('并发上限为 ', 'Concurrency cap is ') + lim.toString() + this.t('，已按上限执行', '; the limit has been applied'));
-              } else {
-                this.concurrencyText = v;
-              }
-              this.scheduleScanSave();
-            })
-          }
-          .width('100%')
-          .margin({ top: 12 })
-          Row({ space: 10 }) {
-            this.ParamCell(this.t('延迟上限 ms', 'Latency cap ms'), 'lat', 'lat-' + this.cfgRev.toString(), true, (v: string) => {
-              this.latencyText = v;
-              this.scheduleScanSave();
-            })
-            this.ParamCell(this.t('Ping 次数', 'Ping count'), 'ping', 'ping-' + this.cfgRev.toString(), true, (v: string) => {
-              this.pingText = v;
-              this.scheduleScanSave();
-            })
-          }
-          .width('100%')
-          .margin({ top: 10 })
+        // 两列两组：左列「采样数 / 并发线程」，右列「延迟上限 / Ping 次数」；
+        // 宽屏与手机同一结构（宽屏靠这两行把左列拉高，与右列底部对齐）
+        Row({ space: 10 }) {
+          this.ParamCell(this.t('采样数', 'Samples'), 'sample', 'sample-' + this.cfgRev.toString(), true, (v: string) => {
+            this.sampleText = v;
+            this.scheduleScanSave();
+          })
+          this.ParamCell(this.t('并发线程', 'Threads'), 'conc', 'conc-' + this.cfgRev.toString(), true, (v: string) => {
+            const lim: number = maxScanConcurrency();
+            const n: number = parseInt(v);
+            if (!isNaN(n) && n > lim) {
+              this.concurrencyText = lim.toString();
+              // TextInput 的 text 只作初值，必须换 id 触发重建才能把上限值回显到输入框
+              this.cfgRev++;
+              this.toast(this.t('并发上限为 ', 'Concurrency cap is ') + lim.toString() + this.t('，已按上限执行', '; the limit has been applied'));
+            } else {
+              this.concurrencyText = v;
+            }
+            this.scheduleScanSave();
+          })
         }
+        .width('100%')
+        .margin({ top: 12 })
+
+        Row({ space: 10 }) {
+          this.ParamCell(this.t('延迟上限 ms', 'Latency cap ms'), 'lat', 'lat-' + this.cfgRev.toString(), true, (v: string) => {
+            this.latencyText = v;
+            this.scheduleScanSave();
+          })
+          this.ParamCell(this.t('Ping 次数', 'Ping count'), 'ping', 'ping-' + this.cfgRev.toString(), true, (v: string) => {
+            this.pingText = v;
+            this.scheduleScanSave();
+          })
+        }
+        .width('100%')
+        .margin({ top: 10 })
 
         // 合格速度直接展示；右侧空位放「应用建议」，与输入框底边对齐
         Row({ space: 10 }) {
@@ -4325,7 +5141,7 @@ struct Index {
     .borderRadius(20)
     .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    .margin({ bottom: 12 })
+    .margin({ bottom: 0 })
   }
 
   @Builder CardSpeed() {
@@ -4337,12 +5153,7 @@ struct Index {
             .fontWeight(FontWeight.Medium)
             .fontColor(this.txt())
           Blank()
-          Toggle({ type: ToggleType.Switch, isOn: this.enableSpeed })
-            .selectedColor(this.accent())
-            .onChange((on: boolean) => {
-              this.enableSpeed = on;
-              this.scheduleScanSave();
-            })
+          this.InfoDot(HELP_SPEED)
         }
         .width('100%')
 
@@ -4390,123 +5201,86 @@ struct Index {
           .width('100%')
           .margin({ top: 12 })
 
-          if (this.speedScope === SpeedScope.PER_REGION) {
-            Row({ space: 10 }) {
-              this.ParamCell(this.t('每地区数量', 'Per-region count'), this.speedPerRegionText, 'spd-per-' + this.cfgRev.toString(), true,
-                (v: string) => {
+          Row({ space: 10 }) {
+            this.ParamCell(this.speedScope === SpeedScope.PER_REGION ? this.t('每地区数量', 'Per-region count') : this.t('测速地址数', 'Test addresses'),
+              this.speedScope === SpeedScope.PER_REGION ? 'perRegion' : 'speedCount',
+              (this.speedScope === SpeedScope.PER_REGION ? 'spd-per-' : 'spd-count-') + this.cfgRev.toString(), true,
+              (v: string) => {
+                if (this.speedScope === SpeedScope.PER_REGION) {
                   this.speedPerRegionText = v;
-                  this.scheduleScanSave();
-                })
-              Column()
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .margin({ top: 10 })
-          } else {
-            Row({ space: 10 }) {
-              this.ParamCell(this.t('测速地址数', 'Test addresses'), this.speedCountText, 'spd-count-' + this.cfgRev.toString(), true,
-                (v: string) => {
+                } else {
                   this.speedCountText = v;
-                  this.scheduleScanSave();
-                })
-              Column()
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .margin({ top: 10 })
+                }
+                this.scheduleScanSave();
+              })
+            this.ParamCell(this.t('每地址次数', 'Rounds per address'), 'rounds', 'spd-rounds-' + this.cfgRev.toString(), true,
+              (v: string) => {
+                this.speedRoundsText = v;
+                this.scheduleScanSave();
+              })
           }
+          .width('100%')
+          .margin({ top: 10 })
+
+          Row({ space: 10 }) {
+            this.ParamCell(this.t('窗口 ms', 'Window ms'), 'window', 'spd-window-' + this.cfgRev.toString(), true,
+              (v: string) => {
+                this.speedWindowText = v;
+                this.scheduleScanSave();
+              })
+            Text(this.t('应用建议', 'Apply'))
+              .fontSize(12)
+              .fontColor(this.accentText())
+              .textAlign(TextAlign.Center)
+              .height(38)
+              .padding({ left: 14, right: 14 })
+              .backgroundColor(this.soft())
+              .borderRadius(10)
+              .constraintSize({ minWidth: 84 })
+              .onClick(() => {
+                this.applySpeedSuggestions();
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Bottom)
+          .margin({ top: 10 })
+
+          Row({ space: 10 }) {
+            this.ParamCell(this.t('测速域名（可选）', 'Test domain (optional)'), 'domain', 'spd-domain-' + this.cfgRev.toString(), false,
+              (v: string) => {
+                this.domain = v;
+                this.scheduleScanSave();
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
 
           if (this.speedScope === SpeedScope.REGION) {
-            Row({ space: 10 }) {
-              this.ParamCell(this.t('地区码', 'Region code'), this.regionCode, 'spd-region-' + this.cfgRev.toString(), false,
-                (v: string) => {
-                  this.regionCode = v;
-                  this.scheduleScanSave();
-                })
-              Column()
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .margin({ top: 10 })
-          }
-
-          Text(this.speedScope === SpeedScope.PER_REGION
-            ? this.t('按地区分组，每个地区各取延迟最低的前几个地址测速；覆盖所有地区。', 'Groups by region and speed-tests the few lowest-latency addresses in each region; covers all regions.')
-            : this.t('第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 10，范围 1~99）；上传数量可在「设置 → 订阅上传」限制。', 'Round 1 addresses are sorted by latency, lowest first, and only the top N are tested (default 10, range 1–99); the upload count can be limited in Settings → Subscription upload.'))
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .width('100%')
-            .margin({ top: 8 })
-
-          // 平板/电脑端横向空间充足：去掉「高级选项」折叠，参数直接全部展示
-          if (this.winW < 900) {
-            this.AdvRow(this.advSpeedOpen, () => {
-              animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
-                this.advSpeedOpen = !this.advSpeedOpen;
-              });
-            })
-          }
-
-          if (this.winW >= 900 || this.advSpeedOpen) {
-            Row({ space: 10 }) {
-              this.ParamCell(this.t('每地址次数', 'Rounds per address'), this.speedRoundsText, 'spd-rounds-' + this.cfgRev.toString(), true,
-                (v: string) => {
-                  this.speedRoundsText = v;
-                  this.scheduleScanSave();
-                })
-              this.ParamCell(this.t('窗口 ms', 'Window ms'), this.speedWindowText, 'spd-window-' + this.cfgRev.toString(), true,
-                (v: string) => {
-                  this.speedWindowText = v;
-                  this.scheduleScanSave();
-                })
-            }
-            .width('100%')
-            .margin({ top: 10 })
-
-            Row({ space: 10 }) {
-              this.ParamCell(this.t('测速域名（可选）', 'Test domain (optional)'), this.domain, 'spd-domain-' + this.cfgRev.toString(), false,
-                (v: string) => {
-                  this.domain = v;
-                  this.scheduleScanSave();
-                })
-              Column()
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .margin({ top: 10 })
-
-            Row() {
-              Text(this.t('解析测试', 'Resolve test'))
-                .fontSize(12)
-                .fontColor(this.accentText())
-                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                .backgroundColor(this.soft())
-                .borderRadius(9)
-                .onClick(() => {
-                  this.doResolve();
-                })
-              Text(this.domainInfoText)
-                .fontSize(11)
-                .fontColor(this.txt3())
-                .margin({ left: 10 })
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .margin({ top: 10 })
-
-            Text(this.t('每个地址测 ', 'Each address is tested ') + this.speedRoundsText + this.t(' 次取平均，单次下载窗口 ', ' times and the results averaged; each download window is ') + this.speedWindowText +
-              this.t('ms。建议次数不超过 10，否则总耗时很长。域名用于测速 Host/SNI 校验，并自动解析其 A（IPv4）/AAAA（IPv6）记录并入候选；留空则用 speed.cloudflare.com。', 'ms. Keep rounds at 10 or fewer, otherwise the total takes a long time. The domain is used for the test Host/SNI check and its A (IPv4)/AAAA (IPv6) records are resolved into candidates; if blank, speed.cloudflare.com is used.'))
+            Text(this.t('地区码：', 'Region code: ') + (this.regionCode.length > 0 ? this.regionCode : this.t('未设置（在「筛选」页填写）', 'not set (fill it on the Filter page)')))
               .fontSize(11)
               .fontColor(this.txt3())
               .width('100%')
-              .margin({ top: 8 })
+              .margin({ top: 10 })
           }
-        } else {
-          Text(this.t('已关闭下载测速：只做连接可用性与延迟筛选，不测下载速度。', 'Download speed test is off: only connectivity and latency are filtered; download speed is not measured.'))
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .width('100%')
-            .margin({ top: 8 })
+
+          Row({ space: 8 }) {
+            Text(this.t('解析测试', 'Resolve test'))
+              .fontSize(12)
+              .fontColor(this.accentText())
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              .backgroundColor(this.soft())
+              .borderRadius(9)
+              .onClick(() => {
+                this.doResolve();
+              })
+            Text(this.domainInfoText)
+              .fontSize(11)
+              .fontColor(this.txt3())
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .margin({ top: 10 })
+
         }
       }
       .onAreaChange((_o: Area, a: Area) => {
@@ -4523,27 +5297,7 @@ struct Index {
     .borderRadius(20)
     .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    // 宽屏时按左列高度撑满，保证左右两列卡片底部边界齐平。
-    // 注意：这里直接读 @State（而不是用 Builder 形参），否则量测值变化不会触发重建。
-    .constraintSize({ minHeight: this.speedCardMinH() })
-    .margin({ bottom: 12 })
-  }
-  @Builder ThemeChip(label: string, idx: number) {
-    Text(label)
-      .fontSize(13)
-      .fontColor(this.themeMode === idx ? '#FFFFFF' : this.txt2())
-      .textAlign(TextAlign.Center)
-      .layoutWeight(1)
-      .height(this.BTN_H)
-      .borderRadius(9)
-      .backgroundColor(this.themeMode === idx ? this.accentFill() : this.soft())
-      .onClick(() => {
-        this.themeMode = idx;
-        this.applyThemeMode();
-        ConfigStore.saveTheme(idx).catch((e: BusinessError) => {
-          this.addLog(this.t('保存主题失败：', 'Failed to save theme: ') + e.message);
-        });
-      })
+    .margin({ bottom: 0 })
   }
 
   /** 选项 chip 的选中判定：在 Builder 内部读取状态，保证点按后高亮即时刷新 */
@@ -4574,7 +5328,16 @@ struct Index {
 
   /** 滑块当前值：在 Builder 内部读取，拖动时百分比与位置即时刷新 */
   private pctVal(key: string): number {
-    return key === 'blur' ? this.bgBlurPct : this.bgBrightPct;
+    if (key === 'blur') {
+      return this.bgBlurPct;
+    }
+    if (key === 'scrim') {
+      return this.bgScrimPct;
+    }
+    if (key === 'card') {
+      return this.cardClearPct;
+    }
+    return this.bgBrightPct;
   }
 
   /** 一行滑块（标题 + 百分比 + Slider），用于背景图模糊 / 明亮程度 */
@@ -4596,11 +5359,15 @@ struct Index {
         .selectedColor(this.accent())
         .trackColor(this.dark ? '#22FFFFFF' : '#14000000')
         .blockColor(this.accent())
-        .enabled(this.bgPath.length > 0)
-        .opacity(this.bgPath.length > 0 ? 1 : 0.4)
+        .enabled(key === 'card' || this.bgPath.length > 0)
+        .opacity(key === 'card' || this.bgPath.length > 0 ? 1 : 0.4)
         .onChange((v: number) => {
           if (key === 'blur') {
             this.bgBlurPct = v;
+          } else if (key === 'scrim') {
+            this.bgScrimPct = v;
+          } else if (key === 'card') {
+            this.cardClearPct = v;
           } else {
             this.bgBrightPct = v;
           }
@@ -4612,10 +5379,150 @@ struct Index {
   }
 
   /** 外观 · 材质：全局沉浸光感 / 材质类型 / 材质等级 */
+  /** 预设背景缩略图（Android 端 rawfile 直读，避免额外解码文件） */
+  /** 背景图块可见内容宽度：宽屏要扣掉左侧分类栏 */
+  private bgContentW(): number {
+    const w: number = Math.min(this.winW, 1600);
+    const side: number = w >= 900 ? 336 : 0;
+    return Math.max(240, w - side - 32);
+  }
+
+  /** 一行放几个图块：内容窄时 4 个（两行），内容宽时 8 个（一行），避免被拉成细长条 */
+  private bgCols(): number {
+    const w: number = this.bgContentW();
+    if (w >= 860) {
+      return 9;
+    }
+    if (w >= 560) {
+      return 5;
+    }
+    return 3;
+  }
+
+  /** 图块高度：列数越少、单个越宽，相应加高以保持接近 3:2 的预览比例 */
+  private bgTileH(): number {
+    // 9 格（无 + 7 预设 + 自定义）在宽屏排一行、窄屏排三行，统一 76 高保持接近 3:2
+    return 76;
+  }
+
+  @Builder BgPresetTile(idx: number) {
+    Stack({ alignContent: Alignment.Center }) {
+      if (idx === 0) { Image($rawfile('bg/preset1.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      } else if (idx === 1) { Image($rawfile('bg/preset2.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      } else if (idx === 2) { Image($rawfile('bg/preset3.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      } else if (idx === 3) { Image($rawfile('bg/preset4.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      } else if (idx === 4) { Image($rawfile('bg/preset5.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      } else if (idx === 5) { Image($rawfile('bg/preset6.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      } else if (idx === 6) { Image($rawfile('bg/preset7.jpg'))
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+      }
+      if (this.presetBgIndex() === idx) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .borderRadius(12)
+          .border({ width: 2, color: this.accent() })
+      }
+    }
+    .width('100%')
+    .height(this.bgTileH())
+    .borderRadius(12)
+    .clip(true)
+    .backgroundColor(this.soft())
+    .onClick(() => {
+      this.usePresetBackground(idx);
+    })
+  }
+
+  /** 「无背景图」图块：与预设图块同尺寸同圆角，选中态与预设一致 */
+  @Builder BgNoneTile() {
+    Stack({ alignContent: Alignment.Center }) {
+      SymbolGlyph($r('sys.symbol.nosign'))
+        .fontSize(18)
+        .fontColor([this.txt3()])
+      if (this.bgPath.length === 0) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .borderRadius(12)
+          .border({ width: 2, color: this.accent() })
+      }
+    }
+    .width('100%')
+    .height(this.bgTileH())
+    .borderRadius(12)
+    .clip(true)
+    .backgroundColor(this.soft())
+    .onClick(() => {
+      this.clearBackground();
+    })
+  }
+
+  /**
+   * 「自定义」图块：当前模式已选自定义图就显示这张图，否则显示取图提示。
+   * 点它 = 从图库选图，选完直接替换**当前模式**的自定义图片。
+   */
+  @Builder BgCustomTile() {
+    Stack({ alignContent: Alignment.Center }) {
+      if (this.hasCustomImage()) {
+        Image('file://' + this.customPathFor(this.dark))
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Cover)
+          .opacity(this.isCustomSelected() ? 1 : 0.55)
+      } else {
+        Column({ space: 2 }) {
+          Text('+')
+            .fontSize(18)
+            .fontColor(this.txt3())
+          Text(this.t('自定义', 'Custom'))
+            .fontSize(9)
+            .fontColor(this.txt3())
+        }
+      }
+      if (this.isCustomSelected()) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .borderRadius(12)
+          .border({ width: 2, color: this.accent() })
+      }
+    }
+    .width('100%')
+    .height(this.bgTileH())
+    .borderRadius(12)
+    .clip(true)
+    .backgroundColor(this.soft())
+    .onClick(() => {
+      this.pickBackground();
+    })
+  }
+
+  /** 材质卡片（原独立分类，现作为「外观与主题」里的第二张卡片，控件与字段完全不变） */
   @Builder CardAppearanceMaterial() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle(this.t('材质', 'Material'), $r('sys.symbol.paintbrush'))
+        this.CardTitleWithHelp(this.t('材质', 'Material'), $r('sys.symbol.paintbrush'), HELP_MATERIAL)
 
         Row() {
           Column() {
@@ -4719,102 +5626,18 @@ struct Index {
     .margin({ bottom: 12 })
   }
 
-  /** 预设背景缩略图（Android 端 rawfile 直读，避免额外解码文件） */
-  /** 背景图块可见内容宽度：宽屏要扣掉左侧分类栏 */
-  private bgContentW(): number {
-    const w: number = Math.min(this.winW, 1600);
-    const side: number = w >= 900 ? 336 : 0;
-    return Math.max(240, w - side - 32);
+  /** 设置列表里「外观与主题」的摘要：当前主题 + 当前模式背景 + 材质 */
+  private appearanceSummary(): string {
+    const theme: string = this.themeMode === ThemeMode.SYSTEM
+      ? this.t('跟随系统', 'Follow system')
+      : (this.dark ? this.t('深色', 'Dark') : this.t('浅色', 'Light'));
+    const bg: string = this.bgPath.length === 0
+      ? this.t('默认背景', 'Default bg')
+      : (this.presetBgIndex() >= 0 ? this.t('预设背景', 'Preset bg') : this.t('自定义背景', 'Custom bg'));
+    return theme + ' · ' + bg + ' · ' + this.matTypeName() + ' · ' + this.matLevelName();
   }
 
-  /** 一行放几个图块：内容窄时 4 个（两行），内容宽时 8 个（一行），避免被拉成细长条 */
-  private bgCols(): number {
-    return this.bgContentW() >= 760 ? 8 : 4;
-  }
-
-  /** 图块高度：列数越少、单个越宽，相应加高以保持接近 3:2 的预览比例 */
-  private bgTileH(): number {
-    const cols: number = this.bgCols();
-    if (cols === 8) {
-      return 76;
-    }
-    return this.bgContentW() >= 560 ? 72 : 56;
-  }
-
-  @Builder BgPresetTile(idx: number) {
-    Stack({ alignContent: Alignment.Center }) {
-      if (idx === 0) { Image($rawfile('bg/preset1.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      } else if (idx === 1) { Image($rawfile('bg/preset2.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      } else if (idx === 2) { Image($rawfile('bg/preset3.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      } else if (idx === 3) { Image($rawfile('bg/preset4.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      } else if (idx === 4) { Image($rawfile('bg/preset5.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      } else if (idx === 5) { Image($rawfile('bg/preset6.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      } else if (idx === 6) { Image($rawfile('bg/preset7.jpg'))
-        .width('100%')
-        .height('100%')
-        .objectFit(ImageFit.Cover)
-      }
-      if (this.presetBgIndex() === idx) {
-        Column()
-          .width('100%')
-          .height('100%')
-          .borderRadius(12)
-          .border({ width: 2, color: this.accent() })
-      }
-    }
-    .width('100%')
-    .height(this.bgTileH())
-    .borderRadius(12)
-    .clip(true)
-    .backgroundColor(this.soft())
-    .onClick(() => {
-      this.usePresetBackground(idx);
-    })
-  }
-
-  /** 「无背景图」图块：与预设图块同尺寸同圆角，选中态与预设一致 */
-  @Builder BgNoneTile() {
-    Stack({ alignContent: Alignment.Center }) {
-      SymbolGlyph($r('sys.symbol.nosign'))
-        .fontSize(18)
-        .fontColor([this.txt3()])
-      if (this.bgPath.length === 0) {
-        Column()
-          .width('100%')
-          .height('100%')
-          .borderRadius(12)
-          .border({ width: 2, color: this.accent() })
-      }
-    }
-    .width('100%')
-    .height(this.bgTileH())
-    .borderRadius(12)
-    .clip(true)
-    .backgroundColor(this.soft())
-    .onClick(() => {
-      this.clearBackground();
-    })
-  }
-
-  /** 外观 · 背景：颜色模式 / 主题色 / 背景图 / 模糊 / 明亮 */
+  /** 外观 · 背景：颜色模式 / 主题色 / 背景图（9 格）/ 模糊 / 明亮 —— 结构沿用改造前版本 */
   @Builder CardAppearanceBackground() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
@@ -4865,20 +5688,17 @@ struct Index {
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
-          Text(this.t('图库选择', 'Choose from gallery'))
-            .fontSize(12)
-            .fontColor(this.accentText())
-            .padding({ left: 12, right: 12, top: 7, bottom: 7 })
-            .backgroundColor(this.dark ? '#1AFFFFFF' : '#10000000')
-            .borderRadius(10)
-            .onClick(() => {
-              this.pickBackground();
-            })
+          Text(this.themeMode === ThemeMode.SYSTEM
+            ? this.t('跟随系统：', 'Follows system: ')
+              + (this.dark ? this.t('深色', 'dark') : this.t('浅色', 'light'))
+            : (this.dark ? this.t('深色模式', 'Dark mode') : this.t('浅色模式', 'Light mode')))
+            .fontSize(11)
+            .fontColor(this.txt3())
         }
         .width('100%')
         .margin({ top: 18 })
 
-        if (this.bgCols() === 8) {
+        if (this.bgCols() === 9) {
           Row({ space: 8 }) {
             Column() {
               this.BgNoneTile()
@@ -4912,59 +5732,76 @@ struct Index {
               this.BgPresetTile(6)
             }
             .layoutWeight(1)
+            Column() {
+              this.BgCustomTile()
+            }
+            .layoutWeight(1)
           }
           .width('100%')
           .alignItems(VerticalAlign.Center)
           .margin({ top: 10 })
         } else {
-        Row({ space: 8 }) {
-          Column() {
-            this.BgNoneTile()
+          Row({ space: 8 }) {
+            Column() {
+              this.BgNoneTile()
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(0)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(1)
+            }
+            .layoutWeight(1)
           }
-          .layoutWeight(1)
-          Column() {
-            this.BgPresetTile(0)
-          }
-          .layoutWeight(1)
-          Column() {
-            this.BgPresetTile(1)
-          }
-          .layoutWeight(1)
-          Column() {
-            this.BgPresetTile(2)
-          }
-          .layoutWeight(1)
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-        .margin({ top: 10 })
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .margin({ top: 10 })
 
-        Row({ space: 8 }) {
-          Column() {
-            this.BgPresetTile(3)
+          Row({ space: 8 }) {
+            Column() {
+              this.BgPresetTile(2)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(3)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(4)
+            }
+            .layoutWeight(1)
           }
-          .layoutWeight(1)
-          Column() {
-            this.BgPresetTile(4)
-          }
-          .layoutWeight(1)
-          Column() {
-            this.BgPresetTile(5)
-          }
-          .layoutWeight(1)
-          Column() {
-            this.BgPresetTile(6)
-          }
-          .layoutWeight(1)
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-        }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .margin({ top: 8 })
 
+          Row({ space: 8 }) {
+            Column() {
+              this.BgPresetTile(5)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgPresetTile(6)
+            }
+            .layoutWeight(1)
+            Column() {
+              this.BgCustomTile()
+            }
+            .layoutWeight(1)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .margin({ top: 8 })
+        }
 
         // 两个滑杆属于常用外观调节，直接展示，不再折叠
         this.PctSliderRow(this.t('背景图模糊程度', 'Background blur'), 'blur')
         this.PctSliderRow(this.t('背景图明亮程度', 'Background brightness'), 'bright')
+        // 遮罩程度由用户决定：喜欢背景质感就调低，需要更清楚的文字就调高
+        this.PctSliderRow(this.t('背景遮罩程度', 'Background scrim'), 'scrim')
+        this.PctSliderRow(this.t('卡片通透度', 'Card clarity'), 'card')
       }
       .width('100%')
       .padding(16)
@@ -4980,7 +5817,7 @@ struct Index {
     .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
-    }
+  }
 
   /** 主题色色块 */
   @Builder ThemeColorDot(idx: number) {
@@ -5055,16 +5892,12 @@ struct Index {
   @Builder CardRuntime() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle(this.t('运行', 'Runtime'), $r('sys.symbol.gearshape'))
+        this.CardTitleWithHelp(this.t('运行', 'Runtime'), $r('sys.symbol.gearshape'), HELP_RUNTIME)
         Row() {
           Column({ space: 3 }) {
             Text(this.t('后台保持运行', 'Keep running in background'))
               .fontSize(14)
               .fontColor(this.txt())
-            Text(this.t('开启后扫描/测速/上传期间切到后台不中断：手机/平板使用数据传输连续任务，PC 优先计算任务；关闭则使用系统默认行为', 'When on, scans, speed tests and uploads keep running after switching to the background: DATA_TRANSFER continuous task on phones/tablets, compute task preferred on PC. When off, the system default applies.'))
-              .fontSize(11)
-              .fontColor(this.txt3())
-              .lineHeight(16)
           }
           .layoutWeight(1)
           .alignItems(HorizontalAlign.Start)
@@ -5282,12 +6115,7 @@ struct Index {
   @Builder CardDiag() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle(this.t('网络诊断', 'Network diagnostics'), $r('sys.symbol.info_circle'))
-        Text(this.t('用于区分「应用 Socket 问题 / 运营商路由问题 / 随机地址不可达 / 超时过短 / 延迟门槛过严」。自检固定使用 3000ms 超时、顺序执行，不会修改扫描配置。', 'Helps distinguish app socket issues / carrier routing issues / unreachable random addresses / timeouts that are too short / an overly strict latency threshold. The self-test always uses a 3000ms timeout and runs sequentially; it does not change scan settings.'))
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .lineHeight(16)
-          .margin({ top: 8 })
+        this.CardTitleWithHelp(this.t('网络诊断', 'Network diagnostics'), $r('sys.symbol.info_circle'), HELP_DIAG)
         Row({ space: 10 }) {
           Text(this.diagBusy ? this.t('诊断中…', 'Diagnosing…') : this.t('运行 IPv4 自检', 'Run IPv4 self-test'))
             .fontSize(13)
@@ -5541,6 +6369,17 @@ TabContent() {
   }
 
   private openChangelog(): void {
+    if (this.winW >= 900) {
+      // 宽屏没有「二级页」概念：直接切右栏，别走 openSub 留下脏 settingsSub
+      if (this.changelogOpen.length === 0) {
+        this.changelogOpen = this.changelogDefaultOpen();
+      }
+      this.settingsPane = 6;
+      this.settingsSub = -1;
+      this.settingsStack = [];
+      this.settingsScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      return;
+    }
     this.openSub(6);
   }
 
@@ -5750,27 +6589,25 @@ TabContent() {
       .width('100%')
       .padding(18)
       .alignItems(HorizontalAlign.Start)
-      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK,
+      .backgroundColor(this.modalVeil())
+      .backgroundBlurStyle(this.cardBlurStyle(),
         { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
       .linearGradient({ angle: 145, colors: this.cardTint() })
-      .borderRadius(22)
+      .borderRadius(20)
       .border({ width: 1, color: this.cardBorderColor() })
-      .shadow({ radius: 28, color: 'rgba(0,0,0,0.35)', offsetX: 0, offsetY: 10 })
+      .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
       .margin({ left: 24, right: 24 })
     }
     .width('100%')
     .height('100%')
     .justifyContent(FlexAlign.Center)
-    .backgroundColor('rgba(0,0,0,0.32)')
+    .backgroundColor('rgba(0,0,0,0.38)')
   }
 
   // ===== 设置：二级分类 =====
   private subTitle(id: number): string {
     if (id === 0) {
       return this.t('外观与主题', 'Appearance');
-    }
-    if (id === 1) {
-      return this.t('沉浸材质与光感', 'Immersive material');
     }
     if (id === 2) {
       return this.t('订阅与上传', 'Subscription upload');
@@ -5787,29 +6624,57 @@ TabContent() {
     return this.t('更新日志', 'Changelog');
   }
 
+  /**
+   * 进入设置二级页（手机布局）。
+   * 从设置首页进入：记录首页滚动位置、清空浏览历史；
+   * 已在二级页时再跳转（如「关于与更新」→「更新日志」）：把当前页压栈，保证逐级返回。
+   */
   private openSub(id: number): void {
-    try {
-      this.settingsScrollCache = this.settingsScroller.currentOffset().yOffset;
-    } catch (e) {
-      this.settingsScrollCache = 0;
+    if (this.settingsSub < 0) {
+      try {
+        this.settingsScrollCache = this.settingsScroller.currentOffset().yOffset;
+      } catch (e) {
+        this.settingsScrollCache = 0;
+      }
+      this.settingsStack = [];
+    } else if (this.settingsSub !== id) {
+      const frame: SettingsFrame = { id: this.settingsSub, scrollY: this.currentSettingsY() };
+      this.settingsStack.push(frame);
     }
     this.settingsSub = id;
     if (id === 6 && this.changelogOpen === '') {
       this.changelogOpen = this.changelogDefaultOpen();
     }
-    setTimeout(() => {
-      try {
-        this.settingsScroller.scrollTo({ xOffset: 0, yOffset: 0 });
-      } catch (e) {
-      }
-    }, 0);
+    this.scrollSettingsTo(0);
   }
 
+  /** 返回上一级：有浏览历史先逐级回退，否则回到设置首页并恢复首页滚动位置 */
   private closeSub(): void {
+    const frame: SettingsFrame | undefined = this.settingsStack.pop();
+    if (frame !== undefined) {
+      this.settingsSub = frame.id;
+      this.scrollSettingsTo(frame.scrollY);
+      return;
+    }
     this.settingsSub = -1;
-    const y: number = this.settingsScrollCache;
-    // 首页内容比二级页高，首帧可能还没完成布局（此时 scrollTo 会被夹到较小的可滚动范围），
-    // 因此在 0 / 90 / 220ms 各校正一次，保证回到原来的滚动位置。
+    this.scrollSettingsTo(this.settingsScrollCache);
+  }
+
+  /** 当前设置页滚动位置（取不到时按 0 处理） */
+  private currentSettingsY(): number {
+    try {
+      return this.settingsScroller.currentOffset().yOffset;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /**
+   * 恢复设置页滚动位置。
+   * 页面内容高度变化后首帧可能还没完成布局（此时 scrollTo 会被夹到较小的可滚动范围），
+   * 因此在 0 / 90 / 220ms 各校正一次，保证回到原来的滚动位置。
+   */
+  private scrollSettingsTo(y: number): void {
     const tries: number[] = [0, 90, 220];
     for (let i = 0; i < tries.length; i++) {
       setTimeout(() => {
@@ -5823,6 +6688,29 @@ TabContent() {
     }
   }
 
+  /**
+   * 系统返回事件（返回键 / 屏幕左右边缘侧滑）统一入口。
+   * 覆盖「来源分组管理页」与「设置二级页」两处覆盖层/子页：
+   * 都复用页面内返回按钮的同一套逐级返回逻辑（srcMgrBack / closeSub），
+   * 手势与按钮行为一致；其他页面不拦截，保持原有退出行为。
+   */
+  onBackPress(): boolean {
+    // 功能说明弹窗：返回键优先关闭弹窗（页面输入与滚动位置不变）
+    if (this.helpKey.length > 0) {
+      this.closeHelp();
+      return true;
+    }
+    if (this.srcMgr) {
+      this.srcMgrBack();
+      return true;
+    }
+    if (this.winW < 900 && this.curTab === 3 && this.settingsSub >= 0) {
+      this.closeSub();
+      return true;
+    }
+    return false;
+  }
+
   /** 分类入口行 */
   @Builder SettingsRow(id: number, icon: Resource, title: string, sub: string) {
     Row({ space: 12 }) {
@@ -5832,7 +6720,8 @@ TabContent() {
       Column({ space: 2 }) {
         Text(title)
           .fontSize(14)
-          .fontColor(this.txt())
+          .fontWeight(this.winW >= 900 && this.settingsPane === id ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor(this.winW >= 900 && this.settingsPane === id ? this.accentText() : this.txt())
         Text(sub)
           .fontSize(11)
           .fontColor(this.txt3())
@@ -5848,13 +6737,19 @@ TabContent() {
     .width('100%')
     .padding({ left: 14, right: 14, top: 11, bottom: 11 })
     .borderRadius(14)
-    .backgroundColor(this.soft())
+    // 宽屏才有「当前分类」概念：选中行给一点主题色底与主题色标题，避免左菜单看不出选中项
+    .backgroundColor(this.winW >= 900 && this.settingsPane === id ? this.accentRgba(0.26) : this.soft())
     .margin({ top: 8 })
     .onClick(() => {
       if (this.winW >= 900) {
         // 宽屏：左侧菜单 + 右侧内容，原地切换
         this.settingsPane = id;
         this.settingsSub = -1;
+        this.settingsStack = [];
+        // 更新日志在宽屏没有二级页，进入时也要初始化展开项
+        if (id === 6 && this.changelogOpen.length === 0) {
+          this.changelogOpen = this.changelogDefaultOpen();
+        }
         this.settingsScroller.scrollTo({ xOffset: 0, yOffset: 0 });
       } else {
         // 手机：进入分类详情页（返回回到菜单），不再在页面底部内嵌展开
@@ -5866,7 +6761,7 @@ TabContent() {
   /** 二级页顶部：返回 + 标题 */
   @Builder SubHeader() {
     Row({ space: 10 }) {
-      Text(this.settingsSub === 6 ? '‹' : '‹')
+      Text('‹')
         .fontSize(22)
         .fontColor(this.accentText())
         .width(30)
@@ -5958,14 +6853,6 @@ TabContent() {
       Stack({ alignContent: Alignment.TopStart }) {
         Column() {
           this.CardTitle(this.t('设置', 'Settings'), $r('sys.symbol.gearshape'))
-          this.SettingsRow(0, $r('sys.symbol.paintbrush'),
-            this.t('外观与主题', 'Appearance'),
-            this.t('颜色模式 · 主题色 · 背景图', 'Color mode · accent · background'))
-          this.SettingsRow(1, $r('sys.symbol.line_3_horizontal'),
-            this.t('沉浸材质与光感', 'Immersive material'),
-            this.globalImmersion
-              ? this.t('已开启 · ', 'On · ') + this.matTypeName() + ' · ' + this.matLevelName()
-              : this.t('已关闭（卡片与导航不使用沉浸光感）', 'Off (cards and navigation use solid style)'))
           this.SettingsRow(2, $r('sys.symbol.icloud'),
             this.t('订阅与上传', 'Subscription upload'),
             this.etEnabled ? this.t('自动上传已开启', 'Auto upload on') : this.t('自动上传已关闭', 'Auto upload off'))
@@ -5973,6 +6860,9 @@ TabContent() {
             this.t('运行与网络', 'Runtime & network'),
             this.keepAlive ? this.t('后台保活已开启', 'Background keep-alive on') : this.t('后台保活已关闭', 'Background keep-alive off') +
               this.t(' · 网络诊断与导出', ' · diagnostics & export'))
+          this.SettingsRow(0, $r('sys.symbol.paintbrush'),
+            this.t('外观与主题', 'Appearance & theme'),
+            this.appearanceSummary())
           this.SettingsRow(4, $r('sys.symbol.info_circle'),
             this.t('关于与更新', 'About & updates'),
             'v' + this.appVersion + this.t(' · 检查更新 · 更新日志', ' · Updates · Changelog'))
@@ -6004,21 +6894,16 @@ TabContent() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
         this.CardTitle(this.t('设置', 'Settings'), $r('sys.symbol.gearshape'))
-        this.SettingsRow(0, $r('sys.symbol.paintbrush'),
-          this.t('外观与主题', 'Appearance'),
-          this.t('颜色模式 · 主题色 · 背景图', 'Color mode · accent · background'))
-        this.SettingsRow(1, $r('sys.symbol.line_3_horizontal'),
-          this.t('沉浸材质与光感', 'Immersive material'),
-          this.globalImmersion
-            ? this.t('已开启 · ', 'On · ') + this.matTypeName() + ' · ' + this.matLevelName()
-            : this.t('已关闭（卡片与导航不使用沉浸光感）', 'Off (cards and navigation use solid style)'))
         this.SettingsRow(2, $r('sys.symbol.icloud'),
           this.t('订阅与上传', 'Subscription upload'),
           this.etEnabled ? this.t('自动上传已开启', 'Auto upload on') : this.t('自动上传已关闭', 'Auto upload off'))
         this.SettingsRow(3, $r('sys.symbol.gearshape'),
           this.t('运行与网络', 'Runtime & network'),
           this.keepAlive ? this.t('后台保活已开启', 'Background keep-alive on') : this.t('后台保活已关闭', 'Background keep-alive off') +
-              this.t(' · 网络诊断与导出', ' · diagnostics & export'))
+            this.t(' · 网络诊断与导出', ' · diagnostics & export'))
+        this.SettingsRow(0, $r('sys.symbol.paintbrush'),
+          this.t('外观与主题', 'Appearance & theme'),
+          this.appearanceSummary())
         this.SettingsRow(4, $r('sys.symbol.info_circle'),
           this.t('关于与更新', 'About & updates'),
           'v' + this.appVersion + this.t(' · 检查更新 · 更新日志', ' · Updates · Changelog'))
@@ -6046,8 +6931,8 @@ TabContent() {
   /** 分类内容：手机详情页与宽屏右栏共用同一份实现（读 bodyIdx() 保证响应式） */
   @Builder CatBody() {
     if (this.bodyIdx() === 0) {
+      // 外观与主题：恢复成「外观」卡片 + 独立的「材质」卡片（材质不再单独占菜单项）
       this.CardAppearanceBackground()
-    } else if (this.bodyIdx() === 1) {
       this.CardAppearanceMaterial()
     } else if (this.bodyIdx() === 2) {
       this.CardUpload()
@@ -6068,16 +6953,16 @@ TabContent() {
   @Builder SettingsPage() {
     Column() {
       if (this.winW >= 900) {
-        // 平板/电脑：左侧菜单 + 右侧内容（右侧限宽、独立滚动）
-        Row({ space: 16 }) {
+        // 平板/电脑：左侧菜单 + 右侧内容；整体限宽居中，两侧与两栏之间都留出阴影空间
+        Row({ space: 8 }) {
           Scroll() {
             Column() {
               this.SettingsMenu()
             }
             .width('100%')
-            .padding({ top: this.contentTop(), bottom: this.pageBottomPad() })
+            .padding({ left: 8, right: 8, top: this.contentTop(), bottom: this.pageBottomPad() })
           }
-          .width(320)
+          .width(300)
           .height('100%')
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
@@ -6088,8 +6973,7 @@ TabContent() {
               this.CatBody()
             }
             .width('100%')
-            .padding({ top: this.contentTop(), bottom: this.pageBottomPad() })
-            .constraintSize({ maxWidth: 900 })
+            .padding({ left: 14, right: 14, top: this.contentTop(), bottom: this.pageBottomPad() })
             .alignItems(HorizontalAlign.Start)
           }
           .layoutWeight(1)
@@ -6103,9 +6987,9 @@ TabContent() {
         }
         .width('100%')
         .height('100%')
-        .padding({ left: 16, right: 16 })
+        .padding({ left: 24, right: 24 })
         .alignItems(VerticalAlign.Top)
-        .constraintSize({ maxWidth: 1600 })
+        .constraintSize({ maxWidth: 1320 })
       } else {
         Scroll(this.settingsScroller) {
           Column() {
@@ -6128,6 +7012,10 @@ TabContent() {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
+        // 与宽屏两个 Scroll 保持一致：内容不足一屏时顶部对齐。
+        // 否则 Scroll 会把短内容（如「语言」详情页）整体垂直居中，
+        // 导致返回按钮随页面内容高度上下浮动。
+        .align(Alignment.TopStart)
         .linearGradientBlur(LG_BLUR_MAX, {
           fractionStops: this.lgStops(this.settingsVpH),
           direction: GradientDirection.Bottom
@@ -6231,7 +7119,7 @@ TabContent() {
   @Builder CardUpload() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        this.CardTitle(this.t('订阅上传', 'Subscription upload'), $r('sys.symbol.icloud'))
+        this.CardTitleWithHelp(this.t('订阅上传', 'Subscription upload'), $r('sys.symbol.icloud'), HELP_UPLOAD)
 
         Row() {
           Column() {
@@ -6443,13 +7331,6 @@ TabContent() {
             })
           }
   
-          Text(this.etWay === 1
-            ? this.t('提示：上传格式为「IP:端口#地区 V4/V6中文名序号」，例如 162.159.9.26:443#SG V4新加坡1；API 直传直接读写 Worker 绑定的 KV（键 ADD.txt），Token 只保存在本机，需要该 Account 的 Workers KV 读写权限。', 'Note: the upload format is "IP:port#region V4/V6ChineseNameIndex", e.g. 162.159.9.26:443#SG V4Singapore1. API direct upload reads and writes the Worker-bound KV (key ADD.txt); the token is stored only on this device and needs Workers KV read/write permission for that account.')
-            : this.t('提示：上传格式为「IP:端口#地区 V4/V6中文名序号」，例如 162.159.9.26:443#SG V4新加坡1；edgetunnel 需把「优选订阅模式」设为自定义订阅，节点不是越多越好。', 'Note: the upload format is "IP:port#region V4/V6ChineseNameIndex", e.g. 162.159.9.26:443#SG V4Singapore1. In edgetunnel, set "Preferred subscription mode" to custom subscription; more nodes is not always better.'))
-            .fontSize(11)
-            .fontColor(this.txt3())
-            .lineHeight(16)
-            .margin({ top: 8 })
         }
       }
       .onAreaChange((_o: Area, a: Area) => {
@@ -6503,9 +7384,6 @@ TabContent() {
 
   @Builder CardLog(fill: boolean, bodyH: number, withMat: boolean) {
     Stack({ alignContent: Alignment.TopStart }) {
-      if (withMat) {
-        this.MeasuredImmersionCard('log', 20)
-      }
       Column() {
         this.CardTitle(this.t('运行日志', 'Logs'), $r('sys.symbol.doc_text'))
         this.LogContent(bodyH)
@@ -6519,229 +7397,15 @@ TabContent() {
     .width('100%')
     .backgroundBlurStyle(fill ? BlurStyle.NONE : this.cardBlurStyle(), { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
     .linearGradient({ angle: 145, colors: this.cardTintOr(fill) })
-    .borderRadius(fill ? 0 : 16)
-    .border({ width: fill ? 0 : 1, color: this.lineC() })
-    .margin({ bottom: fill ? 0 : 12 })
+    .borderRadius(fill ? 0 : 20)
+    .border({ width: fill ? 0 : 1, color: fill ? this.lineC() : this.cardBorderColor() })
+    .shadow(fill ? { radius: 0, color: Color.Transparent, offsetX: 0, offsetY: 0 }
+      : { radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 0 })
+    .width('100%')
     }
   }
     
-    @Builder ToolBar() {
-    Row() {
-    Text(this.t('补测速前 5', 'Re-test top 5'))
-    .fontSize(12)
-    .fontColor('#FFFFFF')
-    .textAlign(TextAlign.Center)
-    .layoutWeight(1)
-    .height(40)
-    .backgroundColor(this.accentFill())
-    .borderRadius(10)
-    .onClick(() => {
-    this.runSpeedTop();
-    })
-    Text(this.t('导出 TXT', 'Export TXT'))
-    .fontSize(12)
-    .fontWeight(FontWeight.Medium)
-    .fontColor(this.accentText())
-    .textAlign(TextAlign.Center)
-    .width(88)
-    .height(40)
-    .backgroundColor(this.accentRgba(0.12))
-    .borderRadius(10)
-    .margin({ left: 8 })
-    .onClick(() => {
-    this.doExport(ExportFormat.PLAIN_COLO_DELAY);
-    })
-    Text(this.t('导出 CSV', 'Export CSV'))
-    .fontSize(12)
-    .fontWeight(FontWeight.Medium)
-    .fontColor(this.accentText())
-    .textAlign(TextAlign.Center)
-    .width(88)
-    .height(40)
-    .backgroundColor(this.accentRgba(0.12))
-    .borderRadius(10)
-    .margin({ left: 8 })
-    .onClick(() => {
-    this.doExport(ExportFormat.CSV);
-    })
-    }
-    .width('100%')
-    .margin({ bottom: 10 })
-    }
-    
-    // ---------- 第一轮：筛选结果（按地区分组，可展开看延迟） ----------
-    @Builder PingPage() {
-    Scroll(this.pingScroller) {
-    Column() {
-    Row().width('100%').height(px2vp(this.statusBarPx) + 66).hitTestBehavior(HitTestMode.None)
-    Stack({ alignContent: Alignment.TopStart }) {
-      Column() {
-        Row({ space: 6 }) {
-        Text(this.t('第一轮通过 ', 'Round 1 passed: ') + this.pingList.length.toString() + this.t(' 个', ' nodes'))
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.txt())
-        .layoutWeight(1)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(' · ' + this.groups.length.toString() + this.t(' 个地区', ' regions'))
-        .fontSize(12)
-        .fontColor(this.txt3())
-        .maxLines(1)
-        Text(this.precheckActive ? this.t('预检中…', 'Pre-checking…') : this.t('开始测速', 'Start speed test'))
-        .fontSize(12)
-        .fontColor('#FFFFFF')
-        .textAlign(TextAlign.Center)
-        .padding({ left: 12, right: 12 })
-        .constraintSize({ minWidth: 74 })
-        .height(34)
-        .backgroundColor(this.precheckActive ? this.soft() : this.accentFill())
-        .borderRadius(9)
-        .onClick(() => {
-        this.onStartSpeedClick();
-        })
-        }
-        .width('100%')
-        .margin({ bottom: 10 })
-    
-        if (this.precheckActive || (this.precheckDone && this.pcMsg.length > 0)) {
-        Row() {
-        Text(this.precheckActive ? this.t('质量预检中', 'Quality pre-check in progress') : this.t('质量预检', 'Quality pre-check'))
-        .fontSize(12)
-        .fontColor(this.accentText())
-        Blank()
-        Text(this.t('检测 ', 'Checked ') + this.pcChecked.toString() + this.t(' · 合格 ', ' · Qualified ') +
-        (this.pcTarget > 0 && this.pcQualified > this.pcTarget ? this.pcTarget : this.pcQualified).toString() +
-        this.t(' / 目标 ', ' / Target ') + this.pcTarget.toString())
-        .fontSize(11)
-        .fontColor(this.txt3())
-        }
-        .width('100%')
-        .margin({ bottom: 6 })
-    
-        // 质量预检进度条：与扫描页同一套视觉（底槽 + 渐变填充）
-        Stack({ alignContent: Alignment.Start }) {
-        Row()
-        .width('100%')
-        .height(6)
-        .backgroundColor(this.soft())
-        .borderRadius(3)
-        Row()
-        .width(this.pcBarPct().toFixed(1) + '%')
-        .height(6)
-        .linearGradient({
-        angle: 90,
-        colors: this.progressTint()
-        })
-        .borderRadius(3)
-        }
-        .width('100%')
-        .height(6)
-        .margin({ bottom: 6 })
-    
-        if (this.pcMsg.length > 0) {
-        Text(this.pcMsg)
-        .fontSize(10)
-        .fontColor(this.txt3())
-        .margin({ bottom: 10 })
-        }
-        }
-    
-        Row() {
-        Text(this.t('地区码', 'Region code'))
-        .fontSize(12)
-        .fontColor(this.txt2())
-        .width(52)
-        TextInput({ text: this.regionCode, placeholder: this.t('可留空；如 HKG / LAX', 'Optional; e.g. HKG / LAX') })
-        .layoutWeight(1)
-        .height(36)
-        .fontSize(12)
-        .fontColor(this.txt())
-        .backgroundColor(this.inputBg())
-        .borderRadius(9)
-        .onChange((v: string) => {
-        this.regionCode = v.toUpperCase();
-        // 地区码变了：上一轮的预检结论作废，点「开始测速」会先重新预检
-        this.precheckDone = false;
-        })
-        }
-        .width('100%')
-        .margin({ bottom: 10 })
-    
-        Text(this.t('先看下面各地区的最快延迟，挑延迟低的地区填码，再点右上「开始测速」；留空则测全部地区。', 'Check the fastest latency for each region below, pick a low-latency region and enter its code, then tap "Start speed test" at the top right; leave blank to test all regions.'))
-        .fontSize(11)
-        .fontColor(this.txt3())
-        .margin({ bottom: 12 })
-
-            if (this.pingList.length === 0) {
-              Column() {
-                Text(this.t('还没有筛选结果', 'No filter results yet'))
-                  .fontSize(15)
-                  .fontColor(this.txt2())
-                Text(this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection'))
-                  .fontSize(12)
-                  .fontColor(this.txt3())
-                  .margin({ top: 6 })
-              }
-              .width('100%')
-              .padding({ top: 60, bottom: 30 })
-            }
-      }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('ping', a);
-      })
-      .width('100%')
-      .alignItems(HorizontalAlign.Start)
-      .padding(16)
-    }
-    .width('100%')
-    .backgroundBlurStyle(this.cardBlurStyle(),
-      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.cardTint() })
-    .borderRadius(20)
-    .border({ width: 1, color: this.cardBorderColor() })
-    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    .margin({ bottom: 12 })
-
-        GridRow({
-          columns: { sm: 12, md: 12, lg: 12 },
-          gutter: { x: 14, y: 0 },
-          breakpoints: { value: ['600vp', '900vp'], reference: BreakpointsReference.WindowSize }
-        }) {
-          ForEach(this.groups, (g: RegionGroup) => {
-            GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
-              this.GroupRow(g)
-            }
-          }, (g: RegionGroup) => g.colo + '#' + g.count.toString() + '#' +
-            (this.expandedColos.indexOf(g.colo) >= 0 ? '1' : '0'))
-        }
-        .width('100%')
-
-
-      }
-      .width('100%')
-      .padding({ left: this.pageSidePad(), right: this.pageSidePad(), top: 12, bottom: this.pageBottomPad() })
-      .constraintSize({ maxWidth: 1600 })
-    }
-    .width('100%')
-    .height('100%')
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
-        .scrollBar(BarState.Off)
-    .edgeEffect(EdgeEffect.Spring)
-    .linearGradientBlur(LG_BLUR_MAX, {
-      fractionStops: this.lgStops(this.pingVpH),
-      direction: GradientDirection.Bottom
-    })
-    .onAreaChange((_o: Area, n: Area) => {
-      const h: number = Number(n.height);
-      if (h > 0 && Math.abs(h - this.pingVpH) > 0.5) {
-        this.pingVpH = h;
-      }
-    })
-    .onScroll(() => {
-      this.onPageScroll(this.pingScroller);
-    })
-  }
 
   @Builder GroupRow(g: RegionGroup) {
     Column() {
@@ -6805,6 +7469,155 @@ TabContent() {
   }
 
   // ---------- 第二轮：测速结果（只显示参与测速的 N 个） ----------
+    @Builder PingPage() {
+    Scroll(this.pingScroller) {
+    Column() {
+    Row().width('100%').height(px2vp(this.statusBarPx) + 66).hitTestBehavior(HitTestMode.None)
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
+        Row({ space: 6 }) {
+        Text(this.t('第一轮通过 ', 'Round 1 passed: ') + this.pingList.length.toString() + this.t(' 个', ' nodes'))
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.txt())
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(' · ' + this.groups.length.toString() + this.t(' 个地区', ' regions'))
+        .fontSize(12)
+        .fontColor(this.txt3())
+        .maxLines(1)
+        Text(this.precheckActive ? this.t('预检中…', 'Pre-checking…') : this.t('开始测速', 'Start speed test'))
+        .fontSize(12)
+        .fontColor('#FFFFFF')
+        .textAlign(TextAlign.Center)
+        .padding({ left: 12, right: 12 })
+        .constraintSize({ minWidth: 74 })
+        .height(34)
+        .backgroundColor(this.precheckActive ? this.soft() : this.accentFill())
+        .borderRadius(9)
+        .onClick(() => {
+        this.onStartSpeedClick();
+        })
+        }
+        .width('100%')
+        .margin({ bottom: 10 })
+    
+        if (this.precheckActive || (this.precheckDone && this.pcMsg.length > 0)) {
+        Column() {
+        this.ProgressStrip(1)
+        if (this.pcMsg.length > 0) {
+        Text(this.pcMsg)
+        .fontSize(10)
+        .fontColor(this.txt3())
+        .margin({ top: 6 })
+        }
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .margin({ bottom: 10 })
+        }
+
+        Row() {
+        Text(this.t('地区码', 'Region code'))
+        .fontSize(12)
+        .fontColor(this.txt2())
+        .width(52)
+        TextInput({ text: this.regionCode, placeholder: this.t('可留空；如 HKG / LAX', 'Optional; e.g. HKG / LAX') })
+        .layoutWeight(1)
+        .height(36)
+        .fontSize(12)
+        .fontColor(this.txt())
+        .backgroundColor(this.inputBg())
+        .borderRadius(9)
+        .onChange((v: string) => {
+        this.regionCode = v.toUpperCase();
+        // 地区码变了：上一轮的预检结论作废，点「开始测速」会先重新预检
+        this.precheckDone = false;
+        // 与扫描页共用同一份状态：改完立即持久化，扫描页的地区测速会读到新值
+        this.scheduleScanSave();
+        })
+        }
+        .width('100%')
+        .margin({ bottom: 10 })
+    
+        Text(this.t('先看下面各地区的最快延迟，挑延迟低的地区填码，再点右上「开始测速」；留空则测全部地区。', 'Check the fastest latency for each region below, pick a low-latency region and enter its code, then tap "Start speed test" at the top right; leave blank to test all regions.'))
+        .fontSize(11)
+        .fontColor(this.txt3())
+        .margin({ bottom: 12 })
+
+            if (this.pingList.length === 0) {
+              Column() {
+                Text(this.t('还没有筛选结果', 'No filter results yet'))
+                  .fontSize(15)
+                  .fontColor(this.txt2())
+                Text(this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection'))
+                  .fontSize(12)
+                  .fontColor(this.txt3())
+                  .margin({ top: 6 })
+              }
+              .width('100%')
+              .padding({ top: 60, bottom: 30 })
+            }
+      }
+      .onAreaChange((_o: Area, a: Area) => {
+        this.updateMeasuredCardHeight('ping', a);
+      })
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(16)
+    }
+    .width('100%')
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTint() })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 12 })
+
+        Row({ space: 14 }) {
+          ForEach(this.groupCols(), (col: RegionGroup[], ci: number) => {
+            Column() {
+              ForEach(col, (g: RegionGroup) => {
+                this.GroupRow(g)
+              }, (g: RegionGroup) => 'c' + ci.toString() + '#' + g.colo + '#' + g.count.toString() + '#' +
+                (this.expandedColos.indexOf(g.colo) >= 0 ? '1' : '0'))
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            .justifyContent(FlexAlign.Start)
+          }, (col: RegionGroup[], ci: number) => 'gc' + ci.toString() + '#' + col.length.toString())
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Top)
+
+
+      }
+      .width('100%')
+      .padding({ left: this.pageSidePad(), right: this.pageSidePad(), top: 12, bottom: this.pageBottomPad() })
+      .constraintSize({ maxWidth: 1600 })
+    }
+    .width('100%')
+    .height('100%')
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
+        .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
+    .linearGradientBlur(LG_BLUR_MAX, {
+      fractionStops: this.lgStops(this.pingVpH),
+      direction: GradientDirection.Bottom
+    })
+    .onAreaChange((_o: Area, n: Area) => {
+      const h: number = Number(n.height);
+      if (h > 0 && Math.abs(h - this.pingVpH) > 0.5) {
+        this.pingVpH = h;
+      }
+    })
+    .onScroll(() => {
+      this.onPageScroll(this.pingScroller);
+    })
+  }
+
   @Builder SpeedPage() {
     Scroll(this.speedScroller) {
       Column() {
@@ -6853,50 +7666,24 @@ TabContent() {
             .margin({ bottom: 8 })
         }
 
-        if (this.scanning) {
+        if (this.scanning && this.taskKind === 3) {
           Column() {
-            Row() {
-              Text(this.phaseText)
-                .fontSize(12)
-                .fontColor(this.txt2())
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .layoutWeight(1)
-              Text(this.progressLabel())
-                .fontSize(12)
-                .fontColor(this.txt3())
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .flexShrink(1)
-                .margin({ left: 8 })
-            }
-            .width('100%')
-
-            Stack({ alignContent: Alignment.Start }) {
-              Row()
-                .width('100%')
-                .height(9)
-                .backgroundColor(this.soft())
-                .borderRadius(3)
-              Row()
-                .width(((this.total > 0 ? this.done / this.total : 0) * 100).toFixed(1) + '%')
-                .height(9)
-                .linearGradient({
-                  angle: 90,
-                  colors: this.progressTint()
-                })
-                .borderRadius(4)
-            }
-            .width('100%')
-            .height(9)
-            .margin({ top: 8 })
+            this.ProgressStrip(2)
           }
           .width('100%')
           .margin({ bottom: 10 })
+        } else if (this.scanning) {
+          Text(this.t('第一轮扫描/预检进行中 · 测速在筛选完成后自动开始', 'Round 1 scanning/pre-check running · the speed test starts automatically afterwards'))
+            .fontSize(11)
+            .fontColor(this.txt3())
+            .width('100%')
+            .margin({ bottom: 10 })
         }
 
         Row() {
-          Text(this.scanning ? this.t('测速进行中…', 'Speed test in progress…') : this.t('重新测速', 'Re-run speed test'))
+          Text(this.scanning && this.taskKind === 3
+            ? this.t('测速进行中…', 'Speed test in progress…')
+            : (this.scanning ? this.t('扫描进行中…', 'Scanning…') : this.t('重新测速', 'Re-run speed test')))
             .fontSize(12)
             .fontColor(this.accentText())
             .textAlign(TextAlign.Center)
@@ -6913,10 +7700,10 @@ TabContent() {
 
         if (this.speedList.length === 0) {
           Column() {
-            Text(this.enableSpeed ? this.t('还没有测速结果', 'No speed test results yet') : this.t('下载测速已关闭', 'Download speed test is off'))
+            Text(this.t('还没有测速结果', 'No speed test results yet'))
               .fontSize(15)
               .fontColor(this.txt2())
-            Text(this.enableSpeed ? this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection') : this.t('在扫描页打开「下载测速」开关', 'Turn on "Download speed test" on the Scan tab'))
+            Text(this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection'))
               .fontSize(12)
               .fontColor(this.txt3())
               .margin({ top: 6 })
@@ -7405,6 +8192,19 @@ TabContent() {
     this.groups = groups;
   }
 
+  /** 地区分组按列独立流式：每列各自排布，展开某张卡只把本列下面的卡片推下去 */
+  private groupCols(): RegionGroup[][] {
+    const n: number = this.winW >= 900 ? 3 : (this.winW >= 600 ? 2 : 1);
+    const out: RegionGroup[][] = [];
+    for (let i = 0; i < n; i++) {
+      out.push([]);
+    }
+    for (let k = 0; k < this.groups.length; k++) {
+      out[k % n].push(this.groups[k]);
+    }
+    return out;
+  }
+
   toggleGroup(colo: string): void {
     const arr: string[] = this.expandedColos.slice();
     const idx: number = arr.indexOf(colo);
@@ -7425,143 +8225,784 @@ TabContent() {
     });
   }
 
-  /** 从文件导入自定义 IP 列表 */
-  importIpFile(): void {
+  // ——————————————————— 三种来源导入（链接 / 文件 / 文本） ———————————————————
+  // 三种方式都只做「取得文本」这一件事，格式校验与 IP 类型判定统一交给 Sources.parseImport：
+  // 它按内容实际格式分类，混合内容只收当前族并逐行给出拒绝原因。
+
+  /** 从链接取回文本（沿用原有超时/错误处理，不扩大格式支持） */
+  private async fetchUrlText(urlIn: string): Promise<string> {
+    const url: string = urlIn.trim();
+    if (url.length === 0) {
+      throw new Error(this.t('请先填写链接', 'Enter a link first'));
+    }
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      throw new Error(this.t('链接需以 http(s):// 开头', 'The link must start with http(s)://'));
+    }
+    const req = http.createHttp();
+    try {
+      const resp: http.HttpResponse = await req.request(url, {
+        method: http.RequestMethod.GET,
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 10000,
+        readTimeout: 20000,
+        usingCache: false
+      });
+      req.destroy();
+      if (resp.responseCode !== 200) {
+        throw new Error(this.t('拉取失败：HTTP ', 'Fetch failed: HTTP ') + resp.responseCode.toString());
+      }
+      const text: string = typeof resp.result === 'string' ? resp.result as string : '';
+      if (text.trim().length === 0) {
+        throw new Error(this.t('链接内容为空', 'The link returned no content'));
+      }
+      return text;
+    } catch (err) {
+      try {
+        req.destroy();
+      } catch (e) {
+      }
+      const e2: BusinessError = err as BusinessError;
+      throw new Error(e2.message.length > 0 ? e2.message : this.t('拉取失败', 'Fetch failed'));
+    }
+  }
+
+  /** 拉取社区段库到指定 IP 族（沿用原有链接；段库按族独立保存，互不覆盖） */
+  private async fetchCommunity(fam: number): Promise<boolean> {
+    const url: string = fam === SRC_FAM_V6 ? LIB_SOURCES[2].url : LIB_SOURCES[3].url;
+    this.srcMgrBusy = true;
+    try {
+      const text: string = await this.fetchUrlText(url);
+      await Sources.setCommunityText(fam, text);
+      this.srcRev++;
+      const n: number = Sources.communityLineCount(fam);
+      if (n === 0) {
+        const msg: string = this.t('段库里没有符合 ', 'No valid ') + this.famText(fam) + this.t(' 的网段', ' ranges in the fetched content');
+        this.toast(msg);
+        this.addLog(msg + '：' + url);
+        return false;
+      }
+      const ok: string = this.t('已更新社区段库：', 'Community ranges updated: ') + n.toString() + this.t(' 行（', ' lines (') + this.famText(fam) + '）';
+      this.toast(ok);
+      this.addLog(ok);
+      return true;
+    } catch (err) {
+      const e2: BusinessError = err as BusinessError;
+      this.toast(this.t('拉取失败：', 'Fetch failed: ') + e2.message);
+      this.addLog(this.t('社区段库拉取失败：', 'Community fetch failed: ') + e2.message);
+      return false;
+    } finally {
+      this.srcMgrBusy = false;
+    }
+  }
+
+  /** 选文件并读成文本（沿用原有 DocumentViewPicker + fileIo + utf-8 解码） */
+  private async pickFileText(): Promise<string> {
     if (this.ctx === undefined || this.ctx === null) {
-      return;
+      throw new Error(this.t('应用上下文未就绪', 'App context not ready'));
     }
     const opts = new picker.DocumentSelectOptions();
     opts.maxSelectNumber = 1;
     const dp = new picker.DocumentViewPicker(this.ctx);
-    dp.select(opts).then((uris: string[]) => {
-      if (uris === undefined || uris === null || uris.length === 0) {
-        return;
-      }
-      try {
-        const f = fileIo.openSync(uris[0], fileIo.OpenMode.READ_ONLY);
-        const stat = fileIo.statSync(f.fd);
-        const buf = new ArrayBuffer(stat.size);
-        fileIo.readSync(f.fd, buf);
-        fileIo.closeSync(f);
-        const decoder = util.TextDecoder.create('utf-8');
-        const text: string = decoder.decodeToString(new Uint8Array(buf));
-        const merged: string = this.customText.length > 0 ? (this.customText + '\n' + text) : text;
-        this.customText = merged;
-        this.mode = ScanMode.CUSTOM;
-        let lines: number = 0;
-        const parts: string[] = text.split('\n');
-        for (let i = 0; i < parts.length; i++) {
-          if (parts[i].trim().length > 0) {
-            lines++;
-          }
-        }
-        this.toast(this.t('已导入 ', 'Imported ') + lines.toString() + this.t(' 行', ' lines'));
-        this.addLog(this.t('从文件导入 ', 'Imported from file: ') + lines.toString() + this.t(' 行候选地址', ' candidate addresses'));
-      } catch (err) {
-        const e2: BusinessError = err as BusinessError;
-        this.toast(this.t('读取失败：', 'Read failed: ') + e2.message);
-      }
-    }).catch((err: BusinessError) => {
-      this.toast(this.t('选择文件失败：', 'Failed to select file: ') + err.message);
-    });
-  }
-  sourceBrief(): string {
-    if (this.srcIdx === 0) {
-      return this.t('内置官方段库', 'Built-in official ranges');
+    const uris: string[] = await dp.select(opts);
+    if (uris === undefined || uris === null || uris.length === 0) {
+      return '';
     }
-    if (this.srcIdx === 3) {
-      const n: number = this.customText.split('\n').filter((l: string) => l.trim().length > 0).length;
-      return n > 0 ? (this.t('自定义：', 'Custom: ') + n.toString() + this.t(' 行', ' lines')) : this.t('自定义：未添加来源', 'Custom: no sources added');
+    const uri: string = uris[0];
+    const idx: number = uri.lastIndexOf('/');
+    this.lastPickName = idx >= 0 ? uri.substring(idx + 1) : uri;
+    const f = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+    try {
+      const stat = fileIo.statSync(f.fd);
+      if (stat.size <= 0) {
+        throw new Error(this.t('文件为空', 'The file is empty'));
+      }
+      const buf = new ArrayBuffer(stat.size);
+      fileIo.readSync(f.fd, buf);
+      const decoder = util.TextDecoder.create('utf-8');
+      const text: string = decoder.decodeToString(new Uint8Array(buf));
+      if (text.trim().length === 0) {
+        throw new Error(this.t('文件里没有内容', 'The file has no content'));
+      }
+      return text;
+    } finally {
+      fileIo.closeSync(f);
     }
-    const n2: number = this.customText.split('\n').filter((l: string) => l.trim().length > 0).length;
-    return (this.srcIdx === 1 ? this.t('社区 IPv6 段库', 'Community IPv6 ranges') : this.t('社区 IPv4 段库', 'Community IPv4 ranges')) + (n2 > 0 ? ('：' + n2.toString() + this.t(' 行', ' lines')) : '');
   }
 
-  /** 从链接导入自定义 IP 列表（优选库） */
-  applySource(idx: number): void {
-    this.srcIdx = idx;
-    if (idx === 0) {
-      this.mode = ScanMode.OFFICIAL;
-      this.scheduleScanSave();
+  // ——————————————————— 来源分组管理页：状态与取值 ———————————————————
+
+  private lastPickName: string = '';
+
+  private openSrcMgr(): void {
+    this.srcMgr = true;
+    this.srcMgrView = 0;
+    this.srcMgrGid = '';
+    this.srcMgrMsg = '';
+    this.srcRename = false;
+    this.srcConfirmGroup = false;
+    this.srcConfirmSrc = '';
+    this.srcLinkDraft = '';
+    this.srcPasteDraft = '';
+    this.srcShowQuarantine = false;
+    this.srcEditSid = '';
+    this.srcEditDraft = '';
+  }
+
+  /** 返回/关闭：在二级视图里先回列表，列表根视图才真正关闭 */
+  private closeSrcMgr(): void {
+    this.srcConfirmSrc = '';
+    this.srcEditSid = '';
+    this.srcEditDraft = '';
+    if (this.srcMgrView !== 0) {
+      this.srcMgrView = 0;
+      this.srcMgrGid = '';
+      this.srcRename = false;
+      this.srcConfirmGroup = false;
+      this.srcMgrMsg = '';
       return;
     }
-    this.mode = ScanMode.CUSTOM;
-    if (idx === 1) {
-      this.ipVersion = IpVersion.V6;
-      this.importUrl = LIB_SOURCES[2].url;
-      if (this.customText.trim().length === 0) {
-        this.importIpUrl();
-      }
-    } else if (idx === 2) {
-      this.ipVersion = IpVersion.V4;
-      this.importUrl = LIB_SOURCES[3].url;
-      if (this.customText.trim().length === 0) {
-        this.importIpUrl();
-      }
-    } else if (idx === 3) {
-      this.ipVersion = this.ipVersion;
-      if (this.customText.trim().length === 0) {
-        this.toast(this.t('自定义为空，请添加来源', 'Custom source is empty; add a source'));
-        this.importDlg.open();
-      }
-    }
-    this.scheduleScanSave();
+    this.srcMgr = false;
   }
 
-  importIpUrl(): void {
-    const url: string = this.importUrl.trim();
+  /**
+   * 逐级返回（与系统返回手势同一入口）：
+   * 编辑来源 / 添加链接 / 添加文本 → 分组详情 → 分组列表 → 关闭面板。
+   */
+  private srcMgrBack(): void {
+    this.srcConfirmSrc = '';
+    if (this.srcMgrView === 4) {
+      this.srcMgrView = 1;
+      this.srcEditSid = '';
+      this.srcEditDraft = '';
+      this.srcMgrMsg = '';
+      return;
+    }
+    if (this.srcMgrView === 2 || this.srcMgrView === 3) {
+      this.srcMgrView = 1;
+      this.srcMgrMsg = '';
+      return;
+    }
+    if (this.srcMgrView === 1) {
+      this.srcMgrView = 0;
+      this.srcMgrGid = '';
+      this.srcRename = false;
+      this.srcConfirmGroup = false;
+      this.srcMgrMsg = '';
+      return;
+    }
+    this.srcMgr = false;
+  }
+
+  /** 宽屏面板高度：按当前视图取，列表页更矮，避免大面积留白 */
+  private srcMgrPanelH(): number {
+    if (this.srcMgrView === 0) {
+      return 400;
+    }
+    if (this.srcMgrView === 1) {
+      return 540;
+    }
+    return 470;
+  }
+
+  /** 进入来源内容编辑（官方段库 / 社区段库不在分组内，天然没有编辑入口） */
+  private openSourceEdit(sid: string): void {
+    const src: SourceItem | undefined = Sources.findSource(this.srcMgrGid, sid);
+    if (src === undefined) {
+      this.srcMgrMsg = this.t('来源不存在', 'Source not found');
+      return;
+    }
+    this.srcEditSid = sid;
+    this.srcEditDraft = src.lines.join('\n');
+    this.srcMgrView = 4;
+    this.srcMgrMsg = '';
+    this.srcConfirmSrc = '';
+    this.srcRename = false;
+  }
+
+  /** 编辑视图标题下的来源名称 */
+  private editSourceName(): string {
+    this.srcTick();
+    const src: SourceItem | undefined = Sources.findSource(this.srcMgrGid, this.srcEditSid);
+    if (src === undefined) {
+      return '';
+    }
+    return Sources.kindLabel(src.kind) + ' · ' + src.name;
+  }
+
+  /** 保存来源内容：重新按当前 IP 版本校验，改/删段落都走同一条解析路径 */
+  private async saveSourceEdit(): Promise<void> {
+    if (this.srcEditSid.length === 0) {
+      return;
+    }
+    const text: string = this.srcEditDraft.trim();
+    if (text.length === 0) {
+      this.srcMgrMsg = this.t('内容为空：至少保留一行有效网段；若要清空请直接删除该来源',
+        'Empty content: keep at least one valid range, or delete this source instead');
+      return;
+    }
+    const r: AddSourceResult = Sources.applyText(this.srcMgrGid, this.srcEditSid, text, '');
+    await Sources.save();
+    this.srcRev++;
+    if (!r.ok) {
+      let why: string = this.rejectHint(r.sampleRejects, 2);
+      if (why.length === 0) {
+        why = r.error;
+      }
+      this.srcMgrMsg = this.t('没有保存：', 'Not saved: ') + why;
+      this.toast(this.t('没有保存：内容里没有符合当前 IP 版本的网段', 'Not saved: no ranges matching the current IP version'));
+      this.hlog('[SRC] edit sid=' + this.srcEditSid + ' gid=' + this.srcMgrGid + ' ok=0 accepted=0 err=' + r.error);
+      return;
+    }
+    let msg: string = this.t('已保存来源内容：', 'Source saved: ') + r.accepted.toString() + this.t(' 行有效地址', ' valid addresses');
+    if (r.duplicates > 0) {
+      msg += this.t('，跳过重复 ', ', skipped ') + r.duplicates.toString() + this.t(' 行', ' duplicates');
+    }
+    if (r.rejected > 0) {
+      msg += this.t('，拒绝 ', ', rejected ') + r.rejected.toString() + this.t(' 行', ' lines');
+    }
+    this.srcMgrMsg = msg;
+    this.addLog(msg);
+    this.hlog('[SRC] edit sid=' + this.srcEditSid + ' gid=' + this.srcMgrGid + ' ok=1 accepted=' +
+      r.accepted.toString() + ' rejected=' + r.rejected.toString() + ' dup=' + r.duplicates.toString());
+    if (this.curSel() === this.srcMgrGid) {
+      const e: string = this.applySelection(true);
+      if (e.length > 0) {
+        this.srcMgrMsg += '｜' + e;
+      }
+    }
+    this.srcMgrView = 1;
+    this.srcEditSid = '';
+    this.srcEditDraft = '';
+  }
+
+  private openGroup(gid: string): void {
+    this.srcMgrGid = gid;
+    this.srcMgrView = 1;
+    this.srcMgrMsg = '';
+    this.srcRename = false;
+    this.srcConfirmGroup = false;
+    this.srcConfirmSrc = '';
+    this.srcNameDraft = this.groupNameOf(gid);
+  }
+
+  private openAddView(view: number): void {
+    this.srcMgrView = view;
+    this.srcMgrMsg = '';
+    this.srcConfirmSrc = '';
+    this.srcEditSid = '';
+    this.srcEditDraft = '';
+    if (view === 2) {
+      this.srcLinkDraft = '';
+    } else if (view === 3) {
+      this.srcPasteDraft = '';
+    }
+  }
+
+  private groupNameOf(gid: string): string {
+    const g: SourceGroup | undefined = Sources.findGroup(gid);
+    if (g === undefined) {
+      return '';
+    }
+    return g.name;
+  }
+
+  private groupStatText(gid: string): string {
+    this.srcTick();
+    const g: SourceGroup | undefined = Sources.findGroup(gid);
+    if (g === undefined) {
+      return '';
+    }
+    const st: GroupStats = Sources.stats(g);
+    let out: string = st.sourceCount.toString() + this.t(' 个来源 · 启用 ', ' sources · enabled ');
+    out += st.enabledCount.toString() + this.t(' · 共 ', ' · total ');
+    out += st.lineCount.toString() + this.t(' 行', ' lines');
+    if (st.failedCount > 0) {
+      out += this.t(' · 失败 ', ' · failed ') + st.failedCount.toString();
+    }
+    return out;
+  }
+
+  private sourceStatText(s: SourceItem): string {
+    this.srcTick();
+    if (s.status === SRC_STATUS_FAILED) {
+      return s.error.length > 0 ? s.error : this.t('导入失败', 'Import failed');
+    }
+    let out: string = s.lines.length.toString() + this.t(' 行有效地址', ' valid addresses');
+    if (s.rejectedCount > 0) {
+      out += this.t('；拒绝 ', '; rejected ') + s.rejectedCount.toString() + this.t(' 行（类型/格式不符）', ' lines (wrong type or format)');
+    }
+    if (s.ref.length > 0) {
+      out = s.ref + ' · ' + out;
+    }
+    return out;
+  }
+
+  private choiceStatText(ch: SourceChoice): string {
+    this.srcTick();
+    if (ch.builtin) {
+      if (ch.id === SRC_ID_OFFICIAL) {
+        return this.t('内置段库 · 只读', 'Built-in list · read-only');
+      }
+      const n: number = ch.stats.lineCount;
+      return n > 0 ? (n.toString() + this.t(' 行 · 只读', ' lines · read-only')) : this.t('尚未更新段库', 'Not updated yet');
+    }
+    if (ch.stats.sourceCount === 0 && ch.stats.lineCount === 0) {
+      return this.t('未添加来源', 'No sources');
+    }
+    return ch.stats.sourceCount.toString() + this.t(' 个来源 · ', ' sources · ') + ch.stats.lineCount.toString() + this.t(' 行', ' lines');
+  }
+
+  private curGroupSources(): SourceItem[] {
+    this.srcTick();
+    const g: SourceGroup | undefined = Sources.findGroup(this.srcMgrGid);
+    if (g === undefined) {
+      return [];
+    }
+    return g.sources;
+  }
+
+  private builtinChoices(): SourceChoice[] {
+    return Sources.choices(this.curFam()).filter((ch: SourceChoice) => ch.builtin);
+  }
+
+  private customChoices(): SourceChoice[] {
+    return Sources.choices(this.curFam()).filter((ch: SourceChoice) => !ch.builtin);
+  }
+
+  /** 当前卡片下方的来源说明（随选中项与来源数量变化） */
+  private sourceHintText(): string {
+    this.srcTick();
+    const fam: number = this.curFam();
+    const sel: string = this.curSel();
+    if (sel === SRC_ID_OFFICIAL) {
+      return this.t('内置官方段库，受保护不可编辑；点「编辑」可管理自定义分组', 'Built-in official ranges are protected; tap "Edit" to manage custom groups');
+    }
+    if (sel === SRC_ID_COMMUNITY) {
+      const n: number = Sources.communityLineCount(fam);
+      if (n === 0) {
+        return this.t('段库为空，切换时会自动拉取一次；也可点「编辑」手动更新', 'Empty; it is fetched when selected, or update it from "Edit"');
+      }
+      return this.famText(fam) + this.t(' 社区段库：', ' community ranges: ') + n.toString() + this.t(' 行', ' lines');
+    }
+    const g: SourceGroup | undefined = Sources.findGroup(sel);
+    if (g === undefined) {
+      return this.t('所选分组已删除，将回退到官方 IP 段', 'The selected group was deleted; falling back to official ranges');
+    }
+    const st: GroupStats = Sources.stats(g);
+    let out: string = this.famText(fam) + this.t(' 分组「', ' group "') + g.name + this.t('」：', '": ');
+    out += st.enabledCount.toString() + '/' + st.sourceCount.toString() + this.t(' 个来源启用 · ', ' sources enabled · ');
+    out += st.lineCount.toString() + this.t(' 行', ' lines');
+    return out;
+  }
+
+  private srcMgrTitle(): string {
+    this.srcTick();
+    if (this.srcMgrView === 1) {
+      return this.groupNameOf(this.srcMgrGid);
+    }
+    if (this.srcMgrView === 2) {
+      return this.t('添加链接来源', 'Add link source');
+    }
+    if (this.srcMgrView === 3) {
+      return this.t('添加文本来源', 'Add text source');
+    }
+    if (this.srcMgrView === 4) {
+      return this.t('编辑来源', 'Edit source');
+    }
+    return this.t('来源分组管理', 'Source groups');
+  }
+
+  private srcMgrSub(): string {
+    this.srcTick();
+    if (this.srcMgrView === 1) {
+      return this.groupStatText(this.srcMgrGid);
+    }
+    if (this.srcMgrView === 2) {
+      return this.t('只允许当前 IP 版本的网段', 'Only ranges of the current IP version');
+    }
+    if (this.srcMgrView === 3) {
+      return this.t('支持 # 注释、CIDR、IP:端口，可混排', 'Comments, CIDR and IP:port are supported');
+    }
+    if (this.srcMgrView === 4) {
+      return this.t('改完保存会按当前 IP 版本重新校验', 'Saving revalidates against the current IP version');
+    }
+    return this.famText(this.curFam()) + this.t(' 来源独立保存，V4 / V6 互不影响', ' sources are stored separately; V4/V6 never mix');
+  }
+
+  private linkNameOf(url: string): string {
+    let out: string = url;
+    const p: number = out.indexOf('://');
+    if (p >= 0) {
+      out = out.substring(p + 3);
+    }
+    const q: number = out.indexOf('?');
+    if (q >= 0) {
+      out = out.substring(0, q);
+    }
+    if (out.length > 48) {
+      out = out.substring(0, 48) + '…';
+    }
+    return out;
+  }
+
+  private rejectHint(rejects: SourceReject[], max: number): string {
+    if (rejects.length === 0) {
+      return '';
+    }
+    let out: string = '';
+    const n: number = rejects.length < max ? rejects.length : max;
+    for (let i = 0; i < n; i++) {
+      out += (out.length > 0 ? '\n' : '') + rejects[i].line + ' — ' + rejects[i].reason;
+    }
+    return out;
+  }
+
+  // ——————————————————— 来源分组管理页：业务动作（全部走 Sources 的业务层保护） ———————————————————
+
+  private async createGroupNow(): Promise<void> {
+    const name: string = this.srcNewName.trim();
+    if (name.length === 0) {
+      this.toast(this.t('请输入分组名称', 'Enter a group name'));
+      return;
+    }
+    const r: OpResult = Sources.createGroup(name, this.curFam());
+    if (!r.ok) {
+      this.srcMgrMsg = r.error;
+      this.toast(r.error);
+      return;
+    }
+    await Sources.save();
+    this.srcRev++;
+    this.srcNewName = '';
+    this.srcMgrGid = r.groupId;
+    this.srcMgrView = 1;
+    this.srcNameDraft = this.groupNameOf(r.groupId);
+    this.srcMgrMsg = this.t('已创建分组「', 'Created group "') + this.srcNameDraft + '」';
+  }
+
+  private async commitRename(): Promise<void> {
+    const name: string = this.srcNameDraft.trim();
+    const old: string = this.groupNameOf(this.srcMgrGid);
+    const r: OpResult = Sources.renameGroup(this.srcMgrGid, name);
+    if (!r.ok) {
+      this.srcMgrMsg = r.error;
+      this.toast(r.error);
+      return;
+    }
+    await Sources.save();
+    this.srcRename = false;
+    this.srcRev++;
+    this.srcMgrMsg = this.t('已改名为「', 'Renamed to "') + name + this.t('」（原「', '" (was "') + old + '」）';
+    this.addLog(this.srcMgrMsg);
+  }
+
+  private async deleteGroupNow(): Promise<void> {
+    const gid: string = this.srcMgrGid;
+    const fam: number = this.curFam();
+    const label: string = this.groupNameOf(gid);
+    const inUse: boolean = Sources.selected(fam) === gid;
+    const r: OpResult = Sources.deleteGroup(gid);
+    if (!r.ok) {
+      this.srcMgrMsg = r.error;
+      this.toast(r.error);
+      return;
+    }
+    this.hlog('[SRC] deleteGroup id=' + gid + ' fam=' + fam.toString() + ' inUse=' + (inUse ? '1' : '0') +
+      ' left=' + Sources.groupsOf(fam).length.toString());
+    if (inUse) {
+      await Sources.setSelected(fam, SRC_ID_OFFICIAL);
+    }
+    await Sources.save();
+    this.srcMgrView = 0;
+    this.srcMgrGid = '';
+    this.srcConfirmGroup = false;
+    this.srcRev++;
+    let msg: string = this.t('已删除分组「', 'Deleted group "') + label + '」';
+    if (inUse) {
+      const e: string = this.applySelection(true);
+      msg += this.t('，当前选择已切回官方 IP 段', '; the current selection fell back to official ranges');
+      if (e.length > 0) {
+        msg += '｜' + e;
+      }
+    }
+    if (this.scanning) {
+      msg += this.t('（正在进行的扫描仍使用删除前的快照，下次扫描生效）', ' (the running scan still uses the pre-delete snapshot; it applies from the next scan)');
+    }
+    this.srcMgrMsg = msg;
+    this.toast(msg);
+    this.addLog(msg);
+  }
+
+  private async toggleSource(sid: string): Promise<void> {
+    const s: SourceItem | undefined = Sources.findSource(this.srcMgrGid, sid);
+    if (s === undefined) {
+      return;
+    }
+    const r: OpResult = Sources.setSourceEnabled(this.srcMgrGid, sid, !s.enabled);
+    if (!r.ok) {
+      this.toast(r.error);
+      return;
+    }
+    await Sources.save();
+    this.srcRev++;
+    this.hlog('[SRC] toggle sid=' + sid + ' enabled=' + (s.enabled ? '0' : '1'));
+    if (this.curSel() === this.srcMgrGid) {
+      this.applySelection(true);
+    }
+  }
+
+  /** 删除单条来源：两次点击确认（只删这条，不动整个分组） */
+  private async removeSource(sid: string): Promise<void> {
+    if (this.srcConfirmSrc !== sid) {
+      this.srcConfirmSrc = sid;
+      return;
+    }
+    const r: OpResult = Sources.deleteSource(this.srcMgrGid, sid);
+    this.srcConfirmSrc = '';
+    if (!r.ok) {
+      this.toast(r.error);
+      return;
+    }
+    await Sources.save();
+    this.srcRev++;
+    this.hlog('[SRC] removeSource sid=' + sid + ' gid=' + this.srcMgrGid);
+    let msg: string = this.t('已删除该来源', 'Source removed');
+    if (this.curSel() === this.srcMgrGid) {
+      const e: string = this.applySelection(true);
+      if (e.length > 0) {
+        msg += '｜' + e;
+      }
+    }
+    this.srcMgrMsg = msg;
+  }
+
+  /** 提交一条来源：成功/部分成功/失败都留痕，失败来源不会被当成有效数据 */
+  private async commitSource(kind: string, ref: string, name: string, text: string, failure: string): Promise<boolean> {
+    const r: AddSourceResult = Sources.addSource(this.srcMgrGid, kind, ref, name, text, failure);
+    await Sources.save();
+    this.srcRev++;
+    let msg: string = '';
+    if (failure.length > 0) {
+      msg = this.t('已记录失败来源：', 'Recorded a failed source: ') + failure;
+    } else {
+      if (r.accepted > 0) {
+        msg = this.t('已添加来源：', 'Added source: ') + r.accepted.toString() + this.t(' 行有效地址', ' valid addresses');
+      } else {
+        msg = this.t('没有添加有效地址', 'No valid addresses added');
+      }
+      if (r.duplicates > 0) {
+        msg += this.t('，跳过重复 ', ', skipped ') + r.duplicates.toString() + this.t(' 行', ' duplicates');
+      }
+      if (r.rejected > 0) {
+        msg += this.t('，拒绝 ', ', rejected ') + r.rejected.toString() + this.t(' 行', ' lines');
+        const hint: string = this.rejectHint(r.sampleRejects, 3);
+        if (hint.length > 0) {
+          msg += '：\n' + hint;
+        }
+      }
+    }
+    if (!r.ok && r.error.length > 0) {
+      msg += '\n' + r.error;
+    }
+    this.srcMgrMsg = msg;
+    this.addLog(msg);
+    if (r.ok) {
+      this.toast(this.t('来源已添加', 'Source added'));
+    } else {
+      this.toast(failure.length > 0 ? this.t('导入失败，已记录到来源列表', 'Import failed; recorded in the source list') : this.t('没有可用数据，已记录到来源列表', 'No usable data; recorded in the source list'));
+    }
+    this.hlog('[SRC] add kind=' + kind + ' fam=' + this.curFam().toString() + ' ok=' + (r.ok ? '1' : '0') +
+      ' accepted=' + r.accepted.toString() + ' rejected=' + r.rejected.toString() +
+      ' dup=' + r.duplicates.toString() + ' err=' + r.error);
+    if (this.curSel() === this.srcMgrGid) {
+      this.applySelection(true);
+    }
+    return r.ok;
+  }
+
+  /** 当前分组里的链接来源 */
+  private curGroupLinks(): SourceItem[] {
+    this.srcTick();
+    const out: SourceItem[] = [];
+    const list: SourceItem[] = this.curGroupSources();
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].kind === SRC_KIND_LINK) {
+        out.push(list[i]);
+      }
+    }
+    return out;
+  }
+
+  private groupLinkCount(): number {
+    this.srcTick();
+    return this.curGroupLinks().length;
+  }
+
+  /**
+   * 一键更新单条链接来源：重新拉取 → 按当前 IP 版本解析 → 成功才替换内容；
+   * 拉取失败时把该来源标为失败（保留在列表里，绝不把它当成有效数据）。
+   */
+  private async refreshLink(sid: string, silent: boolean): Promise<boolean> {
+    const s: SourceItem | undefined = Sources.findSource(this.srcMgrGid, sid);
+    if (s === undefined || s.kind !== SRC_KIND_LINK) {
+      return false;
+    }
+    if (!silent) {
+      this.srcMgrBusy = true;
+      this.srcMgrMsg = this.t('正在更新链接…', 'Refreshing link…');
+    }
+    let text: string = '';
+    let failure: string = '';
+    try {
+      text = await this.fetchUrlText(s.ref);
+    } catch (err) {
+      const e2: BusinessError = err as BusinessError;
+      failure = e2.message.length > 0 ? e2.message : this.t('拉取失败', 'Fetch failed');
+    }
+    const r: AddSourceResult = Sources.applyText(this.srcMgrGid, sid, text, failure);
+    await Sources.save();
+    this.srcRev++;
+    if (!silent) {
+      this.srcMgrBusy = false;
+    }
+    this.hlog('[SRC] refresh sid=' + sid + ' ok=' + (r.ok ? '1' : '0') + ' accepted=' + r.accepted.toString() +
+      ' rejected=' + r.rejected.toString() + ' err=' + r.error);
+    if (this.curSel() === this.srcMgrGid) {
+      this.applySelection(true);
+    }
+    if (!silent) {
+      const msg: string = r.ok ?
+        (this.t('链接已更新：', 'Link refreshed: ') + r.accepted.toString() + this.t(' 行有效地址', ' valid addresses')) :
+        (this.t('链接更新失败：', 'Link refresh failed: ') + (r.error.length > 0 ? r.error : this.t('没有可用数据', 'no usable data')));
+      this.srcMgrMsg = msg;
+      this.toast(msg);
+      this.addLog(msg);
+    }
+    return r.ok;
+  }
+
+  /** 一键更新分组内全部链接来源（逐条进行，最后汇总成功/失败） */
+  private async refreshAllLinks(): Promise<void> {
+    if (this.srcMgrBusy) {
+      return;
+    }
+    const links: SourceItem[] = this.curGroupLinks();
+    if (links.length === 0) {
+      this.toast(this.t('这个分组没有链接来源', 'This group has no link sources'));
+      return;
+    }
+    this.srcMgrBusy = true;
+    let ok: number = 0;
+    let bad: number = 0;
+    let lines: number = 0;
+    for (let i = 0; i < links.length; i++) {
+      this.srcMgrMsg = this.t('正在更新链接 ', 'Refreshing links ') + (i + 1).toString() + '/' + links.length.toString();
+      const good: boolean = await this.refreshLink(links[i].id, true);
+      if (good) {
+        ok++;
+      } else {
+        bad++;
+      }
+    }
+    this.srcMgrBusy = false;
+    const grp: SourceGroup | undefined = Sources.findGroup(this.srcMgrGid);
+    if (grp !== undefined) {
+      const st: GroupStats = Sources.stats(grp);
+      lines = st.lineCount;
+    }
+    const msg: string = this.t('链接更新完成：成功 ', 'Refresh done: ') + ok.toString() +
+      this.t(' 条 / 失败 ', ' ok / ') + bad.toString() + this.t(' 条，分组共 ', ' failed, group has ') +
+      lines.toString() + this.t(' 行', ' lines');
+    this.srcMgrMsg = msg;
+    this.toast(msg);
+    this.addLog(msg);
+    this.srcRev++;
+  }
+
+  private async addLinkSource(): Promise<void> {
+    const url: string = this.srcLinkDraft.trim();
     if (url.length === 0) {
       this.toast(this.t('请先填写链接', 'Enter a link first'));
       return;
     }
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      this.toast(this.t('链接需以 http(s):// 开头', 'The link must start with http(s)://'));
+    this.srcMgrBusy = true;
+    let text: string = '';
+    let failure: string = '';
+    try {
+      text = await this.fetchUrlText(url);
+    } catch (err) {
+      const e2: BusinessError = err as BusinessError;
+      failure = e2.message;
+    }
+    this.srcMgrBusy = false;
+    const ok: boolean = await this.commitSource(SRC_KIND_LINK, url, this.linkNameOf(url), text, failure);
+    if (ok) {
+      this.srcLinkDraft = '';
+      this.srcMgrView = 1;
+    }
+  }
+
+  private async addTextSource(): Promise<void> {
+    const text: string = this.srcPasteDraft;
+    if (text.trim().length === 0) {
+      this.toast(this.t('请先粘贴内容', 'Paste some content first'));
       return;
     }
-    this.toast(this.t('正在拉取优选库…', 'Fetching the selection library…'));
-    const req = http.createHttp();
-    req.request(url, {
-      method: http.RequestMethod.GET,
-      expectDataType: http.HttpDataType.STRING,
-      connectTimeout: 10000,
-      readTimeout: 20000,
-      usingCache: false
-    }).then((resp: http.HttpResponse) => {
-      req.destroy();
-      if (resp.responseCode !== 200) {
-        this.toast(this.t('拉取失败：HTTP ', 'Fetch failed: HTTP ') + resp.responseCode.toString());
-        return;
+    const lineCount: number = text.split('\n').filter((l: string) => l.trim().length > 0).length;
+    const name: string = this.t('粘贴 ', 'Pasted ') + lineCount.toString() + this.t(' 行', ' lines');
+    const ok: boolean = await this.commitSource(SRC_KIND_TEXT, '', name, text, '');
+    if (ok) {
+      this.srcPasteDraft = '';
+      this.srcMgrView = 1;
+    }
+  }
+
+  private async addFileSource(): Promise<void> {
+    let text: string = '';
+    let failure: string = '';
+    let name: string = '';
+    try {
+      text = await this.pickFileText();
+      name = this.lastPickName;
+    } catch (err) {
+      const e2: BusinessError = err as BusinessError;
+      failure = e2.message;
+      name = this.lastPickName.length > 0 ? this.lastPickName : this.t('文件', 'File');
+    }
+    if (failure.length === 0 && text.length === 0) {
+      return;
+    }
+    const ok: boolean = await this.commitSource(SRC_KIND_FILE, name, name, text, failure);
+    if (ok) {
+      this.srcMgrView = 1;
+    }
+  }
+
+  private async runSelfCheck(): Promise<void> {
+    const lines: string[] = Sources.selfCheck();
+    let pass: number = 0;
+    let fail: number = 0;
+    for (let i = 0; i < lines.length; i++) {
+      this.addLog(lines[i]);
+      this.hlog('[SRCCHECK] ' + lines[i]);
+      if (lines[i].startsWith('PASS')) {
+        pass++;
+      } else {
+        fail++;
       }
-      const text: string = typeof resp.result === 'string' ? resp.result as string : '';
-      if (text.length === 0) {
-        this.toast(this.t('链接内容为空', 'The link returned no content'));
-        return;
-      }
-      const lines: string[] = text.split('\n');
-      let valid: number = 0;
-      const add: string[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        let ln: string = lines[i].trim();
-        if (ln.length === 0 || ln.startsWith('#') || ln.startsWith('//')) {
-          continue;
-        }
-        const sp: number = ln.indexOf(' ');
-        if (sp > 0) {
-          ln = ln.substring(0, sp);
-        }
-        add.push(ln);
-        valid++;
-      }
-      const merged: string = this.customText.length > 0 ? (this.customText + '\n' + add.join('\n')) : add.join('\n');
-      this.customText = merged;
-      this.mode = ScanMode.CUSTOM;
-      this.scheduleScanSave();
-      this.toast(this.t('已从链接导入 ', 'Imported ') + valid.toString() + this.t(' 行', ' lines'));
-      this.addLog(this.t('从链接导入 ', 'Imported ') + valid.toString() + this.t(' 行优选地址：', ' preferred addresses from link: ') + url);
-    }).catch((err: BusinessError) => {
-      try { req.destroy(); } catch (e) { }
-      this.toast(this.t('拉取失败：', 'Fetch failed: ') + err.message);
-    });
+    }
+    this.srcRev++;
+    const msg: string = this.t('逻辑自检：通过 ', 'Logic self-check: passed ') + pass.toString() + this.t(' 项 / 失败 ', ' / failed ') + fail.toString() + this.t(' 项', ' items');
+    this.hlog('[SRCCHECK] total pass=' + pass.toString() + ' fail=' + fail.toString());
+    this.srcMgrMsg = msg;
+    this.toast(msg);
+  }
+
+  private async clearQuarantineNow(): Promise<void> {
+    await Sources.clearQuarantine();
+    this.srcShowQuarantine = false;
+    this.srcRev++;
+    this.srcMgrMsg = this.t('已清空隔离区', 'Quarantine cleared');
   }
 
   /** 测速是否还没出结果（0=待测 / 1=测速中） */
@@ -7683,30 +9124,6 @@ TabContent() {
   }
 
   /** 对当前结果前 5 条手动补测速（可选操作） */
-  runSpeedTop(): void {
-    if (this.results.length === 0 || this.testing) {
-      return;
-    }
-    const list: Candidate[] = this.results.slice(0, 5);
-    if (list.length === 0) {
-      return;
-    }
-    this.testing = true;
-    this.testInfo = this.t('测速中 0/', 'Testing 0/') + list.length.toString();
-    const c: ScanConfig = this.buildConfig();
-    const token: CancellationToken = new CancellationToken();
-    Scanner.stageSpeed(c, list, new ScanHooks(), token).then(() => {
-      Ranker.apply(this.results, c);
-      this.results = this.results.slice();
-      this.testing = false;
-      this.testInfo = '';
-      this.toast(this.t('补测速完成', 'Re-test complete'));
-    }).catch((e: BusinessError) => {
-      this.testing = false;
-      this.testInfo = '';
-      this.toast(this.t('补测速失败：', 'Re-test failed: ') + e.message);
-    });
-  }
 }
 
 
@@ -7716,6 +9133,11 @@ const LG_TOP_BAND: number = 118;
 /** 底部模糊带高度（vp）：沿用改造前底部条带覆盖到导航区的 106.7vp */
 const LG_BOTTOM_BAND: number = 106.7;
 /** 最大模糊半径（vp）：与原顶部条带峰值 22vp 对齐，保证观感不突增 */
+interface CardClearK {
+  alpha: number;
+  lift: number;
+}
+
 const LG_BLUR_MAX: number = 22;
 /** 底部峰值折算比例：原底部条带峰值 16vp / 顶部 22vp，使一次调用同时还原两端强度 */
 const LG_BOTTOM_RATIO: number = 16 / 22;

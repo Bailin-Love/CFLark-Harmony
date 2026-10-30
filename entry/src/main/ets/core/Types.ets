@@ -186,6 +186,14 @@ export interface ScanConfig {
   port: number;
   sampleCount: number;
   customText: string;
+  /**
+   * 当前选中的候选来源分组（只在运行期使用，持久化由 Sources 按 IP 族独立维护）：
+   * builtin.official / builtin.community / 自定义分组 id。
+   * 扫描日志用它说明"这次用的是哪个分组的候选数据"。
+   */
+  sourceGroupId: string;
+  /** 选中分组的显示名（日志/提示用） */
+  sourceGroupName: string;
   /** 是否用测速域名做 A/AAAA 解析采样并并入候选 */
   domainSampling: boolean;
 

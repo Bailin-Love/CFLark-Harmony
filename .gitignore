@@ -16,3 +16,11 @@
 /tmp-*/
 *.log
 *_files/
+
+# ---- 本地审查产物与发布包（不入库）
+/_verify/
+/h08
+/h11
+/packages/*.hap
+/packages/*.zip
+/tools/__pycache__/

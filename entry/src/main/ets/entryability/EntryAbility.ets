@@ -1,4 +1,4 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AppBackground } from '../core/AppBackground';
 import { window } from '@kit.ArkUI';
@@ -26,7 +26,8 @@ export class BarStyle {
   static attach(stage: window.WindowStage): void {
     try {
       BarStyle.win = stage.getMainWindowSync();
-      BarStyle.apply(true);
+      // 启动时用已读到的主题初值，避免浅色主题先画一帧白图标
+      BarStyle.apply(AppStorage.get<boolean>('initialDark') ?? true);
     } catch (e) {
       hilog.error(DOMAIN, 'testTag', 'BarStyle.attach failed: %{public}s', JSON.stringify(e));
     }
@@ -63,7 +64,8 @@ export class BarStyle {
       hilog.error(DOMAIN, 'testTag', 'setWindowLayoutFullScreen failed: %{public}s', e.message);
     });
 
-    const winDark0: boolean = AppStorage.get<boolean>('initialDark') ?? true;
+    // 用调用方传入的主题判定（运行期切换主题时 Index 会带当前 dark 调进来）
+    const winDark0: boolean = dark;
 
     // 2) 状态栏/导航栏全部透明：底部安全区不再画系统底色，露出页面背景
     win.setWindowSystemBarProperties({
@@ -110,6 +112,15 @@ export default class EntryAbility extends UIAbility {
       hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+    // 系统深浅色实时同步：把 colorMode 挂进 AppStorage，页面用 @StorageProp('colorMode') 订阅。
+    // onConfigurationUpdate 在部分窗口形态下不一定回调，这条通道保证「跟随系统」一定能收到变化。
+    try {
+      const linked: boolean = Environment.envProp('colorMode',
+        ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      hilog.info(DOMAIN, 'testTag', 'envProp colorMode linked=%{public}s', linked ? 'true' : 'false');
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'envProp colorMode failed: %{public}s', JSON.stringify(err));
+    }
     // 启动窗口是系统画的、读不到应用偏好；这里在进程一开始就同步读一次主题，
     // 写进 AppStorage，页面首帧（应用内启动页）就能直接用它，不会先闪一下系统色。
     try {
@@ -124,16 +135,97 @@ export default class EntryAbility extends UIAbility {
         initialDark = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
       }
       AppStorage.setOrCreate<boolean>('initialDark', initialDark);
-      hilog.info(DOMAIN, 'testTag', 'initialDark=%{public}s (themeMode=%{public}d)',
-        initialDark ? 'dark' : 'light', mode);
+      // 系统当前深浅色也单独记一份：页面「跟随系统」时以它为准（onForeground/onConfigurationUpdate 会刷新）
+      const sysDark: boolean = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      AppStorage.setOrCreate<boolean>('sysDark', sysDark);
+      hilog.info(DOMAIN, 'testTag', 'initialDark=%{public}s sysDark=%{public}s (themeMode=%{public}d)',
+        initialDark ? 'dark' : 'light', sysDark ? 'dark' : 'light', mode);
     } catch (err) {
       hilog.warn(DOMAIN, 'testTag', 'read themeMode failed: %{public}s', JSON.stringify(err));
+    }
+    // 背景图同样在进程一开始同步读一次：首帧直接用正确的底图，避免先画渐变再换图。
+    try {
+      const st: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: 'cflark_store' });
+      const ver: number = st.getSync('bg_path_ver', 0) as number;
+      let light: string = '';
+      let dark: string = '';
+      if (ver >= 2) {
+        light = st.getSync('bg_path_light', '') as string;
+        dark = st.getSync('bg_path_dark', '') as string;
+      } else {
+        const legacy: string = st.getSync('bg_path', '') as string;
+        light = legacy;
+        dark = legacy;
+      }
+      AppStorage.setOrCreate<string>('initialBgLight', light);
+      AppStorage.setOrCreate<string>('initialBgDark', dark);
+      hilog.info(DOMAIN, 'testTag', 'initialBg light=%{public}s dark=%{public}s',
+        light.length > 0 ? 'custom' : 'default', dark.length > 0 ? 'custom' : 'default');
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'read background failed: %{public}s', JSON.stringify(err));
     }
     ConfigStore.init(this.context).then(() => {
       hilog.info(DOMAIN, 'testTag', '%{public}s', 'preferences initialized');
     }).catch((e: BusinessError) => {
       hilog.error(DOMAIN, 'testTag', 'preferences init failed: %{public}s', e.message);
     });
+  }
+
+  /** 回到前台：重读一次系统深浅色并通知页面（后台期间系统主题可能已经变了） */
+  onForeground(): void {
+    this.refreshSystemDark();
+  }
+
+  /** 读取当前系统深浅色写入 AppStorage；themeMode=跟随系统时顺带通知页面重算 */
+  private refreshSystemDark(): void {
+    try {
+      const dark: boolean = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      AppStorage.setOrCreate<boolean>('sysDark', dark);
+      let mode: number = 2;
+      try {
+        const st: preferences.Preferences =
+          preferences.getPreferencesSync(this.context, { name: 'cflark_store' });
+        mode = st.getSync('themeMode', 2) as number;
+      } catch (e) {
+        mode = 2;
+      }
+      if (mode === 2) {
+        const prev: number = AppStorage.get<number>('sysThemeTick') ?? 0;
+        AppStorage.setOrCreate<number>('sysThemeTick', prev + 1);
+      }
+      hilog.info(DOMAIN, 'testTag', 'sysDark refreshed: dark=%{public}s themeMode=%{public}d',
+        dark ? 'true' : 'false', mode);
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'refreshSystemDark failed: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  /**
+   * 系统深浅色变化：把「跟随系统」模式下需要重算的时机推给页面。
+   * 手动选了浅色/深色时不动，保证用户偏好优先。
+   */
+  onConfigurationUpdate(newConfig: Configuration): void {
+    try {
+      const dark: boolean =
+        newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      AppStorage.setOrCreate<boolean>('sysDark', dark);
+      let mode: number = 2;
+      try {
+        const st: preferences.Preferences =
+          preferences.getPreferencesSync(this.context, { name: 'cflark_store' });
+        mode = st.getSync('themeMode', 2) as number;
+      } catch (e) {
+        mode = 2;
+      }
+      if (mode === 2) {
+        const prev: number = AppStorage.get<number>('sysThemeTick') ?? 0;
+        AppStorage.setOrCreate<number>('sysThemeTick', prev + 1);
+      }
+      hilog.info(DOMAIN, 'testTag', 'configuration changed: dark=%{public}s themeMode=%{public}d',
+        dark ? 'true' : 'false', mode);
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'onConfigurationUpdate failed: %{public}s', JSON.stringify(err));
+    }
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
@@ -166,7 +258,6 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void { }
-  onForeground(): void { }
   onBackground(): void { }
   onDestroy(): void { }
 }

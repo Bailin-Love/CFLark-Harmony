@@ -17,6 +17,7 @@
 import { Candidate, ScanConfig, ScanMode, IpVersion, Stage, Verdict, SpeedScope } from './Types';
 import { IpUtil, CidrV4, CF_IPV4_RANGES, CF_IPV6_RANGES } from './IpUtil';
 import { CF_IPV6_POOL_48 } from './V6Pool';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { TcpProbe, TcpResult, TraceProbe, TraceResult } from './Probe';
 import { SpeedTest, SpeedTarget } from './SpeedTest';
 import { DnsService } from './DnsService';
@@ -89,6 +90,8 @@ export class PrecheckResult {
 export class Scanner {
   /** 上一次 customCandidates 解析跳过的行数（用于日志提示） */
   static lastParseSkipped: number = 0;
+  /** 上一次 runPing 里因 IP 版本不符被剔除的候选数（0 = 没有跨类型污染） */
+  static lastDroppedByType: number = 0;
 
   static makeCandidate(ip: string, port: number, version: number): Candidate {
     const c: Candidate = {
@@ -170,7 +173,9 @@ export class Scanner {
       const usePool: boolean = CF_IPV6_POOL_48.length > 0;
       if (usePool) {
         Scanner.lastLayeredBlock48 = CF_IPV6_POOL_48.length;
-        const per: number = Math.max(1, Math.ceil(cfg.sampleCount / CF_IPV6_POOL_48.length));
+        // 采样数 <= 0：全部 /48 池各取 1 个地址
+        const per: number = cfg.sampleCount <= 0 ? 1
+          : Math.max(1, Math.ceil(cfg.sampleCount / CF_IPV6_POOL_48.length));
         for (let i = 0; i < CF_IPV6_POOL_48.length; i++) {
           const ips: string[] = IpUtil.sampleV6Layered(CF_IPV6_POOL_48[i], per);
           for (let j = 0; j < ips.length; j++) {
@@ -179,7 +184,8 @@ export class Scanner {
         }
         return out;
       }
-      const per: number = Math.max(1, Math.ceil(cfg.sampleCount / CF_IPV6_RANGES.length));
+      const per: number = cfg.sampleCount <= 0 ? 1
+        : Math.max(1, Math.ceil(cfg.sampleCount / CF_IPV6_RANGES.length));
       for (let i = 0; i < CF_IPV6_RANGES.length; i++) {
         const ips: string[] = IpUtil.sampleV6Layered(CF_IPV6_RANGES[i], per);
         for (let j = 0; j < ips.length; j++) {
@@ -201,7 +207,8 @@ export class Scanner {
       }
     }
     const shuffled: number[] = IpUtil.shuffle<number>(bases);
-    const need: number = Math.min(cfg.sampleCount, shuffled.length);
+    // 采样数 <= 0：全部 /24 各取 1 个
+    const need: number = cfg.sampleCount <= 0 ? shuffled.length : Math.min(cfg.sampleCount, shuffled.length);
     for (let i = 0; i < need; i++) {
       const base: number = shuffled[i];
       const off: number = 1 + Math.floor(Math.random() * 254);
@@ -211,6 +218,32 @@ export class Scanner {
   }
 
   /** 自定义候选：支持 CIDR / ip:port / [v6]:port / 纯 IPv6，一行一个，# 开头是注释 */
+  /**
+   * 从多行文本里随机抽取 limit 条有效行（跳过空行与 # 注释）。
+   * 用于「来源行数 > 采样数」时把候选量收敛到采样数。
+   */
+  private static pickLines(text: string, limit: number): string {
+    const src: string[] = text.split(String.fromCharCode(10));
+    const valid: string[] = [];
+    for (let i = 0; i < src.length; i++) {
+      const t: string = src[i].trim();
+      if (t.length > 0 && !t.startsWith('#')) {
+        valid.push(t);
+      }
+    }
+    if (limit >= valid.length || limit <= 0) {
+      return text;
+    }
+    // Fisher-Yates 洗牌后取前 limit 条，保证每次扫描抽样不同
+    for (let i = valid.length - 1; i > 0; i--) {
+      const j: number = Math.floor(Math.random() * (i + 1));
+      const tmp: string = valid[i];
+      valid[i] = valid[j];
+      valid[j] = tmp;
+    }
+    return valid.slice(0, limit).join(String.fromCharCode(10));
+  }
+
   static customCandidates(text: string, defaultPort: number, perCidr: number = 20): Candidate[] {
     const out: Candidate[] = [];
     let skipped: number = 0;
@@ -282,8 +315,10 @@ export class Scanner {
             if (pv > 0 && pv < 65536 && host.indexOf(':') === colon) {
               port = pv;
               host = head;
-            } else if (pv > 0 && pv < 65536 && IpUtil.isV6(head)) {
-              // 纯 IPv6 带端口：只有前段仍是合法 IPv6 才拆分端口
+            } else if (pv > 0 && pv < 65536 && Scanner.strictV6(host) && Scanner.strictV6(head)) {
+              // 纯 IPv6 带端口：整串与前缀都必须是合法 IPv6 才拆分端口。
+              // 否则 2606:4700::1 这种「:: 前缩写 + 末段纯数字」会被误当成端口，
+              // 拆出非法 host 后整条地址被静默丢弃。
               port = pv;
               host = head;
             }
@@ -313,6 +348,60 @@ export class Scanner {
       out.push(c);
     }
     return out;
+  }
+
+  /**
+   * 严格按实际地址格式校验并只保留指定 IP 版本的候选。
+   * 这是「V4 筛选流程只能产生 IPv4 节点」的最后一道闸门：
+   * 不看 Candidate.version 字段（它可能来自历史/异常数据），而是直接解析 ip 文本。
+   */
+  static filterByVersion(list: Candidate[], ver: IpVersion): Candidate[] {
+    const wantV6: boolean = ver === IpVersion.V6;
+    const out: Candidate[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const c: Candidate = list[i];
+      const isV6: boolean = Scanner.strictV6(c.ip);
+      const isV4: boolean = !isV6 && Scanner.strictV4(c.ip);
+      if (wantV6 ? isV6 : isV4) {
+        c.version = wantV6 ? 6 : 4;
+        out.push(c);
+      }
+    }
+    Scanner.lastDroppedByType = list.length - out.length;
+    return out;
+  }
+
+  /** 严格 IPv4：四段十进制、每段 0-255 */
+  private static strictV4(ip: string): boolean {
+    const parts: string[] = ip.split('.');
+    if (parts.length !== 4) {
+      return false;
+    }
+    for (let i = 0; i < 4; i++) {
+      const p: string = parts[i];
+      if (p.length === 0 || p.length > 3) {
+        return false;
+      }
+      for (let k = 0; k < p.length; k++) {
+        const code: number = p.charCodeAt(k);
+        if (code < 48 || code > 57) {
+          return false;
+        }
+      }
+      const v: number = Number(p);
+      if (isNaN(v) || v < 0 || v > 255) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** 严格 IPv6：展开成 8 组再校验（不认内嵌 IPv4） */
+  private static strictV6(ip: string): boolean {
+    if (ip.indexOf(':') < 0 || ip.indexOf('.') >= 0) {
+      return false;
+    }
+    return IpUtil.ipv6ToBytes(ip).length === 16;
   }
 
   /** 并发池：cursor + N 个 worker */
@@ -936,7 +1025,8 @@ export class Scanner {
         hooks.onLog('候选来源：官方 IP 段（IPv6 社区 /48 池共 ' +
           Scanner.lastLayeredBlock48.toString() + ' 个 /48），生成 ' + list.length.toString() + ' 个');
       } else {
-        hooks.onLog('候选来源：官方 IP 段（IPv4 按 /24 分层），生成 ' + list.length.toString() + ' 个');
+        hooks.onLog('候选来源：官方 IP 段（IPv4 按 /24 分层' +
+        (cfg.sampleCount <= 0 ? '，采样全部段' : '') + '），生成 ' + list.length.toString() + ' 个');
       }
     } else {
       let entries: number = 0;
@@ -947,12 +1037,29 @@ export class Scanner {
           entries++;
         }
       }
-      const perCidr: number = Math.max(1, Math.ceil(cfg.sampleCount / Math.max(1, entries)));
-      list = Scanner.customCandidates(cfg.customText, cfg.port, perCidr);
-      hooks.onLog('候选来源：自定义（' + entries.toString() + ' 行，每条个采 ' + perCidr.toString() +
-        '），解析出 ' + list.length.toString() + ' 个');
+      // 采样数统一约束候选总量：来源行数多于采样数时（典型是社区段库 6000+ 行），
+      // 随机抽取「采样数」条再采样，否则候选量会被行数顶满、采样数形同虚设。
+      const wantAll: boolean = cfg.sampleCount <= 0;
+      const picked: number = wantAll ? entries : (entries > cfg.sampleCount ? cfg.sampleCount : entries);
+      const scanText: string = (!wantAll && entries > cfg.sampleCount)
+        ? Scanner.pickLines(cfg.customText, cfg.sampleCount)
+        : cfg.customText;
+      const perCidr: number = wantAll ? 1 : Math.max(1, Math.ceil(cfg.sampleCount / Math.max(1, picked)));
+      list = Scanner.customCandidates(scanText, cfg.port, perCidr);
+      const srcLabel: string = cfg.sourceGroupName.length > 0 ? '「' + cfg.sourceGroupName + '」' : '';
+      hooks.onLog('候选来源：自定义分组' + srcLabel + '（' + entries.toString() + ' 行' +
+        (wantAll ? '，采样全部段' : (picked < entries ? '，随机取样 ' + picked.toString() + ' 行' : '')) +
+        '，每条采 ' + perCidr.toString() + '），解析出 ' + list.length.toString() + ' 个');
     }
     list = Scanner.dedupe(list);
+    // 候选来源与 IP 版本严格隔离：进入筛选流程前按实际地址格式再校验一遍，
+    // 历史配置 / 缓存 / 异常数据里混进来的另一种类型在这里被剔除，绝不进入 ping/测速。
+    const beforeVer: number = list.length;
+    list = Scanner.filterByVersion(list, cfg.ipVersion);
+    if (list.length !== beforeVer) {
+      hooks.onLog('类型校验：丢弃 ' + (beforeVer - list.length).toString() +
+        ' 个与当前 IP 版本（' + (cfg.ipVersion === IpVersion.V6 ? 'IPv6' : 'IPv4') + '）不符的候选');
+    }
     if (list.length === 0) {
       hooks.onLog('没有可用候选');
       return [];
@@ -988,12 +1095,39 @@ export class Scanner {
     if (Scanner.lastParseSkipped > 0) {
       hooks.onLog('自定义候选：有 ' + Scanner.lastParseSkipped.toString() + ' 行无法解析，已忽略');
     }
+    // 域名采样并入后再校验一次（种子理论上是同族，这里仍然以实际地址为准）
+    const beforeVer2: number = list.length;
+    list = Scanner.filterByVersion(list, cfg.ipVersion);
+    if (list.length !== beforeVer2) {
+      hooks.onLog('类型校验：域名采样后又剔除 ' + (beforeVer2 - list.length).toString() + ' 个类型不符的候选');
+    }
+    if (list.length === 0) {
+      hooks.onLog('没有可用候选');
+      return [];
+    }
     if (cfg.ipVersion === IpVersion.V6) {
       const envOk: boolean = await Scanner.checkV6Env();
       hooks.onLog(envOk ? 'IPv6 环境自检：可用（测试地址已连通）' :
         'IPv6 环境自检：不可用或超时（本机无 IPv6 或网络掉线时属环境问题，不是代码故障）');
     }
 
+    // 可观测性：进入 ping 前打印候选的实际类型分布，命令行即可验证「V4 流程只出 IPv4 节点」
+    let nv4: number = 0;
+    let nv6: number = 0;
+    const sampleIps: string[] = [];
+    for (let si = 0; si < list.length; si++) {
+      const sc: Candidate = list[si];
+      if (Scanner.strictV6(sc.ip)) {
+        nv6++;
+      } else if (Scanner.strictV4(sc.ip)) {
+        nv4++;
+      }
+      if (si < 3) {
+        sampleIps.push(sc.ip);
+      }
+    }
+    hooks.onLog('候选类型分布：v4=' + nv4.toString() + '，v6=' + nv6.toString() + '，样本 ' + sampleIps.join('、'));
+    hilog.info(0x0001, 'cflark', '%{public}s', '候选类型分布：v4=' + nv4.toString() + '，v6=' + nv6.toString() + '，样本 ' + sampleIps.join('、'));
     const passedPing: Candidate[] = await Scanner.stagePing(cfg, list, hooks, token);
     if (token.isCancelled() || passedPing.length === 0) {
       hooks.onPhase(4, '完成');
