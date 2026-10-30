@@ -2673,9 +2673,8 @@ struct Index {
    * 这里只叠一层薄纱：模糊、亮度、图片层次全部保留，换来的是一致的最低对比度。
    */
   private bgScrim(): ResourceColor {
-    // 上限 0.8，留一点余光；0% 时完全不加纱，喜欢看背景的用户可以拉到最低
-    // 0% 也保留 6% 的薄纱、最高 80%：两头都留余量，避免背景完全压不住文字
-    const a: number = 0.06 + Math.max(0, Math.min(100, this.bgScrimPct)) / 100 * 0.74;
+    // 0% 就是完全不加纱（与 1.4.1 观感一致），100% 上限 0.8
+    const a: number = Math.max(0, Math.min(100, this.bgScrimPct)) / 100 * 0.8;
     return this.dark ? 'rgba(6,8,14,' + a.toFixed(3) + ')' : 'rgba(248,250,253,' + a.toFixed(3) + ')';
   }
 
