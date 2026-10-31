@@ -42,8 +42,8 @@ export class Changelog {
         },
         {
           kind: ChangeKind.NEW,
-          zh: '「声明」里补上了「致敬与致谢」：本应用的外观风格与玻璃材质思路借鉴了开源项目 OpenAuthenticator（作者 mroble），并得到作者在实现思路上的指导，在此致谢。',
-          en: 'The statements page now credits OpenAuthenticator by mroble: its visual style and glass-material approach inspired this app, and the author kindly shared implementation guidance. Sincere thanks.'
+          zh: '「声明」里补上了「致敬与致谢」：应用外观设计采用「星蚀显影波源半模态沉浸光感方案」制作，并向开源项目 OpenAuthenticator（作者 mroble）及其作者致谢，感谢其在设计思路与实现方面提供的指导。',
+          en: 'The statements page now credits the immersive-material scheme this app follows and OpenAuthenticator by mroble, whose design and implementation guidance helped shape it. Sincere thanks.'
         },
         {
           kind: ChangeKind.IMPROVE,

@@ -6572,8 +6572,8 @@ TabContent() {
           .fontColor(this.txt2())
           .margin({ top: 4 })
         Text(this.t(
-          '本应用的外观风格与玻璃材质思路，借鉴了开源项目 OpenAuthenticator（作者 mroble，https://atomgit.com/mroble/Authenticator ），并得到了原作者在实现思路上的指导。本项目代码为独立实现，未复制该仓库源码。在此郑重致谢。',
-          'The visual style and glass material approach of this app were inspired by the open-source project OpenAuthenticator by mroble (https://atomgit.com/mroble/Authenticator), and its author kindly offered guidance on the implementation approach. All code here is independently written; no source was copied from that repository. Sincere thanks to the author.'))
+          '本应用的外观设计采用「星蚀显影波源半模态沉浸光感方案」制作，并借鉴了开源项目 OpenAuthenticator（作者 mroble，https://atomgit.com/mroble/Authenticator ）的界面与玻璃材质思路；实现过程中也得到了原作者在设计思路上的指导。本项目代码为独立实现，未复制该仓库源码。在此郑重致谢。',
+          'The visual design of this app follows the immersive-material scheme documented as "Stellar Eclipse Wave-Source Semi-Modal Immersive Light" (星蚀显影波源半模态沉浸光感方案), and drew on the interface and glass-material approach of the open-source project OpenAuthenticator by mroble (https://atomgit.com/mroble/Authenticator); its author also kindly advised on the design. All code here is independently written; no source was copied from that repository. Sincere thanks to the author.'))
           .fontSize(10)
           .fontColor(this.txt3())
           .lineHeight(16)

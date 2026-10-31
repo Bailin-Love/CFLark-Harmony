@@ -9,7 +9,7 @@
 ### 新增
 
 1. **自定义背景角标**：上传过图片后，该格左下角显示「● 自定义」，与 7 张内置预设一眼区分。
-2. **致敬与致谢**：声明页新增一段，注明外观风格与玻璃材质思路借鉴了开源项目 OpenAuthenticator（作者 mroble，https://atomgit.com/mroble/Authenticator），并得到作者在实现思路上的指导。
+2. **开源项目致谢**：声明页新增致谢，说明应用外观设计采用「星蚀显影波源半模态沉浸光感方案」制作，并向开源项目 OpenAuthenticator（作者 mroble，https://atomgit.com/mroble/Authenticator）及其作者致谢，感谢其在设计思路与实现方面提供的指导。
 
 ### 优化
 
