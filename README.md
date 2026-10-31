@@ -44,22 +44,22 @@ CFLark 是一款为 HarmonyOS NEXT 打造的原生 Cloudflare 节点优选工具
 
 ### 方式一：HAP 安装（调试包）
 
-1. 下载 Releases 中的 `CFLark-Harmony-1.4.2-debug.hap`（未签名构建）。
+1. 下载 Releases 中的 `CFLark-Harmony-1.4.3-debug.hap`（未签名构建）。
 2. 连接鸿蒙设备（需开启开发者模式与 USB 调试），执行：
 
 ```bash
-hdc install CFLark-Harmony-1.4.2-debug.hap
+hdc install CFLark-Harmony-1.4.3-debug.hap
 ```
 
 3. 也可以把 HAP 传到手机/平板后用文件管理器打开安装（需允许安装未知来源应用）。
 
 ### 方式二：App Pack 安装（发行版，推荐）
 
-下载 `CFLark-Harmony-1.4.2-app-release.app.hap`，**Hokit 可直接安装，无需修改后缀**；也可用于归档或上架流程。
+下载 `CFLark-Harmony-1.4.3-app-release.app.hap`，**Hokit 可直接安装，无需修改后缀**；也可用于归档或上架流程。
 
 > GitHub 附件不支持 `.app` 后缀，因此发行版 `.app` 统一命名为 `*.app.hap`，本质仍是鸿蒙 App Pack。
 
-> 1.4.2 的两个安装包均为**未签名**构建 —— 这是刻意为之：当前鸿蒙侧载生态（Hokit、轻启、Hapkit、小白盒子等）会在安装时自动重签，无需自带签名。推荐直接拖入 Hokit 安装。
+> 1.4.3 的两个安装包均为**未签名**构建 —— 这是刻意为之：当前鸿蒙侧载生态（Hokit、轻启、Hapkit、小白盒子等）会在安装时自动重签，无需自带签名。推荐直接拖入 Hokit 安装。
 
 ## 使用流程
 

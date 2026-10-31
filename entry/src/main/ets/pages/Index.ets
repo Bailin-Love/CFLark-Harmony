@@ -79,6 +79,8 @@ const OK_C: string = '#10B981';
 const WARN_C: string = '#F59E0B';
 const BAD_C: string = '#F43F5E';
 const PRIMARY: string = '#4F46E5';
+// 内置预设背景素材版本：换图后 +1，旧的沙箱缓存会自动重拷，避免用户仍看到旧图
+const PRESET_CACHE_VER: number = 2;
 
 // ============================================================================
 // 沉浸材质承载层基础设施
@@ -273,6 +275,8 @@ struct Index {
   @State latencyHint: string = '';
   /** 当前实际生效的背景图（渲染用：跟随实际深浅色自动取 bgLight / bgDark） */
   @State bgPath: string = '';
+  @State customPathLight: string = '';
+  @State customPathDark: string = '';
   /** 本次运行内背景图加载失败（只临时回落渐变，不改用户配置） */
   @State bgLoadFailed: boolean = false;
   /** 浅色模式背景图（空串=该模式使用默认背景） */
@@ -676,6 +680,8 @@ struct Index {
     this.latencyHint = this.t('建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）', 'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
     // v1→v2：旧版单一背景图复制进浅色/深色两套（同步完成，避免读到半迁移状态）
     ConfigStore.migrateBgPathsSync();
+    this.refreshCustomPaths();
+    this.migratePresetCache();
     this.bgLight = ConfigStore.bgPathFor(false);
     this.bgDark = ConfigStore.bgPathFor(true);
     this.applyEffectiveBg();
@@ -718,10 +724,57 @@ struct Index {
     await ConfigStore.saveBgPathFor(dark, path);
   }
 
-  /** 当前模式的自定义图片路径：深浅色各一个文件，互不覆盖 */
+  /** 当前模式最新的自定义图片路径（文件名带时间戳，换图后路径必变，避免命中图片缓存） */
   private customPathFor(dark: boolean): string {
-    const dir: string = this.ctx !== undefined ? this.ctx.filesDir : '';
-    return dir + (dark ? '/bg_custom_dark.jpg' : '/bg_custom_light.jpg');
+    return dark ? this.customPathDark : this.customPathLight;
+  }
+
+  /** 扫描 filesDir，找出浅色/深色各自最新的一张自定义背景 */
+  private refreshCustomPaths(): void {
+    const ctx = this.ctx;
+    if (ctx === undefined) {
+      return;
+    }
+    let names: string[] = [];
+    try {
+      names = fileIo.listFileSync(ctx.filesDir);
+    } catch (e) {
+      names = [];
+    }
+    let bestLight: string = '';
+    let lightTs: number = -1;
+    let bestDark: string = '';
+    let darkTs: number = -1;
+    for (let i = 0; i < names.length; i++) {
+      const n: string = names[i];
+      const isLight: boolean = n.indexOf('bg_custom_light') === 0;
+      const isDark: boolean = n.indexOf('bg_custom_dark') === 0;
+      if (!isLight && !isDark) {
+        continue;
+      }
+      const ts: number = this.timestampOfName(n);
+      if (isLight) {
+        if (ts > lightTs) {
+          lightTs = ts;
+          bestLight = ctx.filesDir + '/' + n;
+        }
+      } else if (ts > darkTs) {
+        darkTs = ts;
+        bestDark = ctx.filesDir + '/' + n;
+      }
+    }
+    this.customPathLight = bestLight;
+    this.customPathDark = bestDark;
+  }
+
+  private timestampOfName(name: string): number {
+    const base: string = name.indexOf('.jpg') >= 0 ? name.substring(0, name.indexOf('.jpg')) : name;
+    const cut: number = base.lastIndexOf('_');
+    if (cut < 0) {
+      return 0;
+    }
+    const v: number = Number(base.substring(cut + 1));
+    return isNaN(v) ? 0 : v;
   }
 
   /** 当前模式是否已经有自定义图片（文件真的存在才算） */
@@ -729,9 +782,13 @@ struct Index {
     if (this.ctx === undefined) {
       return false;
     }
+    const p: string = this.customPathFor(this.dark);
+    if (p.length === 0) {
+      return false;
+    }
     try {
       // accessSync 直接返回 boolean（文件不存在不抛异常）
-      return fileIo.accessSync(this.customPathFor(this.dark));
+      return fileIo.accessSync(p);
     } catch (e) {
       return false;
     }
@@ -778,11 +835,24 @@ struct Index {
       if (res.photoUris.length === 0) {
         return;
       }
-      const dst: string = this.customPathFor(dark);
+      const dir: string = ctx.filesDir;
+      const oldPath: string = this.customPathFor(dark);
+      const stamp: string = new Date().getTime().toString();
+      const dst: string = dir + (dark ? '/bg_custom_dark_' : '/bg_custom_light_') + stamp + '.jpg';
       const f = fileIo.openSync(res.photoUris[0], fileIo.OpenMode.READ_ONLY);
       fileIo.copyFileSync(f.fd, dst);
       fileIo.closeSync(f);
+      this.refreshCustomPaths();
       await this.setModeBg(dark, dst);
+      // 换图成功后清掉同一模式的旧文件，避免沙箱里越堆越多
+      if (oldPath.length > 0 && oldPath !== dst) {
+        try {
+          fileIo.unlinkSync(oldPath);
+        } catch (e) {
+          // 旧文件已被删除/占用时忽略
+        }
+      }
+      this.refreshCustomPaths();
       const which: string = dark ? this.t('深色', 'dark') : this.t('浅色', 'light');
       this.addLog(which + this.t('模式已设置自定义背景图', ' mode custom background set'));
       this.toast(which + this.t('模式背景已更新', ' background updated'));
@@ -834,6 +904,66 @@ struct Index {
     return this.bgPath.length > 0;
   }
 
+  /** 从任意背景路径解析预设序号（-1 表示不是预设） */
+  private presetIndexFromPath(p: string): number {
+    if (p.length === 0) {
+      return -1;
+    }
+    for (let i = 1; i <= 7; i++) {
+      if (p.indexOf('bg_preset_' + i + '.jpg') >= 0 || p.indexOf('bg_preset_' + i + '_') >= 0) {
+        return i - 1;
+      }
+    }
+    return -1;
+  }
+
+  /** 预设素材换图后的缓存迁移：把当前选中项重拷成带版本号的新文件，并清掉旧缓存 */
+  private migratePresetCache(): void {
+    const ctx = this.ctx;
+    if (ctx === undefined) {
+      return;
+    }
+    const suffix: string = '_v' + PRESET_CACHE_VER + '.jpg';
+    try {
+      for (let k = 0; k < 2; k++) {
+        const m: boolean = k === 1;
+        const cur: string = ConfigStore.bgPathFor(m);
+        if (cur.indexOf('/bg_preset_') < 0 || cur.endsWith(suffix)) {
+          continue;
+        }
+        const idx: number = this.presetIndexFromPath(cur);
+        if (idx < 0) {
+          continue;
+        }
+        const raw: string = 'bg/preset' + (idx + 1) + '.jpg';
+        const buf: Uint8Array = ctx.resourceManager.getRawFileContentSync(raw);
+        const dst: string = ctx.filesDir + '/bg_preset_' + (idx + 1) +
+          (m ? '_dark' : '_light') + suffix;
+        const f = fileIo.openSync(dst,
+          fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+        fileIo.writeSync(f.fd, buf.buffer as ArrayBuffer);
+        fileIo.closeSync(f);
+        ConfigStore.saveBgPathFor(m, dst);
+      }
+      const files: string[] = fileIo.listFileSync(ctx.filesDir);
+      for (let i = 0; i < files.length; i++) {
+        const name: string = files[i];
+        if (name.indexOf('bg_preset_') !== 0 || name.endsWith(suffix)) {
+          continue;
+        }
+        try {
+          fileIo.unlinkSync(ctx.filesDir + '/' + name);
+        } catch (e) {
+          const err = e as BusinessError;
+          this.addLog(this.t('清理旧预设缓存失败：', 'Failed to clean old preset cache: ') + err.message);
+        }
+      }
+    } catch (e) {
+      const err = e as BusinessError;
+      this.addLog(this.t('预设背景缓存迁移失败：', 'Preset cache migration failed: ') + err.message);
+    }
+  }
+
   /** 应用内置预设背景：复制进沙箱，文件按深浅色分开，和自定义图片共用同一条渲染/持久化路径 */
   private async usePresetBackground(index: number): Promise<void> {
     const ctx = this.ctx;
@@ -846,7 +976,7 @@ struct Index {
       const raw: string = 'bg/preset' + (index + 1) + '.jpg';
       const buf: Uint8Array = ctx.resourceManager.getRawFileContentSync(raw);
       const dst: string = ctx.filesDir + '/bg_preset_' + (index + 1) +
-        (dark ? '_dark' : '_light') + '.jpg';
+        (dark ? '_dark' : '_light') + '_v' + PRESET_CACHE_VER + '.jpg';
       const f = fileIo.openSync(dst,
         fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
       fileIo.writeSync(f.fd, buf.buffer as ArrayBuffer);
@@ -1846,9 +1976,9 @@ struct Index {
                   .padding({ left: 14, right: 14 })
                   .borderRadius(this.CHIP_H / 2)
                   .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : this.floatFallbackBg())
-                  .linearGradient({ angle: 180, colors: this.floatSheen() })
+                  .linearGradient({ angle: 145, colors: this.floatTint() })
                   .backgroundBlurStyle(this.floatBlur())
-                  .border({ width: 1, color: this.navGlassBorder() })
+                  .border({ width: 1, color: this.floatBorder() })
                 .shadow({
                   radius: this.floatShadowR(),
                   color: this.floatShadowColor(),
@@ -1917,9 +2047,9 @@ struct Index {
         .height(this.fabSize())
         .borderRadius(this.fabSize() / 2)
         .backgroundColor(this.shouldUseCardMaterial() ? Color.Transparent : this.floatFallbackBg())
-        .linearGradient({ angle: 180, colors: this.floatSheen() })
+        .linearGradient({ angle: 145, colors: this.floatTint() })
         .backgroundBlurStyle(this.floatBlur())
-        .border({ width: 1, color: this.navGlassBorder() })
+        .border({ width: 1, color: this.floatBorder() })
         .shadow({
           radius: this.floatShadowR(),
           color: this.floatShadowColor(),
@@ -3246,19 +3376,29 @@ struct Index {
   private navGlassBorder(): string {
     return this.dark ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.85)';
   }
+  /** 悬浮小控件的底色：不做白纱，改成贴近底部导航的「微暗玻璃」，并跟随卡片通透度 */
+  private floatTint(): Array<[ResourceColor, number]> {
+    // 与卡片板块完全同源：cardTint 已内置「卡片通透度」系数，滑杆会同时影响卡片与悬浮件
+    return this.cardTint();
+  }
+
+  /** 悬浮小控件的描边：与卡片同一套描边色 */
+  private floatBorder(): string {
+    return this.cardBorderColor();
+  }
   /** 悬浮小控件（顶部主题胶囊 / 回到顶部按钮）：与底部悬浮导航同一套「浮起玻璃」配方 */
   private floatBlur(): BlurStyle {
-    // 与底部悬浮导航一致：薄玻璃（导航用系统材质，实际观感接近 COMPONENT_THIN），不再自加厚玻璃
-    return this.shouldUseCardMaterial() ? BlurStyle.COMPONENT_THIN : BlurStyle.NONE;
+    // 与卡片同一档玻璃，跟随材质等级（自适应/沉浸/无材质）一起变化
+    return this.cardBlurStyle();
   }
   private floatFallbackBg(): ResourceColor {
     return this.dark ? 'rgba(39,39,46,0.92)' : 'rgba(255,255,255,0.94)';
   }
   private floatShadowR(): number {
-    return this.dark ? 16 : 18;
+    return this.cardShadowR();
   }
   private floatShadowColor(): string {
-    return this.dark ? 'rgba(0,0,0,0.55)' : 'rgba(15,23,42,0.16)';
+    return this.cardShadowColor();
   }
   /** 单个页签：选中时只加一层淡色圆角底 + 主题色图标/文字，不做发光 */
   /** 选中光：中心亮、四周完全渐隐的径向柔光（没有矩形边界） */
@@ -5499,6 +5639,29 @@ struct Index {
             .fontColor(this.txt3())
         }
       }
+      if (this.hasCustomImage()) {
+        // 自定义图独有的角标：一眼区分「自己上传的」与内置预设
+        Stack({ alignContent: Alignment.BottomStart }) {
+          Row({ space: 4 }) {
+            Column()
+              .width(5)
+              .height(5)
+              .borderRadius(3)
+              .backgroundColor(Color.White)
+            Text(this.t('自定义', 'Mine'))
+              .fontSize(9)
+              .fontColor(Color.White)
+          }
+          .height(18)
+          .padding({ left: 5, right: 7 })
+          .borderRadius(9)
+          .backgroundColor(this.dark ? 'rgba(0,0,0,0.55)' : 'rgba(15,23,42,0.55)')
+          .margin({ left: 5, bottom: 5 })
+        }
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+      }
       if (this.isCustomSelected()) {
         Column()
           .width('100%')
@@ -6403,6 +6566,17 @@ TabContent() {
           .fontSize(10)
           .fontColor(this.txt3())
           .lineHeight(16)
+        Text(this.t('致敬与致谢', 'Credits & thanks'))
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.txt2())
+          .margin({ top: 4 })
+        Text(this.t(
+          '本应用的外观风格与玻璃材质思路，借鉴了开源项目 OpenAuthenticator（作者 mroble，https://atomgit.com/mroble/Authenticator ），并得到了原作者在实现思路上的指导。本项目代码为独立实现，未复制该仓库源码。在此郑重致谢。',
+          'The visual style and glass material approach of this app were inspired by the open-source project OpenAuthenticator by mroble (https://atomgit.com/mroble/Authenticator), and its author kindly offered guidance on the implementation approach. All code here is independently written; no source was copied from that repository. Sincere thanks to the author.'))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .lineHeight(16)
         Text(this.t('AI 辅助开发声明', 'AI-assisted development'))
           .fontSize(12)
           .fontWeight(FontWeight.Medium)
@@ -6595,10 +6769,11 @@ TabContent() {
       .borderRadius(20)
       .border({ width: 1, color: this.cardBorderColor() })
       .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-      .margin({ left: 24, right: 24 })
+      .constraintSize({ maxWidth: 460 })
     }
     .width('100%')
     .height('100%')
+    .padding({ left: 24, right: 24 })
     .justifyContent(FlexAlign.Center)
     .backgroundColor('rgba(0,0,0,0.38)')
   }

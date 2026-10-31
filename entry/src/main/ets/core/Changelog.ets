@@ -32,6 +32,42 @@ export interface ChangelogEntry {
 export class Changelog {
   private static readonly DATA: ChangelogEntry[] = [
     {
+      version: '1.4.3',
+      date: '2026-10-31',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '自定义背景格里加了「自定义」角标：上传过图片以后，那一格左下角会有个小标签，一眼就能和 7 张内置预设分开。',
+          en: 'The custom background cell now carries a small "Mine" badge once you have uploaded an image, so it is easy to tell apart from the seven built-in presets.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '「声明」里补上了「致敬与致谢」：本应用的外观风格与玻璃材质思路借鉴了开源项目 OpenAuthenticator（作者 mroble），并得到作者在实现思路上的指导，在此致谢。',
+          en: 'The statements page now credits OpenAuthenticator by mroble: its visual style and glass-material approach inspired this app, and the author kindly shared implementation guidance. Sincere thanks.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '预设背景的第 3、5、7 张换了新图（彩球、罗盘、蒲公英），并按手机竖屏重新裁切；升级后会自动换成新图，不需要重新选一次。',
+          en: 'Presets 3, 5 and 7 have new artwork (clay beads, compass, dandelion), cropped for portrait phones. Existing selections refresh automatically after upgrading; no need to pick again.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '右上角的深浅色切换按钮和右下角的置顶按钮，改成和卡片完全同一套玻璃：颜色、模糊、描边、阴影都跟卡片走，拖动「卡片通透度」时它们也一起变。',
+          en: 'The theme toggle and back-to-top buttons now use exactly the same glass as the cards: same tint, blur, border and shadow, and they follow the card clarity slider too.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '升级说明弹层不再占满左右屏幕：最宽 460vp、左右各留 24vp，手机、平板、电脑上都是一块居中的卡片。',
+          en: 'The what-is-new sheet no longer spans the full width: it is capped at 460vp with 24vp side margins, so it reads as a centered card on phones, tablets and PCs.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '修好「自定义背景换第二张必须重启才生效」：每次选图都存成新文件，选完立刻替换，并自动清掉同模式的旧图。',
+          en: 'Fixed custom backgrounds not refreshing until a restart: each pick is saved under a new file name, applied immediately, and the previous image of that theme is cleaned up.'
+        }
+      ]
+    },
+    {
       version: '1.4.2',
       date: '2026-10-30',
       items: [
