@@ -785,7 +785,7 @@ struct Index {
     this.keepAlive = ConfigStore.keepAlive();
     AppBackground.enabled = this.keepAlive;
     this.regionCode = c.regionCode;
-    this.latencyHint = this.t('建议：延迟上限建议 280~360ms（默认 320ms，Ping 3 次取最小值）；设得过低会误杀可用节点', 'Tip: a latency cap of 280–360 ms is recommended (default 320 ms; 3 pings take the minimum); too low a cap may discard usable nodes.');
+    this.latencyHint = this.t('建议：延迟上限建议 280~360ms（默认 320ms）；设得过低会误杀可用节点', 'Tip: a latency cap of 280–360 ms is recommended (default 320 ms); too low a cap may discard usable nodes.');
     // v1→v2：旧版单一背景图复制进浅色/深色两套（同步完成，避免读到半迁移状态）
     ConfigStore.migrateBgPathsSync();
     this.refreshCustomPaths();
@@ -1193,7 +1193,7 @@ struct Index {
 
   /** 切换 IPv4/IPv6 时更新建议值；若当前仍是另一协议的默认值，则自动跟随 */
   private maybeAutoSuggest(v6: boolean): void {
-    this.latencyHint = this.t('建议：延迟上限建议 280~360ms（默认 320ms，Ping 3 次取最小值）；设得过低会误杀可用节点', 'Tip: a latency cap of 280–360 ms is recommended (default 320 ms; 3 pings take the minimum); too low a cap may discard usable nodes.');
+    this.latencyHint = this.t('建议：延迟上限建议 280~360ms（默认 320ms）；设得过低会误杀可用节点', 'Tip: a latency cap of 280–360 ms is recommended (default 320 ms); too low a cap may discard usable nodes.');
     if (v6) {
       this.latencyHint = this.latencyHint;
     }
@@ -3377,8 +3377,8 @@ struct Index {
     const hint: string = this.latencyHint;
     if (hint.length === 0 || hint.indexOf('280~360') >= 0) {
       this.latencyHint = this.t(
-        '建议：延迟上限建议 280~360ms（默认 320ms，Ping 3 次取最小值）；设得过低会误杀可用节点',
-        'Tip: a latency cap of 280–360 ms is recommended (default 320 ms; 3 pings take the minimum); too low a cap may discard usable nodes.');
+        '建议：延迟上限建议 280~360ms（默认 320ms）；设得过低会误杀可用节点',
+        'Tip: a latency cap of 280–360 ms is recommended (default 320 ms); too low a cap may discard usable nodes.');
     }
   }
 

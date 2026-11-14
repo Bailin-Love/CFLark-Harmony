@@ -66,14 +66,14 @@ export class Changelog {
           en: 'Tighter multi-round cards and independent tablet columns: multi-round cards keep three key lines, and the two tablet columns now flow independently, so expanding a card only grows its own column instead of stretching the one beside it.'
         },
         {
-          kind: ChangeKind.IMPROVE,
-          zh: '「丢包」改称「连接失败」：卡片显示连接失败百分比，逐轮表格的「连接」列写该轮结果，筛选页叫「连接失败率上限」。默认 0%，即一次探测失败就淘汰；调高可以放宽，100% 等于关闭这项筛选。',
-          en: 'Packet loss is now called link failure: cards show the failure percentage, the round table has a Link column, and the filter is Max link fail %. It defaults to 0%, so a single failed probe drops the node; raise it to relax the filter, or set 100% to turn it off.'
+          kind: ChangeKind.NEW,
+          zh: '连接失败率上限：第一轮筛选新增「连接失败率上限」。默认 0%，即一次探测失败就淘汰；调高可以放宽，100% 等于关闭这项筛选。卡片显示连接失败百分比，逐轮表格的「连接」列写该轮结果。',
+          en: 'Max link failure: the first-round filter now has a Max link fail % setting. It defaults to 0%, so a single failed probe drops the node; raise it to relax the filter, or set 100% to turn it off. Cards show the failure percentage and the round table has a Link column.'
         },
         {
           kind: ChangeKind.IMPROVE,
-          zh: 'Ping 超时与默认参数：Ping 超时现在可以调（300–10000 ms，默认 1000 ms），只影响 TCP 建连。新装默认 Ping 3 次、延迟上限 320 ms；第一轮会比以前多花一点时间，换来更可信的延迟和连接失败率。',
-          en: 'Ping timeout and new defaults: Ping timeout is now adjustable (300–10000 ms, default 1000 ms) and only affects the TCP connect. Fresh installs default to 3 pings and a 320 ms latency cap; the first round takes a little longer than before, but its latency and link-failure figures are more trustworthy.'
+          zh: 'Ping 超时可调：Ping 超时现在可以调（300–10000 ms，默认 1000 ms），只影响 TCP 建连；新装默认延迟上限 320 ms。第一轮会比以前多花一点时间，换来更可信的延迟与连接失败率。',
+          en: 'Adjustable ping timeout: ping timeout is now configurable (300–10000 ms, default 1000 ms) and only affects the TCP connect; fresh installs default to a 320 ms latency cap. The first round takes a little longer than before, but its latency and link-failure figures are more trustworthy.'
         },
         {
           kind: ChangeKind.IMPROVE,

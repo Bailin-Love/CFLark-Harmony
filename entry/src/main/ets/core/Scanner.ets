@@ -2,7 +2,7 @@
  * CFLark 扫描编排 —— 两阶段，对齐 CloudFlareScan
  *
  * 阶段一「快速筛选」（对应 CloudFlareScan 的 ScanWorker）：
- *   每个候选 IP 连 pingTimes 次 TCP（默认 3 次，间隔 pingIntervalMs），取最小延迟；
+ *   每个候选 IP 连 pingTimes 次 TCP（默认 1 次，间隔 pingIntervalMs），取最小延迟；
  *   最小延迟 >= latencyLimitMs（默认 320ms）或全部失败就淘汰；
  *   通过的再做一次 /cdn-cgi/trace 拿 colo（Host 固定 speed.cloudflare.com）。
  *   为省时间有两个提前结束：首包已低于门槛 60% 直接通过、首次超时直接放弃剩余重试；

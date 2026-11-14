@@ -98,7 +98,7 @@ export function defaultScanConcurrency(): number {
 }
 /** 推荐参数（默认值与「恢复默认」共用的唯一来源，避免 UI / 配置 / 测速三处各写一份） */
 export const REC_SAMPLE_COUNT: number = 3000;
-export const REC_PING_TIMES: number = 3;
+export const REC_PING_TIMES: number = 1;
 export const REC_LATENCY_MS: number = 320;
 /** 丢包率上限（%）的推荐值：0 = 不允许丢包；100 = 不按丢包筛选 */
 export const REC_MAX_LOSS_PCT: number = 0;
