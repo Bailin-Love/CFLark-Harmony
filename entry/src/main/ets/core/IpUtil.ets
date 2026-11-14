@@ -26,6 +26,7 @@ export const CF_IPV4_RANGES: string[] = [
   '198.41.128.0/17',
   '162.158.0.0/15',
   '104.16.0.0/13',
+  '104.24.0.0/14',
   '172.64.0.0/13',
   '131.0.72.0/22'
 ];
@@ -383,15 +384,6 @@ export class IpUtil {
     }
     return out;
   }
-  /** 随机 16 位十六进制串 */
-  static randHex16(): string {
-    let s: string = '';
-    for (let i = 0; i < 4; i++) {
-      s += Math.floor(Math.random() * 16).toString(16);
-    }
-    return s;
-  }
-
   /** 判断 IPv4 是否落在 Cloudflare 官方段内 */
   static isCfV4(ip: string): boolean {
     const n: number = IpUtil.ipv4ToInt(ip);
@@ -425,17 +417,30 @@ export class IpUtil {
     return IpUtil.isCfV4(ip);
   }
 
-  /** 校验用户输入的 IP:port 形式，返回解析结果 */
-  static parseHostPort(input: string, defaultPort: number): string {
-    const s: string = input.trim();
-    if (s.length === 0) {
+  /**
+   * 返回该 IP 命中的 Cloudflare 官方段（形如 `104.24.0.0/14`）；不命中返回空串。
+   * 仅用于结果导出/诊断分析，不参与筛选判定。
+   */
+  static cidrOf(ip: string): string {
+    if (IpUtil.isV6(ip)) {
+      for (let i = 0; i < CF_IPV6_RANGES.length; i++) {
+        if (IpUtil.inCidrV6(ip, CF_IPV6_RANGES[i])) {
+          return CF_IPV6_RANGES[i];
+        }
+      }
       return '';
     }
-    // IPv6 带端口形式 [2606::1]:443
-    if (s.charAt(0) === '[') {
-      return s;
+    const n: number = IpUtil.ipv4ToInt(ip);
+    if (n < 0) {
+      return '';
     }
-    return s;
+    for (let i = 0; i < CF_IPV4_RANGES.length; i++) {
+      const r: CidrV4 = IpUtil.parseCidrV4(CF_IPV4_RANGES[i]);
+      if (n >= r.start && n <= r.end) {
+        return CF_IPV4_RANGES[i];
+      }
+    }
+    return '';
   }
 
   /** 打乱数组（Fisher-Yates） */

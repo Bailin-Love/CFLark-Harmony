@@ -49,6 +49,7 @@ export class HelpText {
           'Official and community ranges are built-in read-only sources; they cannot be edited or deleted.',
           'A custom group may contain several sources of mixed kinds: link, file and pasted text.',
           'Imports are validated against the current IP version: the IPv4 page only accepts IPv4 ranges and the IPv6 page only accepts IPv6 ranges. Lines of the wrong type are rejected with a reason.',
+          'The port row only lists TLS ports that Cloudflare supports: 443, 2053, 2083, 2087, 2096 and 8443.',
           'Link sources can be refreshed in one tap. A failed source stays in the list with its reason and is not counted as enabled.'
         ];
       }
@@ -56,6 +57,7 @@ export class HelpText {
         '官方 IP 段与社区段库为内置只读来源，不允许编辑或删除。',
         '一个自定义分组可包含多个来源，链接、文件、文本三种方式可以混用。',
         '导入时按当前 IP 版本严格校验：IPv4 页面只接受 IPv4 网段，IPv6 页面只接受 IPv6 网段；类型不符的行会被拒绝并给出原因。',
+        '端口行只列出 Cloudflare 支持的 TLS 端口：443、2053、2083、2087、2096、8443。',
         '链接来源支持一键更新；解析失败的来源会保留在列表里并标注原因，不计入启用来源。'
       ];
     }
@@ -65,14 +67,14 @@ export class HelpText {
           'Full test: round 1 addresses are sorted by latency, lowest first, and only the top N are tested (default 10, range 1-99); the upload count can be limited in Settings - Subscription upload.',
           'Region test: groups by region and speed-tests the few lowest-latency addresses in each region; covers all regions.',
           'Each address is tested {rounds} times and the results averaged; each download window is {window}ms. Keep rounds at 10 or fewer, otherwise the total takes a long time.',
-          'The test domain is used for the Host/SNI check and its A (IPv4)/AAAA (IPv6) records are resolved into candidates; if blank, speed.cloudflare.com is used.'
+          'The test domain\'s A (IPv4)/AAAA (IPv6) records are resolved into candidates; when "Domain end-to-end check" is on, each selected node is also validated with this domain before the speed test. Download speed tests always use speed.cloudflare.com.'
         ];
       }
       return [
         '完全测速：第一轮通过的地址按延迟从低到高排序，只测前 N 个（默认 10，范围 1~99）；上传数量可在「设置 → 订阅上传」限制。',
         '地区测速：按地区分组，每个地区各取延迟最低的前几个地址测速；覆盖所有地区。',
         '每个地址测 {rounds} 次取平均，单次下载窗口 {window}ms。建议次数不超过 10，否则总耗时很长。',
-        '测速域名用于 Host/SNI 校验，并自动解析其 A（IPv4）/AAAA（IPv6）记录并入候选；留空则用 speed.cloudflare.com。'
+        '测速域名会自动解析 A（IPv4）/AAAA（IPv6）记录并入候选；开启「域名端到端检测」后，正式测速前还会用它逐个验证入选节点。下载测速始终使用 speed.cloudflare.com，与该域名无关。'
       ];
     }
     if (key === HELP_UPLOAD) {
@@ -130,18 +132,22 @@ export class HelpText {
     if (en) {
       return [
         'Samples: 3000 for both IPv4 and IPv6; if random addresses have a low hit rate, sample domain AAAA records instead.',
-        'Concurrency cap: 120 on phones / 200 on tablets / 300 on computers (this device: {cap}). Values above it are reset to the cap automatically.',
+        'Concurrency cap: 150 on phones / 200 on tablets / 300 on computers (this device: {cap}). Values above it are reset to the cap automatically.',
         '{latency}',
         'Each IP gets {ping} TCP samples, keeping the minimum; nodes above the latency cap are dropped. IPv4 and IPv6 share the same cap.',
-        'Min speed: after the round 1 pre-filter, nodes below this value are eliminated one by one in ascending latency order, and the process stops early if the target cannot be filled (0 = no elimination).'
+        'Max loss: 0 = no loss allowed (default; one lost probe out of 3 is dropped). Larger values are looser; 100 = loss filtering off. The rate uses probes actually sent as the denominator, so probes skipped by early exit never count as loss.',
+        'Min speed: after the round 1 pre-filter, nodes below this value are eliminated one by one in ascending latency order, and the process stops early if the target cannot be filled (0 = no elimination).',
+        'Ping timeout: applies only to the TCP connect wait in round 1 (default 1000 ms, range 300–10000). The default matches common Cloudflare speed-test tools. A longer timeout recognises slow-but-alive nodes that a 1s budget would drop, at the cost of a slower round 1. It does not affect the HTTPS probe, precheck or download test, which each keep their own timeout.'
       ];
     }
     return [
       '采样数：本次扫描最多生成多少个候选地址，IPv4/IPv6 通用（默认 3000）。填 0 表示采样全部段：官方段库每个 /24（IPv6 每个 /48）各取 1 个，社区与自定义来源每一行各取 1 个，候选量会明显变大，扫描也更久。',
-      '并发上限：手机 120 / 平板 200 / 电脑 300（当前设备 {cap}），超过会自动改回上限。',
+      '并发上限：手机 150 / 平板 200 / 电脑 300（当前设备 {cap}），超过会自动改回上限。',
       '{latency}',
       '每个 IP 连 {ping} 次 TCP 取最小值；超过延迟上限直接淘汰，IPv4/IPv6 共用同一上限。',
-      '合格速度：低于该值的节点在第一轮初筛后按延迟从低到高逐个淘汰，凑不满会提前中止（0 = 不淘汰）。'
+      '连接失败率上限：0 = 不允许失败（默认，任一次探测失败即淘汰）；数值越大越宽松，100 = 关闭该筛选。失败率以真实发出的探测次数为分母，提前结束时未发的次数不计为失败。',
+      '合格速度：低于该值的节点在第一轮初筛后按延迟从低到高逐个淘汰，凑不满会提前中止（0 = 不淘汰）。',
+      'Ping 超时：作用于第一阶段每次 TCP 建连等待，以及测速阶段每轮开始前的那一次 TCP 握手（稳定性样本）；不影响 HTTPS 预检和下载测速，那两步各用各的超时（默认 1000 ms，范围 300–10000）。默认值与常见的 Cloudflare 测速工具一致。调长能救回「慢但在线」的节点，代价是第一轮更久；调短则相反。'
     ];
   }
 }

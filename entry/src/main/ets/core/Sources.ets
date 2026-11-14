@@ -20,7 +20,7 @@
  *     版本键 src_model_ver 避免每次启动重复迁移；旧版 scan_custom 数据按实际网段格式
  *     分类迁入，无法识别的行进入隔离区（保留并提示，不静默丢弃），scan_custom 原值不动。
  */
-import { ConfigStore } from './ConfigStore';
+import { ConfigStore, RawEntry } from './ConfigStore';
 import { IpUtil } from './IpUtil';
 import { ScanConfig, ScanMode, IpVersion } from './Types';
 
@@ -209,6 +209,9 @@ export class Sources {
   /** 社区段库缓存（按族分开保存，避免互相覆盖） */
   static communityV4: string = '';
   static communityV6: string = '';
+  /** 社区库行数缓存：键是上一次计数时的文本内容，值是当时算出的有效行数 */
+  static commCountText: string[] = ['', ''];
+  static commCount: number[] = [-1, -1];
   /** 隔离区 */
   static quarantines: QuarantineItem[] = [];
   /** 当前选中来源 id（按族独立） */
@@ -233,10 +236,6 @@ export class Sources {
       return '文件';
     }
     return '文本';
-  }
-
-  static isBuiltinId(id: string): boolean {
-    return id.startsWith(BUILTIN_PREFIX);
   }
 
   /** 内置分组：只读。业务层用这个守卫，不能只依赖 UI 隐藏按钮 */
@@ -870,35 +869,6 @@ export class Sources {
     return r;
   }
 
-  static renameSource(groupId: string, sourceId: string, name: string): OpResult {
-    const r: OpResult = { ok: false, error: '', groupId: groupId, sourceId: sourceId };
-    const b: string = Sources.builtinError(groupId);
-    if (b.length > 0) {
-      r.error = b;
-      return r;
-    }
-    const g: SourceGroup | undefined = Sources.findGroup(groupId);
-    if (g === undefined) {
-      r.error = '分组不存在';
-      return r;
-    }
-    const n: string = Sources.trimName(name);
-    if (n.length === 0) {
-      r.error = '来源名称不能为空';
-      return r;
-    }
-    for (let i = 0; i < g.sources.length; i++) {
-      if (g.sources[i].id === sourceId) {
-        g.sources[i].name = n;
-        g.updatedAt = Date.now();
-        r.ok = true;
-        return r;
-      }
-    }
-    r.error = '来源不存在';
-    return r;
-  }
-
   // ————————————————————————————————— 当前选中（按族独立） —————————————————————————————————
 
   static selected(family: number): string {
@@ -979,9 +949,24 @@ export class Sources {
     return family === SRC_FAM_V6 ? Sources.communityV6 : Sources.communityV4;
   }
 
-  /** 社区库有效行数（按族严格校验后计数，错误类型不会被算进当前族） */
+  /**
+   * 社区库有效行数（按族严格校验后计数，错误类型不会被算进当前族）。
+   *
+   * 这段解析不便宜：两万行要逐行 classify + Set 去重，Node 实测约 14ms，
+   * 而它被 sourceHintText() 在每次 ScanPage build 里求值（扫描期每秒约 8 次），
+   * 管理面板打开时同一帧最多 4 个求值点。所以这里按「文本内容」做缓存：
+   * 文本没变就直接复用行数，文本一变（拉取 / 导入 / 清空 / 恢复默认）键自然失配，
+   * 不需要额外的失效通知，也不会读到过期值。
+   */
   static communityLineCount(family: number): number {
-    const out: ImportOutcome = Sources.parseImport(Sources.communityText(family), family, 0);
+    const text: string = Sources.communityText(family);
+    const idx: number = family === SRC_FAM_V6 ? 1 : 0;
+    if (Sources.commCountText[idx] === text && Sources.commCount[idx] >= 0) {
+      return Sources.commCount[idx];
+    }
+    const out: ImportOutcome = Sources.parseImport(text, family, 0);
+    Sources.commCountText[idx] = text;
+    Sources.commCount[idx] = out.accepted.length;
     return out.accepted.length;
   }
 
@@ -1307,11 +1292,15 @@ export class Sources {
   }
 
   static async save(): Promise<void> {
-    await ConfigStore.rawPut(KEY_MODEL_V4, Sources.serializeFamily(SRC_FAM_V4));
-    await ConfigStore.rawPut(KEY_MODEL_V6, Sources.serializeFamily(SRC_FAM_V6));
-    await ConfigStore.rawPut(KEY_VER, VER_CURRENT);
-    await ConfigStore.rawPut(KEY_SEL_V4, Sources.selV4);
-    await ConfigStore.rawPut(KEY_SEL_V6, Sources.selV6);
+    // 五个键属于同一次快照，批量写、只 flush 一次（原来逐键 flush，一次保存 5 次磁盘写）
+    const entries: RawEntry[] = [
+      { key: KEY_MODEL_V4, value: Sources.serializeFamily(SRC_FAM_V4) },
+      { key: KEY_MODEL_V6, value: Sources.serializeFamily(SRC_FAM_V6) },
+      { key: KEY_VER, value: VER_CURRENT },
+      { key: KEY_SEL_V4, value: Sources.selV4 },
+      { key: KEY_SEL_V6, value: Sources.selV6 }
+    ];
+    await ConfigStore.rawPutMany(entries);
   }
 
   /**

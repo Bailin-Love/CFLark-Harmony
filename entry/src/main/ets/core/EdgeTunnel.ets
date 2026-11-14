@@ -292,6 +292,66 @@ export class EdgeTunnel {
   }
 
   /**
+   * 同地区排列：同一地区码内始终 IPv4 在前、IPv6 在后，与上传先后无关。
+   * 只重排「本项目可解析的节点行」，自定义行/订阅链接等保持原位置不动；
+   * 同族内部保持原有相对顺序，不丢弃任何行，也不改写节点原有信息。
+   * 追加场景下远程内容先于新节点，这里会把它一并重排，因此「先传 IPv6 再追加
+   * IPv4」最终也会落到「V4 在前、V6 在后」。
+   */
+  static orderByRegion(content: string): string {
+    if (content.length === 0) {
+      return content;
+    }
+    const lines: string[] = content.split('\n');
+    const slots: number[] = [];
+    const raws: string[] = [];
+    const parsed: NodeLine[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const p: NodeLine | undefined = EdgeTunnel.parseNodeLine(lines[i]);
+      if (p === undefined) {
+        continue;
+      }
+      slots.push(i);
+      raws.push(lines[i]);
+      parsed.push(p);
+    }
+    if (parsed.length < 2) {
+      return content;
+    }
+    // 地区按首次出现顺序保留（不重新设计地区优先级），组内按 V4 → V6 稳定切分
+    const order: string[] = [];
+    const groups: Map<string, number[]> = new Map<string, number[]>();
+    for (let i = 0; i < parsed.length; i++) {
+      const code: string = parsed[i].code;
+      let arr: number[] | undefined = groups.get(code);
+      if (arr === undefined) {
+        const fresh: number[] = [];
+        groups.set(code, fresh);
+        order.push(code);
+        arr = fresh;
+      }
+      (arr as number[]).push(i);
+    }
+    const seq: number[] = [];
+    for (let g = 0; g < order.length; g++) {
+      const arr: number[] = groups.get(order[g]) as number[];
+      for (let f = 0; f < 2; f++) {
+        const family: number = f === 0 ? 4 : 6;
+        for (let i = 0; i < arr.length; i++) {
+          if (parsed[arr[i]].family === family) {
+            seq.push(arr[i]);
+          }
+        }
+      }
+    }
+    const out: string[] = lines.slice();
+    for (let i = 0; i < slots.length; i++) {
+      out[slots[i]] = raws[seq[i]];
+    }
+    return out.join('\n');
+  }
+
+  /**
    * 节点的去重键：忽略 # 备注，仅比较地址本身。
    * IPv6 统一成不带方括号的 "addr:port"，这样 "addr:port" 与
    * "[addr]:port#备注" 会被视为同一个节点，追加时不会重复写入。
@@ -467,6 +527,9 @@ export class EdgeTunnel {
       throw new Error('没有可上传的内容');
     }
 
+    // 无论覆盖还是追加、无论先传 V4 还是 V6，写入前统一做一次同地区 V4→V6 排列
+    content = EdgeTunnel.orderByRegion(content);
+
     onStatus('正在写入远程文件…');
     const t2: number = Date.now();
     await EdgeTunnel.writeRemote(base, cookie, content, proxy);
@@ -549,6 +612,9 @@ export class EdgeTunnel {
     if (content.length === 0) {
       throw new Error('没有可上传的内容');
     }
+
+    // 与登录上传走同一套排列规则，保证两条上传链路结果一致
+    content = EdgeTunnel.orderByRegion(content);
 
     onStatus('正在写入 Cloudflare KV…');
     const t2: number = Date.now();

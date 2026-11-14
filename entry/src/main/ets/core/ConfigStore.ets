@@ -1,18 +1,24 @@
 /**
  * CFLark 配置持久化（preferences）
  *
- * 默认值按 CloudFlareScan 的推荐：
- *  - 每 IP ping 2 次（间隔 50ms）取最小值，超时 1 秒
- *  - 延迟上限 220ms（ScanWorker 的默认值，不取更高的，高了没意义）
- *  - TCP 并发 120（CloudFlareScan 用 150，模拟器上 120 更稳）
- *  - 测速 3 秒窗口，取延迟最低的前 10 个，每个测 1 次，串行、间隔 300ms
- *  - 排名权重：延迟 0.3 / 速度 0.7
+ * 默认值（UI「恢复默认」与配置默认共用同一组 REC_* 常量）：
+ *  - 每 IP ping 3 次（间隔 50ms），单次超时 1 秒
+ *  - 延迟上限 320ms
+ *  - TCP 并发默认 30；上限按设备形态分档：手机 150 / 平板 200 / 电脑(2in1) 300
+ *  - 测速 6 秒窗口，取延迟最低的前 10 个，每个测 1 轮，串行、间隔 300ms
+ *  - 排名权重：延迟 0.1 / 速度 0.9
  */
 import { preferences } from '@kit.ArkData';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { EdgeTunnelConfig, defaultEdgeTunnelConfig } from './EdgeTunnel';
 import { common } from '@kit.AbilityKit';
 import { ScanConfig, ScanMode, IpVersion, SpeedScope } from './Types';
+
+/** 一次批量写入的一个键值对（配合 ConfigStore.rawPutMany 使用） */
+export interface RawEntry {
+  key: string;
+  value: string;
+}
 
 /** 外观设置：材质（全局沉浸光感 / 材质类型 / 材质等级）+ 主题色 + 背景图（模糊 / 明亮） */
 export interface UiConfig {
@@ -71,15 +77,9 @@ export enum ThemeMode {
   SYSTEM = 2
 }
 
-/** 两套背景图快照（启动预读用） */
-export interface BgSnapshot {
-  light: string;
-  dark: string;
-}
-
 /** 第一轮并发上限：按设备形态分档，避免低端机开太猛反而更慢 */
 export function maxScanConcurrency(): number {
-  // 按设备形态分档：手机 120、平板 200、电脑(2in1) 300。
+  // 按设备形态分档：手机 150、平板 200、电脑(2in1) 300。
   // 超过上限只会在弱网下制造大量超时并让设备发热，收益为负。
   const t: string = deviceInfo.deviceType;
   if (t === '2in1' || t === 'pc') {
@@ -88,23 +88,34 @@ export function maxScanConcurrency(): number {
   if (t === 'tablet') {
     return 200;
   }
-  return 120;
+  return 150;
 }
 
-/** 默认并发 = 上限的 80% */
+/** 默认并发 30（上限见 maxScanConcurrency） */
 export function defaultScanConcurrency(): number {
   // 默认并发 30：3000 个候选大约 1 分钟内跑完，同时避免排队放大延迟与过度发热。
   return 30;
 }
-/** 推荐参数（默认值与「应用建议」共用的唯一来源，避免 UI / 配置 / 测速三处各写一份） */
+/** 推荐参数（默认值与「恢复默认」共用的唯一来源，避免 UI / 配置 / 测速三处各写一份） */
 export const REC_SAMPLE_COUNT: number = 3000;
-export const REC_PING_TIMES: number = 1;
-export const REC_LATENCY_MS: number = 300;
+export const REC_PING_TIMES: number = 3;
+export const REC_LATENCY_MS: number = 320;
+/** 丢包率上限（%）的推荐值：0 = 不允许丢包；100 = 不按丢包筛选 */
+export const REC_MAX_LOSS_PCT: number = 0;
 export const REC_SPEED_COUNT: number = 10;
 export const REC_SPEED_PER_REGION: number = 3;
 export const REC_SPEED_ROUNDS: number = 1;
 export const REC_SPEED_WINDOW_MS: number = 6000;
 export const REC_MIN_SPEED_MBPS: number = 0.1;
+/**
+ * 第一阶段 TCP 连接探测（Ping）的单次超时推荐值，单位 ms。
+ * 只作用于 TcpProbe.pingOnce 的建连等待，不影响 trace / 预检 / 下载测速
+ * （那些走独立的 traceTimeoutMs 与 speedWindowMs）。
+ */
+export const REC_PING_TIMEOUT_MS: number = 1000;
+/** Ping 超时可调范围：低于 300ms 会把正常国际链路误杀，高于 10s 会让慢节点拖住整轮 */
+export const PING_TIMEOUT_MIN_MS: number = 300;
+export const PING_TIMEOUT_MAX_MS: number = 10000;
 
 export function defaultScanConfig(): ScanConfig {
   const c: ScanConfig = {
@@ -117,8 +128,9 @@ export function defaultScanConfig(): ScanConfig {
     sourceGroupName: '',
     pingTimes: REC_PING_TIMES,
     pingIntervalMs: 50,
-    pingTimeoutMs: 1000,
+    pingTimeoutMs: REC_PING_TIMEOUT_MS,
     latencyLimitMs: REC_LATENCY_MS,
+    maxLossPct: REC_MAX_LOSS_PCT,
     scanConcurrency: defaultScanConcurrency(),
     traceHost: DEFAULT_TRACE_HOST,
     tracePath: DEFAULT_TRACE_PATH,
@@ -135,6 +147,7 @@ export function defaultScanConfig(): ScanConfig {
     speedGapMs: 300,
     minSpeedMbps: REC_MIN_SPEED_MBPS,
     domain: '',
+    domainCheck: false,
     domainSampling: true,
     regionCode: '',
     delayWeight: 0.1,
@@ -185,13 +198,28 @@ export class ConfigStore {
   static rawStr(key: string, def: string): string {
     return ConfigStore.str(key, def);
   }
-
   static async rawPut(key: string, value: string): Promise<void> {
     const st = ConfigStore.store;
     if (st === undefined) {
       return;
     }
     await st.put(key, value);
+    await st.flush();
+  }
+
+  /**
+   * 批量写同一批键，只在最后 flush 一次。
+   * 用于「一次操作要落多个键」的场景（如候选来源模型一次写 5 个键），
+   * 避免每键一次磁盘写；写入值与逐个 rawPut 完全一致。
+   */
+  static async rawPutMany(entries: RawEntry[]): Promise<void> {
+    const st = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    for (let i = 0; i < entries.length; i++) {
+      st.putSync(entries[i].key, entries[i].value);
+    }
     await st.flush();
   }
 
@@ -203,7 +231,9 @@ export class ConfigStore {
     d.sampleCount = ConfigStore.num('scan_samples', d.sampleCount);
     d.customText = ConfigStore.str('scan_custom', d.customText);
     d.pingTimes = ConfigStore.num('scan_ping_times', d.pingTimes);
+    d.pingTimeoutMs = ConfigStore.num('scan_ping_timeout', d.pingTimeoutMs);
     d.latencyLimitMs = ConfigStore.num('scan_latency', d.latencyLimitMs);
+    d.maxLossPct = ConfigStore.num('scan_loss_pct', d.maxLossPct);
     d.scanConcurrency = ConfigStore.num('scan_concurrency', d.scanConcurrency);
     d.enableSpeed = ConfigStore.str('scan_enable_speed', '1') === '1';
     const sc: number = ConfigStore.num('scan_speed_scope', d.speedScope);
@@ -214,6 +244,7 @@ export class ConfigStore {
     d.speedWindowMs = ConfigStore.num('scan_speed_window', d.speedWindowMs);
     d.minSpeedMbps = ConfigStore.num('scan_min_speed', d.minSpeedMbps);
     d.domain = ConfigStore.str('domain', d.domain);
+    d.domainCheck = ConfigStore.str('domain_check', '0') === '1';
     d.domainSampling = ConfigStore.str('domain_sampling', '0') === '1';
     d.regionCode = ConfigStore.str('scan_region', d.regionCode);
     return d;
@@ -234,7 +265,9 @@ export class ConfigStore {
     st.putSync('scan_samples', c.sampleCount);
     st.putSync('scan_custom', c.customText);
     st.putSync('scan_ping_times', c.pingTimes);
+    st.putSync('scan_ping_timeout', c.pingTimeoutMs);
     st.putSync('scan_latency', c.latencyLimitMs);
+    st.putSync('scan_loss_pct', c.maxLossPct);
     st.putSync('scan_concurrency', c.scanConcurrency);
     st.putSync('scan_enable_speed', c.enableSpeed ? '1' : '0');
     st.putSync('scan_speed_scope', c.speedScope);
@@ -244,6 +277,7 @@ export class ConfigStore {
     st.putSync('scan_speed_window', c.speedWindowMs);
     st.putSync('scan_min_speed', c.minSpeedMbps);
     st.putSync('domain', c.domain);
+    st.putSync('domain_check', c.domainCheck ? '1' : '0');
     st.putSync('domain_sampling', c.domainSampling ? '1' : '0');
     st.putSync('scan_region', c.regionCode);
     await st.flush();
@@ -311,20 +345,6 @@ export class ConfigStore {
     st.putSync('changelog_seen_version', version);
     await st.flush();
   }
-  /** 自定义背景图（应用沙箱内的绝对路径），空串表示用默认渐变 */
-  static bgPath(): string {
-    return ConfigStore.str('bg_path', '');
-  }
-
-  static async saveBgPath(path: string): Promise<void> {
-    const st = ConfigStore.store;
-    if (st === undefined) {
-      return;
-    }
-    st.putSync('bg_path', path);
-    await st.flush();
-  }
-
   /**
    * 按深浅色分别读取背景图（v2 数据结构）。
    * 空串表示该模式使用默认背景（深色为深色渐变、浅色为浅色渐变）。
@@ -341,20 +361,6 @@ export class ConfigStore {
     }
     st.putSync(dark ? 'bg_path_dark' : 'bg_path_light', path);
     st.putSync('bg_path_ver', 2);
-    await st.flush();
-  }
-
-  /**
-   * 旧版只有一份 `bg_path`（不分深浅色）。首次升级时把它**复制**到两套配置里，
-   * 这样升级前后背景观感完全一致，也不会因为只归入一种模式而让另一种模式突然变样。
-   * 已是 v2 或旧值为空则不做任何事；旧键保留不删，便于回滚。
-   */
-  static async migrateBgPaths(): Promise<void> {
-    ConfigStore.migrateBgPathsSync();
-    const st = ConfigStore.store;
-    if (st === undefined) {
-      return;
-    }
     await st.flush();
   }
 
@@ -376,22 +382,6 @@ export class ConfigStore {
     st.putSync('bg_path_ver', 2);
   }
 
-  /** 启动阶段同步取两套背景图（供进程创建时预读，避免首帧闪空白） */
-  static bgPathSnapshot(): BgSnapshot {
-    const st = ConfigStore.store;
-    if (st === undefined) {
-      return { light: '', dark: '' };
-    }
-    const ver: number = ConfigStore.num('bg_path_ver', 0);
-    if (ver >= 2) {
-      return {
-        light: ConfigStore.str('bg_path_light', ''),
-        dark: ConfigStore.str('bg_path_dark', '')
-      };
-    }
-    const legacy: string = ConfigStore.str('bg_path', '');
-    return { light: legacy, dark: legacy };
-  }
   /** 读取主题模式，默认「跟随系统」 */
 static ui(): UiConfig {
     const d: UiConfig = defaultUiConfig();
@@ -443,6 +433,24 @@ static ui(): UiConfig {
     await st.flush();
   }
 
+  /** 历史记录保存上限：0=关闭自动保存，30/50=保留最近 N 条（默认 50） */
+  static historyLimit(): number {
+    const v: number = ConfigStore.num('hist_limit', 50);
+    if (v === 0 || v === 30 || v === 50) {
+      return v;
+    }
+    return 50;
+  }
+
+  static async saveHistoryLimit(n: number): Promise<void> {
+    const st: preferences.Preferences | undefined = ConfigStore.store;
+    if (st === undefined) {
+      return;
+    }
+    await st.put('hist_limit', n);
+    await st.flush();
+  }
+
   static theme(): number {
     return ConfigStore.num('themeMode', ThemeMode.SYSTEM);
   }
@@ -451,15 +459,6 @@ static ui(): UiConfig {
   static glassLevel(): number {
     const n = ConfigStore.num('glass_level', 1);
     return n < 0 ? 0 : (n > 3 ? 3 : n);
-  }
-
-  static async saveGlassLevel(v: number): Promise<void> {
-    const st = ConfigStore.store;
-    if (st === undefined) {
-      return;
-    }
-    st.putSync('glass_level', v < 0 ? 0 : (v > 3 ? 3 : v));
-    await st.flush();
   }
 
   /** 保存主题模式（切换后立刻落盘，避免重启丢失） */

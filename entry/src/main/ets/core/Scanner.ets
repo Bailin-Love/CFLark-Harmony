@@ -2,23 +2,30 @@
  * CFLark 扫描编排 —— 两阶段，对齐 CloudFlareScan
  *
  * 阶段一「快速筛选」（对应 CloudFlareScan 的 ScanWorker）：
- *   每个候选 IP 连 pingTimes 次 TCP（默认 2 次，间隔 pingIntervalMs），取最小延迟；
- *   最小延迟 >= latencyLimitMs（默认 220ms）或全部失败就淘汰；
+ *   每个候选 IP 连 pingTimes 次 TCP（默认 3 次，间隔 pingIntervalMs），取最小延迟；
+ *   最小延迟 >= latencyLimitMs（默认 320ms）或全部失败就淘汰；
  *   通过的再做一次 /cdn-cgi/trace 拿 colo（Host 固定 speed.cloudflare.com）。
+ *   为省时间有两个提前结束：首包已低于门槛 60% 直接通过、首次超时直接放弃剩余重试；
+ *   丢包率按「真实发出的次数」算分母，未执行的次数不算丢包。
  *
  * 阶段二「测速」（对应 CloudFlareScan 的 SpeedTestWorker）：
  *   把通过的候选按延迟升序排序（可选先按 regionCode 过滤 colo）；
  *   取延迟最低的前 speedCount 个（默认 10，范围 1~99），逐个测速；
- *   每个地址测 speedRounds 次取平均，每个之间 sleep(speedGapMs)；
- *   测速的 Host / SNI 用用户填的域名（留空则 speed.cloudflare.com）。
+ *   每个地址测 speedRounds 次，每个之间 sleep(speedGapMs)；
+ *   评分速度用方案 A 的「有效速度」= 成功轮中位数 ×（成功轮数 ÷ 设定轮数），
+ *   失败轮不消失、而是按比例扣减；平均/最低/最高只用于展示。
+ *   测速的 Host / SNI 固定 speed.cloudflare.com（用户域名一般不提供 /__down 端点）。
  *
- * 排名：Ranker 负责 min-max 归一化 + 加权（延迟 0.3 / 速度 0.7）。
+ * 可选「自定义域名端到端检测」：开关打开且域名有效时，在正式测速前对已入选的
+ *   节点各做一次 https://<域名>/ 请求（DNS 指到候选 IP），失败的节点直接淘汰。
+ *
+ * 排名：Ranker 负责相对最优归一化 + 加权（延迟 0.1 / 速度 0.9）。
  */
 import { Candidate, ScanConfig, ScanMode, IpVersion, Stage, Verdict, SpeedScope } from './Types';
 import { IpUtil, CidrV4, CF_IPV4_RANGES, CF_IPV6_RANGES } from './IpUtil';
 import { CF_IPV6_POOL_48 } from './V6Pool';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { TcpProbe, TcpResult, TraceProbe, TraceResult } from './Probe';
+import { TcpProbe, TcpResult, TraceProbe, TraceResult, TraceTarget } from './Probe';
 import { SpeedTest, SpeedTarget } from './SpeedTest';
 import { DnsService } from './DnsService';
 import { Ranker } from './Ranker';
@@ -26,8 +33,6 @@ import { Ranker } from './Ranker';
 export const DEFAULT_TRACE_HOST: string = 'speed.cloudflare.com';
 export const DEFAULT_TRACE_PATH: string = '/cdn-cgi/trace';
 export const SPEED_PATH: string = '/__down?bytes=50000000';
-export const MIN_LATENCY_LIMIT: number = 50;
-export const MAX_LATENCY_LIMIT: number = 1000;
 
 /** 进度与结果回调（必须是 class，ArkTS 不接受未标注类型的对象字面量） */
 export class ScanHooks {
@@ -58,6 +63,24 @@ export class ScanHooks {
   onPrecheckDone: (qualified: number, checked: number, exhausted: boolean, target: number) => void =
     (qualified: number, checked: number, exhausted: boolean, target: number) => {
     };
+  /**
+   * 单个节点的预检结果（诊断用）：把每个节点实际测到的速度、字节数、耗时、
+   * HTTP 状态码和判定结果交给 UI 写进运行日志。
+   *
+   * 为什么需要它：合格速度 0.4 MB/s 却「全部不通过」时，只看一个「0 个达标」
+   * 的数字分不清是「网络确实慢」「阈值没生效」还是「节点回了 429/错误页」。
+   * 把每次探测的真实数字摊开，才能把配置问题、阈值问题和网络问题区分开。
+   * 这条日志不参与任何评分或筛选，只用于排查。
+   */
+  onProbeResult: (text: string) => void = (text: string) => {
+  };
+  /**
+   * 本轮在进入下载测速前被中止（目前只有「域名端到端检测全部失败」这一种）。
+   * reason 是给用户看的中文原因；UI 据此显示失败阶段与后续动作建议，
+   * 不能把它当成「测速完成」。
+   */
+  onAborted: (reason: string, suggestion: string) => void = (reason: string, suggestion: string) => {
+  };
 }
 
 /** 取消令牌 */
@@ -87,6 +110,25 @@ export class PrecheckResult {
   cancelled: boolean = false;
 }
 
+/**
+ * 单节点预检的诊断报告。只用于把「每个节点实际测到了什么」写进运行日志，
+ * 不参与评分、排名或任何筛选判定。
+ */
+export interface ProbeReport {
+  /** 是否达到用户设置的合格速度（r.ok && avgMbps >= minSpeedMbps） */
+  ok: boolean;
+  /** 本窗口内的实测速度（MB/s），按「首字节→结束」的有效时长计算 */
+  avgMbps: number;
+  /** 实际收到的字节数，0 表示什么都没下到（不能当成「速度 0」） */
+  bytes: number;
+  /** 本次探测耗时（ms） */
+  costMs: number;
+  /** HTTP 状态码，0 表示没拿到响应（TLS/连接层就失败了） */
+  statusCode: number;
+  /** 失败原因（成功时为空） */
+  error: string;
+}
+
 export class Scanner {
   /** 上一次 customCandidates 解析跳过的行数（用于日志提示） */
   static lastParseSkipped: number = 0;
@@ -111,8 +153,19 @@ export class Scanner {
       httpCode: 0,
       speedMbps: 0,
       speedMaxMbps: 0,
+      speedMinMbps: 0,
+      speedAvgMbps: 0,
       speedRounds: 0,
+      speedCfgRounds: 0,
       speedOk: false,
+      speedSamples: '',
+      speedStates: '',
+      speedLatSamples: '',
+      speedLossSamples: '',
+      linkOk: 0,
+      linkTries: 0,
+      speedDelayMs: 0,
+      stabilityScore: -1,
       delayScore: 0,
       speedScore: 0,
       finalScore: 0,
@@ -121,36 +174,6 @@ export class Scanner {
       failReason: ''
     };
     return c;
-  }
-
-  static clone(c: Candidate): Candidate {
-    const r: Candidate = {
-      ip: c.ip,
-      port: c.port,
-      version: c.version,
-      stage: c.stage,
-      pingSent: c.pingSent,
-      pingRecv: c.pingRecv,
-      minLatencyMs: c.minLatencyMs,
-      avgLatencyMs: c.avgLatencyMs,
-      maxLatencyMs: c.maxLatencyMs,
-      lossRate: c.lossRate,
-      colo: c.colo,
-      traceOk: c.traceOk,
-      traceDelayMs: c.traceDelayMs,
-      httpCode: c.httpCode,
-      speedMbps: c.speedMbps,
-      speedMaxMbps: c.speedMaxMbps,
-      speedRounds: c.speedRounds,
-      speedOk: c.speedOk,
-      delayScore: c.delayScore,
-      speedScore: c.speedScore,
-      finalScore: c.finalScore,
-      verdict: c.verdict,
-      remark: c.remark,
-      failReason: c.failReason
-    };
-    return r;
   }
 
   static sleep(ms: number): Promise<void> {
@@ -445,8 +468,12 @@ export class Scanner {
     }
   }
 
-  /** 质量预检单节点：小窗口快速估速（只用于判断能否达标，不参与最终统计） */
-  private static async probeQuality(c: Candidate, cfg: ScanConfig, windowMs: number): Promise<boolean> {
+  /**
+   * 质量预检单节点：小窗口快速估速（只用于判断能否达标，不参与最终统计）。
+   * 返回带诊断字段的报告，不只是 boolean——「0 个达标」时必须能说清每个节点
+   * 到底测到了多少、花了多久、服务端回了什么。
+   */
+  private static async probeQuality(c: Candidate, cfg: ScanConfig, windowMs: number): Promise<ProbeReport> {
     const t: SpeedTarget = {
       ip: c.ip,
       port: c.port,
@@ -458,9 +485,18 @@ export class Scanner {
     };
     try {
       const r = await SpeedTest.run(t);
-      return r.ok && r.avgMbps >= cfg.minSpeedMbps;
+      const rep: ProbeReport = {
+        ok: r.ok && r.avgMbps >= cfg.minSpeedMbps,
+        avgMbps: r.avgMbps,
+        bytes: r.bytes,
+        costMs: r.costMs,
+        statusCode: r.statusCode,
+        error: r.error
+      };
+      return rep;
     } catch (e) {
-      return false;
+      const rep: ProbeReport = { ok: false, avgMbps: 0, bytes: 0, costMs: 0, statusCode: 0, error: '探测异常' };
+      return rep;
     }
   }
 
@@ -582,11 +618,24 @@ export class Scanner {
         const key: string = c.ip + ':' + c.port.toString();
         inflight.add(key);
         hooks.onPrecheckTick(res.checked, res.qualified, inflight.size, res.quota);
-        const ok: boolean = await Scanner.probeQuality(c, cfg, gateWindow);
+        const rep: ProbeReport = await Scanner.probeQuality(c, cfg, gateWindow);
         inflight.delete(key);
         if (token.isCancelled()) {
           abortReason = 'cancelled';
           return;
+        }
+        const ok: boolean = rep.ok;
+        // 诊断：把每个节点真正测到的数字写进日志，便于区分「网络慢」「阈值没生效」「服务端拒绝」
+        const head: string = '预检 ' + c.ip + ':' + c.port.toString();
+        if (rep.bytes <= 0) {
+          hooks.onProbeResult(head + ' 未下到数据（' +
+            (rep.error.length > 0 ? rep.error : (rep.statusCode > 0 ? 'HTTP ' + rep.statusCode.toString() : '无响应')) +
+            '）→ 不达标');
+        } else {
+          hooks.onProbeResult(head + ' ' + rep.avgMbps.toFixed(2) + ' MB/s（' +
+            Math.round(rep.bytes / 1024).toString() + ' KB / ' + rep.costMs.toString() + 'ms，HTTP ' +
+            rep.statusCode.toString() + '）→ ' +
+            (ok ? '达标' : '不达标（门槛 ' + minSpeed.toString() + ' MB/s）'));
         }
         res.checked++;
         if (ok) {
@@ -647,16 +696,19 @@ export class Scanner {
   }
 
   /**
-   * IPv6 有效延迟上限：随机 IPv6 地址在 Cloudflare 段内通常走较远的移动路由，
-   * 实测平均最小延迟约 375ms；若沿用 IPv4 的 260ms 口径会误杀 90% 以上可达节点。
-   * 这里按用户阈值放大 2.2 倍并封顶 800ms，IPv4 保持原值不变。
+   * 有效延迟筛选上限。
+   *
+   * 2026-11-13 起 IPv4/IPv6 统一使用用户设置的 latencyLimitMs，不再对 IPv6 放大。
+   * 原先对 IPv6 按 2.2 倍放大（320 → 704ms）的副作用是：那条「首包已明显快于门槛就
+   * 不再重试」的提前结束判断也是用同一个上限算的，阈值一并从 192ms 放宽到 422ms，
+   * 于是 IPv6 节点几乎全部只测 1 次 —— 三次延迟完全相同、丢包率只能落在 0% 或 100%。
+   *
+   * 实测依据（2026-11-13 19:50，移动网络）：优选的 4 个 IPv6 节点延迟 211–283ms，
+   * 本来就落在 320ms 以内，不存在「320ms 误杀 IPv6」的证据。用户若要在特定运营商
+   * 环境下放宽，直接改界面上的「延迟上限」即可，两族同时生效。
    */
   static effectiveLatencyLimit(cfg: ScanConfig): number {
-    if (cfg.ipVersion !== IpVersion.V6) {
-      return cfg.latencyLimitMs;
-    }
-    const adaptive: number = Math.round(cfg.latencyLimitMs * 2.2);
-    return Math.max(cfg.latencyLimitMs, Math.min(800, adaptive));
+    return cfg.latencyLimitMs;
   }
 
   static async stagePing(cfg: ScanConfig, list: Candidate[], hooks: ScanHooks,
@@ -668,11 +720,19 @@ export class Scanner {
       hooks.onLog('IPv6 自适应延迟上限：' + cfg.latencyLimitMs.toString() + 'ms → ' + limitMsEff.toString() +
         'ms（随机 IPv6 路由普遍较远，沿用 IPv4 阈值会误杀大量可达节点）');
     }
+    if (cfg.maxLossPct < 100) {
+      if (cfg.maxLossPct <= 0) {
+        hooks.onLog('连接失败率筛选：已启用，不允许失败（探测失败 1 次即淘汰）');
+      } else {
+        hooks.onLog('连接失败率筛选：已启用，连接失败率超过 ' + cfg.maxLossPct.toString() + '% 的节点在第一轮直接淘汰');
+      }
+    }
     hooks.onLog('候选 IP 共 ' + list.length.toString() + ' 个，开始第一轮 TCP 延迟筛选');
     const statStartMs: number = Date.now();
     let done: number = 0;
     let passed: number = 0;
     let overLimit: number = 0;
+    let lossFiltered: number = 0;
     let timeouts: number = 0;
     let otherErrors: number = 0;
     let skipped: number = 0;
@@ -710,13 +770,13 @@ export class Scanner {
         }
         // 第一次就超时：对不可达地址再试没有意义，直接放弃剩余重试，
         // 第一轮耗时可近似减半（这是最常走的失败分支）。
+        // 注意：这条只对「一次都没成功」成立，因此不会掩盖真实的多次采样。
         if (r.stage === 'timeout') {
           break;
         }
-        // 第一次延迟已明显低于门槛（≤ 门槛 60%）：无需再重试，直接省一次连接
-        if (r.ok && r.rttMs > 0 && r.rttMs <= limitMsEff * 0.6) {
-          break;
-        }
+        // 2026-11-13：删除了「首包已明显快于门槛就不再重试」的提前结束。
+        // 用户设置 Ping N 次就必须完成 N 次独立探测，否则 min/avg/max 三值相同、
+        // 丢包率只能出现 0% 或 100%，多次采样失去意义。
         if (k < cfg.pingTimes - 1) {
           await Scanner.sleep(cfg.pingIntervalMs);
         }
@@ -729,7 +789,10 @@ export class Scanner {
       c.stage = Stage.PING;
       c.pingSent = recv + timeoutCount + errorCount;
       c.pingRecv = recv;
-      c.lossRate = cfg.pingTimes > 0 ? (cfg.pingTimes - recv) / cfg.pingTimes : 1;
+      // 丢包率的分母必须是「真实发出的探测次数」：提前结束（首包够快 / 第一次超时
+      // 就放弃剩余重试）时，没发出去的次数不是丢包，否则 pingTimes=3 的快节点
+      // 会被算成 66.7% 丢包，后续丢包筛选与展示全部失真。
+      c.lossRate = c.pingSent > 0 ? (c.pingSent - recv) / c.pingSent : 0;
       if (recv > 0) {
         let sum: number = 0;
         let mn: number = pings[0];
@@ -762,6 +825,10 @@ export class Scanner {
             errSamples.push(c.ip + ' ' + lastStage + codeText + msgText);
           }
         }
+      } else if (cfg.maxLossPct < 100 && c.lossRate * 100 > cfg.maxLossPct) {
+        c.verdict = Verdict.FAILED;
+        c.remark = '连接失败率超限';
+        lossFiltered++;
       } else if (c.minLatencyMs >= limitMsEff) {
         c.verdict = Verdict.SLOW;
         c.remark = '延迟超限';
@@ -793,7 +860,8 @@ export class Scanner {
     const coloOk: number = keep.length;
     const coloDropped: number = Math.max(0, passed - keep.length);
     hooks.onLog('第一阶段完成：候选 ' + list.length.toString() + ' 个；TCP 成功 ' + passed.toString() +
-      ' 个（延迟达标）；延迟超限 ' + overLimit.toString() + ' 个；连接超时 ' + timeouts.toString() +
+      ' 个（延迟达标）；延迟超限 ' + overLimit.toString() + ' 个；丢包超限 ' + lossFiltered.toString() +
+      ' 个；连接超时 ' + timeouts.toString() +
       ' 个；其他错误 ' + otherErrors.toString() + ' 个；取消/未执行 ' + skipped.toString() +
       ' 个；最终通过 ' + keep.length.toString() + ' 个（拿到 colo ' + coloOk.toString() + ' 个）' +
       (coloDropped > 0 ? ('，另有 ' + coloDropped.toString() + ' 个无法完成 HTTPS 探测') : ''));
@@ -854,35 +922,60 @@ export class Scanner {
     }
   }
 
-  /** 阶段一补充：对通过的候选取 colo（保留给单独调用；主流程已合并进 stagePing） */
-  static async stageColo(cfg: ScanConfig, list: Candidate[], hooks: ScanHooks,
-    token: CancellationToken): Promise<void> {
-    hooks.onPhase(2, '第二阶段 · 获取数据中心（colo）');
+  /**
+   * 自定义域名端到端检测（可选）：对已经入选的节点逐个用用户域名发起一次
+   * HTTPS 请求，DNS 解析强制指向候选 IP，因此同时验证「域名可用」和
+   * 「该 IP 能承载这个域名」。拿到任意 HTTP 状态码都算可达（403/404/429/500
+   * 也说明 TCP + TLS + Host 链路已经抵达 Cloudflare 边缘），只有网络错误或超时才淘汰。
+   *
+   * 唯一例外是 421 Misdirected Request：它的语义正是「这台服务器不为该 SNI 服务」，
+   * 说明域名并没有挂到这个 Cloudflare 边缘上，必须判失败，否则会掩盖真实的配置问题。
+   */
+  private static async domainCheckTargets(cfg: ScanConfig, targets: Candidate[],
+    hooks: ScanHooks, token: CancellationToken): Promise<Candidate[]> {
+    const host: string = cfg.domain;
+    const conc: number = 4;
+    const passed: boolean[] = [];
+    for (let i = 0; i < targets.length; i++) {
+      passed.push(false);
+    }
     let done: number = 0;
     let okCount: number = 0;
-    await Scanner.pool<void>(list.length, cfg.traceConcurrency, token, async (index: number): Promise<void> => {
-      const c: Candidate = list[index];
-      const r: TraceResult = await TraceProbe.request({
+    hooks.onPhase(2, '第二阶段 · 域名端到端检测（' + host + '，' + targets.length.toString() + ' 个地址）');
+    hooks.onLog('域名端到端检测：' + host + '，只检查已入选的 ' + targets.length.toString() + ' 个地址');
+    await Scanner.pool<void>(targets.length, conc, token, async (index: number): Promise<void> => {
+      const c: Candidate = targets[index];
+      const t: TraceTarget = {
         ip: c.ip,
         port: c.port,
-        host: DEFAULT_TRACE_HOST,
-        path: DEFAULT_TRACE_PATH,
-        timeoutMs: cfg.traceTimeoutMs
-      });
-      c.stage = Stage.COLO;
-      c.traceOk = r.ok;
-      c.traceDelayMs = r.ok ? r.totalMs : -1;
-      c.httpCode = r.httpCode;
-      c.colo = r.colo;
-      if (r.ok && r.colo.length > 0) {
+        host: host,
+        path: '/',
+        timeoutMs: Math.max(3000, cfg.traceTimeoutMs)
+      };
+      const r: TraceResult = await TraceProbe.request(t);
+      // 421 例外：它表示「这台边缘不为该 SNI 服务」，等于域名没挂上来。
+      const ok: boolean = r.httpCode > 0 && r.httpCode !== 421;
+      if (ok) {
+        passed[index] = true;
         okCount++;
+      } else {
+        c.verdict = Verdict.FAILED;
+        c.remark = r.httpCode === 421 ? '域名未被该节点承载（HTTP 421）' : '域名端到端不通';
+        c.failReason = 'domain';
       }
-      hooks.onSpeedTick(index, c, true);
       done++;
-      // 每完成一个真实探测就上报（UI 侧再做 80ms 节流），避免按批次跳跃
-      hooks.onProgress(done, list.length, okCount, list.length - okCount);
+      if (done % 1 === 0 || done === targets.length) {
+        hooks.onProgress(done, targets.length, okCount, targets.length - okCount);
+      }
     });
-    hooks.onLog('数据中心获取完成：' + list.length.toString() + ' 个中 ' + okCount.toString() + ' 个拿到 colo');
+    const out: Candidate[] = [];
+    for (let i = 0; i < targets.length; i++) {
+      if (passed[i]) {
+        out.push(targets[i]);
+      }
+    }
+    hooks.onLog('域名端到端检测完成：' + targets.length.toString() + ' 个中 ' + okCount.toString() + ' 个可达');
+    return out;
   }
 
   /** 阶段二：测速（按延迟升序取前 N） */
@@ -940,6 +1033,29 @@ export class Scanner {
       hooks.onLog('按延迟从低到高，只测前 ' + cap.toString() + ' 个地址');
     }
     let targets: Candidate[] = pool.slice(0, cap);
+    // 域名端到端检测只对「已经入选」的节点各做一次：不提前检查全部候选，
+    // 也不在后续阶段重复请求。开关与有效域名必须同时满足。
+    if (cfg.domainCheck && !DnsService.isValidDomain(cfg.domain)) {
+      hooks.onLog('已开启域名端到端检测，但未填写有效域名：本次不执行（CF 官方测速不受影响）');
+    }
+    if (cfg.domainCheck && DnsService.isValidDomain(cfg.domain) && targets.length > 0) {
+      targets = await Scanner.domainCheckTargets(cfg, targets, hooks, token);
+      if (targets.length === 0) {
+        hooks.onLog('域名端到端检测：' + cfg.domain + ' 在入选节点上全部失败，本轮没有可测速的地址');
+        // 明确告诉 UI「这是检测失败，不是测速完成」，并给出下一步能做什么。
+        // workers.dev 单独给一条说明：这类域名在部分网络下会被 DNS 污染 + SNI 阻断，
+        // 而「解析测试」只做 DNS（不走 TCP/TLS），所以能解析出地址并不代表连得上。
+        const isWorkers: boolean = cfg.domain.toLowerCase().indexOf('.workers.dev') >= 0;
+        hooks.onAborted(
+          '域名端到端检测失败：' + cfg.domain + ' 在第一阶段入选的节点上全部不可达，下载测速没有开始',
+          isWorkers
+            ? '当前测速域名无法完成端到端连接。若使用 workers.dev 域名，可能受到当前网络环境限制（解析能拿到地址，但 TLS 握手被中断），' +
+              '建议更换为 speed.cloudflare.com 或留空后重试；也可以关闭「域名端到端检测」直接测速。'
+            : '可关闭「域名端到端检测」开关，再到「筛选」页点「开始测速」——第一阶段结果已保留，不会再跑一遍延迟筛选；' +
+              '或检查该域名是否已正确托管在 Cloudflare');
+        return;
+      }
+    }
     hooks.onSpeedInit(targets);
     // 下载测速固定走 speed.cloudflare.com 的 /__down 端点：用户自己的域名一般没有这个路径，
     // 绑上去只会 404，表现就是「只显示延迟、没有 MB/s」。域名只用于可用性校验，不参与测速下载。
@@ -954,6 +1070,8 @@ export class Scanner {
     let done: number = 0;
     let okCount: number = 0;
     const gap: number = Math.max(0, cfg.speedGapMs);
+    // 设定轮数：方案 A 的分母。配置被写成 0 时按 1 轮兜底，避免除零得到 Infinity/NaN。
+    const cfgRounds: number = cfg.speedRounds > 0 ? cfg.speedRounds : 1;
 
     await Scanner.pool<void>(targets.length, cfg.speedConcurrency, token, async (index: number): Promise<void> => {
       const c: Candidate = targets[index];
@@ -962,10 +1080,39 @@ export class Scanner {
       let best: number = 0;
       let rounds: number = 0;
       let lastErr: string = '';
-      for (let k = 0; k < cfg.speedRounds; k++) {
+      // 成功轮的速度样本：中位数、最低/最高/平均都从这份真实样本算，
+      // 不再用「累计和 ÷ 成功轮数」直接当评分速度（方案 A 要按设定轮数惩罚失败轮）。
+      const okSpeeds: number[] = [];
+      // 逐轮记录：只记录真正执行到的轮次，不补空位、不按配置次数反推
+      const sampleParts: string[] = [];
+      const stateParts: string[] = [];
+      // 逐轮延迟/丢包：只用于展开详情的表格展示，不参与筛选、评分与排名。
+      // 每轮 2 次 TCP 握手（复用第一阶段同一探针），取最小 RTT，按真实发出次数算丢包。
+      const latParts: string[] = [];
+      const lossParts: string[] = [];
+      // 34 号方案：稳定性只取第三阶段每轮的 TCP 握手结果，下载失败不计入。
+      let linkOk: number = 0;
+      let linkTries: number = 0;
+      const linkRtts: number[] = [];
+      for (let k = 0; k < cfgRounds; k++) {
         if (token.isCancelled()) {
+          sampleParts.push('—');
+          stateParts.push('已取消');
           break;
         }
+        // 每轮只做 1 次 TCP 握手：既作为稳定性样本，也用于逐轮延迟展示。
+        // 下载失败（HTTP 429 / 未读到数据 / 数据不足）只影响速度维度，不算连接失败。
+        const pr: TcpResult = await TcpProbe.pingOnce(c.ip, c.port, cfg.pingTimeoutMs);
+        const linkOkRound: boolean = pr.ok && pr.rttMs > 0;
+        linkTries++;
+        let roundLat: number = -1;
+        if (linkOkRound) {
+          linkOk++;
+          roundLat = pr.rttMs;
+          linkRtts.push(pr.rttMs);
+        }
+        latParts.push(roundLat > 0 ? Math.round(roundLat).toString() : '—');
+        lossParts.push(linkOkRound ? '0' : '100');
         const t: SpeedTarget = {
           ip: c.ip,
           port: c.port,
@@ -978,20 +1125,57 @@ export class Scanner {
         const r = await SpeedTest.run(t);
         if (r.ok && r.avgMbps > 0) {
           total += r.avgMbps;
+          okSpeeds.push(r.avgMbps);
           if (r.avgMbps > best) {
             best = r.avgMbps;
           }
           rounds++;
+          sampleParts.push(r.avgMbps.toFixed(2));
+          stateParts.push('成功');
         } else {
           lastErr = r.error;
+          // 失败轮速度留空（不写 0，避免被当成「测出 0 MB/s」）
+          sampleParts.push('—');
+          stateParts.push(r.error.length > 0 ? r.error : '失败');
         }
-        if (k < cfg.speedRounds - 1) {
+        if (k < cfgRounds - 1) {
           await Scanner.sleep(gap);
         }
       }
       c.stage = Stage.SPEED;
+      c.speedSamples = sampleParts.join('/');
+      c.speedStates = stateParts.join('/');
+      c.speedLatSamples = latParts.join('/');
+      c.speedLossSamples = lossParts.join('/');
+      c.speedCfgRounds = cfgRounds;
+      c.linkOk = linkOk;
+      c.linkTries = linkTries;
+      let linkSum: number = 0;
+      for (let li = 0; li < linkRtts.length; li++) {
+        linkSum += linkRtts[li];
+      }
+      c.speedDelayMs = linkRtts.length > 0 ? linkSum / linkRtts.length : 0;
+      // N=1 没有稳定性维度：数据层也写 -1，避免未来新出口漏掉轮数判断时把满分泄出去。
+      c.stabilityScore = (cfgRounds > 1 && linkTries > 0)
+        ? Math.round((linkOk + 1) / (linkTries + 1) * 100)
+        : -1;
       if (rounds > 0) {
-        c.speedMbps = total / rounds;
+        // 方案 A：有效速度 = 成功轮中位数 ×（成功轮数 ÷ 设定轮数）。
+        //   - 失败轮不进「平均」分子，但通过比例把「只成功 1/3」的节点压到 1/3；
+        //   - 两轮成功时中位数取两个数的平均值，一轮成功时就是该轮速度；
+        //   - 比例用「设定轮数」而不是「实际执行轮数」，中途停止也按未完成惩罚。
+        // 平均/最低/最高另外记录，只用于展示，不参与评分。
+        const sorted: number[] = okSpeeds.slice();
+        sorted.sort((a: number, b: number): number => a - b);
+        const half: number = Math.floor(rounds / 2);
+        const median: number = rounds % 2 === 0
+          ? (sorted[half - 1] + sorted[half]) / 2
+          : sorted[half];
+        const ratio: number = rounds / cfgRounds;
+        const eff: number = median * ratio;
+        c.speedMbps = eff > 0 ? eff : 0;
+        c.speedAvgMbps = total / rounds;
+        c.speedMinMbps = sorted[0];
         c.speedMaxMbps = best;
         c.speedRounds = rounds;
         c.speedOk = true;
@@ -1000,6 +1184,12 @@ export class Scanner {
       } else {
         c.speedOk = false;
         c.speedMbps = 0;
+        c.speedAvgMbps = 0;
+        c.speedMinMbps = 0;
+        // 清掉上一轮残留的峰值/轮数：否则「这次全失败」的节点会带着旧峰值导出，
+        // 看起来像「有峰值却测不出平均速度」的自相矛盾数据。
+        c.speedMaxMbps = 0;
+        c.speedRounds = 0;
         // 标记成「已进过测速阶段」，这样结果行会显示「测速失败」，
         // 而不是停在 PASS 显示成「延迟达标」（用户会误以为没测）。
         c.verdict = Verdict.SPEEDED;

@@ -84,13 +84,4 @@ export class AppMeta {
     return Number(out);
   }
 
-  /** 展示用：确保带 v 前缀 */
-  static display(v: string): string {
-    const t: string = v.trim();
-    if (t.length === 0) {
-      return 'v?';
-    }
-    const c: string = t.charAt(0);
-    return (c === 'v' || c === 'V') ? t : ('v' + t);
-  }
 }

@@ -12,9 +12,12 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { uiMaterial } from '@kit.ArkUI';
-import { hdsMaterial, HdsTabs, HdsTabsFloatingStyle, SystemMaterialParams } from '@kit.UIDesignKit';
+import { hdsMaterial, HdsTabs, HdsTabsController, HdsTabsFloatingStyle, SystemMaterialParams } from '@kit.UIDesignKit';
 import { BarStyle } from '../entryability/EntryAbility';
-import { Candidate, ScanConfig, ScanMode, IpVersion, Verdict, Stage, DomainInfo, SpeedScope } from '../core/Types';
+import {
+  Candidate, ScanConfig, ScanMode, IpVersion, Verdict, Stage, DomainInfo, SpeedScope,
+  HistoryRecord, HistoryNode, HistorySummary, HistoryMeta, HistoryRound, NodeVM, RoundVM
+} from '../core/Types';
 import {
   ConfigStore,
   ThemeMode,
@@ -29,6 +32,9 @@ import {
   REC_LATENCY_MS,
   REC_MIN_SPEED_MBPS,
   REC_PING_TIMES,
+  REC_PING_TIMEOUT_MS,
+  PING_TIMEOUT_MIN_MS,
+  PING_TIMEOUT_MAX_MS,
   REC_SAMPLE_COUNT,
   REC_SPEED_COUNT,
   REC_SPEED_PER_REGION,
@@ -48,12 +54,13 @@ import {
   SRC_KIND_LINK, SRC_KIND_FILE, SRC_KIND_TEXT, SRC_STATUS_OK, SRC_STATUS_PARTIAL, SRC_STATUS_FAILED
 } from '../core/Sources';
 import { HelpText, HELP_FILTER, HELP_SOURCE, HELP_SPEED, HELP_UPLOAD, HELP_MATERIAL, HELP_DIAG, HELP_RUNTIME } from '../core/HelpText';
-import { Ranker } from '../core/Ranker';
+import { Ranker, ScoreBase, StabilityInfo } from '../core/Ranker';
 import { EdgeTunnel, EdgeTunnelConfig, defaultEdgeTunnelConfig, UploadPayload, UploadResult } from '../core/EdgeTunnel';
-import { Exporter, ExportFormat, defaultExportOptions } from '../core/Exporter';
+import { Exporter, ExportFormat, ExportMeta, defaultExportOptions } from '../core/Exporter';
 import { Geo } from '../core/Geo';
 import { DnsService } from '../core/DnsService';
 import { FileSaver } from '../core/FileSaver';
+import { HistoryStore } from '../core/HistoryStore';
 import { Diag } from '../core/Diag';
 import { picker } from '@kit.CoreFileKit';
 import { connection, http } from '@kit.NetworkKit';
@@ -107,24 +114,9 @@ interface ProgressInfo {
 @Component
 struct Index {
   @State dark: boolean = AppStorage.get<boolean>('initialDark') ?? true;
-  // 导航光感：控制中心按钮式的跟随柔光 + 拖拽弹簧（q 弹）
   private lastColorMode: number = -1;
-  @State navGlowPct: number = 50;
-  @State navGlowOn: boolean = false;
-  @State navStretch: number = 0;
-  // ===== 方案 A：高亮胶囊的位置与形变（单一数据源）=====
-  @State navPillX: number = 0;
-  @State navPillS: number = 1.0;
-  @State navPillFlat: number = 0;
-  @State navPillY: number = 0;
-  @State navPillDragging: boolean = false;
-  private navStartX: number = 0;
-  private navLastWX: number = 0;
-  private navLastMs: number = 0;
-  private navVelMs: number = 0;
-  private navDrag: boolean = false;
-  private navDownX: number = -1;
-  private navMoved: boolean = false;
+  /** HdsTabs 控制器：点击页签时由应用侧主动切页（不依赖 HDS 命中区） */
+  private tabsCtrl: HdsTabsController = new HdsTabsController();
   /** 0=深色 1=浅色 2=跟随系统 */
   @State themeMode: number = ThemeMode.SYSTEM;
   @State curTab: number = 0;
@@ -153,8 +145,6 @@ struct Index {
   /** 材质对象缓存（切换材质档位时不重复 new，避免卡顿） */
   private matCached: uiMaterial.Material = uiMaterial.Material.empty;
   private matCacheKey: string = '';
-  /** 卡片实测高度（vp），供 HDS 材质层撑满卡片；对标 OA measuredCardHeights */
-  @State private measuredCardHeights: Map<string, number> = new Map();
   /** 主题色：0 柠檬黄 1 奶油黄 2 鼠尾草绿 3 雾霾蓝 4 灰豆沙粉 5 清透炭黑 */
   @State themeColorIdx: number = 4;
   /** 背景图模糊程度 0~100 */
@@ -197,6 +187,7 @@ struct Index {
   private pingScroller: Scroller = new Scroller();
   private speedScroller: Scroller = new Scroller();
   private settingsScroller: Scroller = new Scroller();
+  private histScroller: Scroller = new Scroller();
 
 
   // 扫描状态
@@ -217,6 +208,32 @@ struct Index {
   @State speedList: Candidate[] = [];
   /** 与 speedList 同下标的测速状态：0=待测 1=测速中 2=完成 3=失败 */
   @State speedStates: number[] = [];
+  /** 当前展开逐轮详情的节点（ip:port；空串=全部收起） */
+  @State expandedSpeedKey: string = '';
+  /** 历史记录：列表只放摘要，展开某条记录时才按需读完整快照 */
+  @State historyList: HistorySummary[] = [];
+  /** 当前展开的历史记录 id（空串=全部收起） */
+  @State histOpenId: string = '';
+  /** 当前展开的历史记录完整快照（仅一条，收起即释放） */
+  @State histOpenRecord: HistoryRecord | null = null;
+  /** 历史页里当前展开逐轮详情的节点（记录 id + ip:port） */
+  @State histNodeKey: string = '';
+  @State trendLat: number[] = [];
+  @State trendSpd: number[] = [];
+  /** 与 trendLat/trendSpd 同下标的横轴时间（HH:mm，旧→新） */
+  @State trendTime: string[] = [];
+  /** 两张独立走势图的画布与实测宽度（0=延迟，1=速度） */
+  private trendCtxLat: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  private trendCtxSpd: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  @State trendWLat: number = 0;
+  @State trendWSpd: number = 0;
+  /** 正在单节点复测的 ip:port（空串=没有任务） */
+  @State retestKey: string = '';
+  /** 历史保存上限：0=关闭保存，30/50=保留最近 N 条 */
+  @State histLimit: number = 50;
+  private historyReady: boolean = false;
+  /** 历史页高度（驱动页面底部渐隐模糊的停靠位置） */
+  @State histVpH: number = 0;
   /** 筛选页按地区分组 */
   @State groups: RegionGroup[] = [];
   /** 已展开的地区码 */
@@ -290,15 +307,21 @@ struct Index {
   @StorageProp('colorMode') @Watch('onSysColorMode') colorMode: number = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
   /** 底部胶囊拖动时的指尖 x（-1 表示未触摸） */
   @State pingText: string = REC_PING_TIMES.toString();
+  /** 第一阶段 TCP 建连单次超时（ms），与 Ping 次数分开：次数管采样，超时管单次等多久 */
+  @State pingTimeoutText: string = REC_PING_TIMEOUT_MS.toString();
   @State speedCountText: string = REC_SPEED_COUNT.toString();
   @State speedRoundsText: string = REC_SPEED_ROUNDS.toString();
   @State speedWindowText: string = REC_SPEED_WINDOW_MS.toString();
   /** 合格速度（MB/s），低于该值的测速结果会被淘汰，默认 0.1 */
   @State minSpeedText: string = REC_MIN_SPEED_MBPS.toString();
+  /** 丢包率上限（%）：0 = 不允许丢包（默认），100 = 不按丢包筛选 */
+  @State lossPctText: string = '0';
   @State enableSpeed: boolean = true;
   @State speedScope: number = SpeedScope.ALL;
   @State speedPerRegionText: string = REC_SPEED_PER_REGION.toString();
   @State domain: string = '';
+  /** 域名端到端检测开关：开关 + 有效域名同时满足才执行 */
+  @State domainCheck: boolean = false;
   @State keepAlive: boolean = false;
   @State domainSampling: boolean = false;
   @State regionCode: string = '';
@@ -311,12 +334,48 @@ struct Index {
   @State pcCandidates: number = 0;
   @State pcExhausted: boolean = false;
   @State pcMsg: string = '';
+  /**
+   * 预检是否以「非成功」方式结束：0 个达标 / 用户取消 / 执行异常。
+   * 这类结束不能设 precheckDone（否则下次点「开始测速」会跳过预检），
+   * 但结果必须让用户看见——否则界面只剩「按钮从预检中…变回开始测速」，看起来像什么都没发生。
+   * UI 用本字段决定这条消息是否展示、以及用警示色还是常规色。
+   */
+  @State pcFailed: boolean = false;
+  /**
+   * 停止前最近一次有效的「第一轮筛选结果」快照。
+   *
+   * 为什么需要：用户点「开始测速」后立刻停止时，筛选页出现过「第一轮通过 0 个 /
+   * 还没有筛选结果」——本轮并没有重新扫第一阶段，没有任何理由把上一轮的结果清掉。
+   * 停止时如果发现 pingList 已空，就用这份快照补回，保证「停止」不会丢已有结果。
+   * 只存快照、不参与任何筛选或评分逻辑。
+   */
+  private pingBackup: Candidate[] = [];
   @State domainInfoText: string = '';
   @State resolving: boolean = false;
   @State testing: boolean = false;
   @State testInfo: string = '';
   /** 应用版本号，Header 上展示 */
   @State appVersion: string = '1.4.0';
+  /**
+   * 本轮计分基准，由 Ranker.apply 返回后缓存。
+   * 导出 CSV 时据此写出「本轮最快延迟 / 本轮最高速度」两列，
+   * 用户才能用导出的数据反算出「延迟得分 / 速度得分 / 综合评分」，
+   * 否则分数是相对基准计算的，文件里没有基准就永远对不上。
+   */
+  private scoreBaseDelayMs: number = 0;
+  private scoreBaseSpeedMbps: number = 0;
+  /**
+   * 本轮测速完成时间（yyyy-MM-dd HH:mm:ss）。
+   * TXT 报告的「测速时间」用它；为空（中途停止/还没跑完）时由 Exporter 退回导出时间。
+   */
+  private lastSpeedDoneAt: string = '';
+  /**
+   * 本轮在进入下载测速前被中止的原因（目前只有「域名端到端检测全部失败」）。
+   * 空串表示正常跑完。UI 用它区分「测速完成」与「检测失败中止」，不允许把中止显示成完成。
+   * 必须是 @State：失败发生在本轮结束时，需要驱动结果页空状态与阶段文案重建。
+   */
+  @State abortedReason: string = '';
+  @State abortedSuggestion: string = '';
   // ===== 语言 =====
   @State langMode: number = LangMode.SYSTEM;
   @State langEn: boolean = false;
@@ -382,6 +441,28 @@ struct Index {
   private diagGen: number = 0;
   /** 扫描参数持久化防抖计时器 */
   private scanSaveTimer: number = -1;
+  /** 订阅上传配置持久化防抖计时器（输入框每敲一个字符都会触发保存） */
+  private etSaveTimer: number = -1;
+  /**
+   * speedSource() 的排序缓存。
+   *
+   * 每张结果卡都要算一次名次（vm.rank），而 speedSource() 是
+   * 「过滤 results + Ranker.compare 全排序」，300 张卡就是 300 次全排序。
+   * 同一次 build 里 results 与配置都不变，所以把上一次的结果连同
+   * 「数组引用 + 分数版本 + cfgRev」一起缓存，命中时只做一次 Map 查名次。
+   *
+   * 失效条件（必须覆盖所有会改变排序结果的路径）：
+   *  1) this.results 被重新赋值（新数组引用）；
+   *  2) Ranker.apply() 把分数写回 results 之后（speedRankRev++）；
+   *  3) 单节点复测往 results 里 push 新候选之后（speedRankRev++）；
+   *  4) 影响得分的配置变化（cfgRev，参数面板每次改动都会 ++）。
+   */
+  private speedRankRef: Candidate[] | null = null;
+  private speedRankRev: number = 0;
+  private speedRankRevCache: number = -1;
+  private speedRankCfgRev: number = -1;
+  private speedRankList: Candidate[] = [];
+  private speedRankMap: Map<string, number> = new Map();
   /** 首帧展开动画是否已播放（保证只播一次） */
   private entranceDone: boolean = false;
   /** 网络提示定时器句柄，-1 表示无待执行任务 */
@@ -509,6 +590,20 @@ struct Index {
       this.addLog(this.t('读取版本号失败：', 'Failed to read version: ') + be.message);
     }
     this.ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    // 历史记录用沙箱文件保存：启动时只加载摘要索引（几十条也只是小数组），
+    // 完整快照留在磁盘上，点开详情才读，避免把所有历史节点常驻内存。
+    try {
+      HistoryStore.init(this.ctx.filesDir);
+      this.histLimit = ConfigStore.historyLimit();
+      HistoryStore.setLimit(this.histLimit);
+      HistoryStore.trimToLimit();
+      this.historyList = HistoryStore.loadIndex();
+      this.historyReady = HistoryStore.ready();
+    } catch (e) {
+      const be: BusinessError = e as BusinessError;
+      this.addLog(this.t('历史记录初始化失败：', 'Failed to init history: ') + be.message);
+      this.historyReady = false;
+    }
 
     // EntryAbility 已在进程启动时同步读过主题偏好；拿不到才退回系统颜色
     const cached: boolean | undefined = AppStorage.get<boolean>('initialDark');
@@ -580,9 +675,19 @@ struct Index {
       }).catch(() => {
       });
     }
+    if (this.etSaveTimer >= 0) {
+      clearTimeout(this.etSaveTimer);
+      this.etSaveTimer = -1;
+      this.flushEtConfig();
+    }
     this.clearScanTimers();
     this.stopHeartbeat();
     this.token.cancel();
+    // 页面销毁时任务已无法继续，这里兜底释放长时任务引用，
+    // 避免「扫描/测速进行中退出页面」后保活与常亮残留。
+    AppBackground.release('scan');
+    AppBackground.release('speed');
+    AppBackground.release('upload');
   }
   /** 系统当前是否深色 */
   private systemDark(): boolean {
@@ -664,20 +769,23 @@ struct Index {
     this.concurrencyText = c.scanConcurrency.toString();
     this.latencyText = c.latencyLimitMs.toString();
     this.pingText = c.pingTimes.toString();
+    this.pingTimeoutText = c.pingTimeoutMs.toString();
     this.speedCountText = c.speedCount.toString();
     this.speedRoundsText = c.speedRounds.toString();
     this.speedWindowText = c.speedWindowMs.toString();
     this.minSpeedText = c.minSpeedMbps.toString();
+    this.lossPctText = c.maxLossPct.toString();
     // 下载测速开关已移除：始终开启（旧配置里被关闭的也一律恢复）
     this.enableSpeed = true;
     this.speedScope = c.speedScope;
     this.speedPerRegionText = c.speedPerRegion.toString();
     this.domain = c.domain;
     this.domainSampling = c.domainSampling;
+    this.domainCheck = c.domainCheck;
     this.keepAlive = ConfigStore.keepAlive();
     AppBackground.enabled = this.keepAlive;
     this.regionCode = c.regionCode;
-    this.latencyHint = this.t('建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）', 'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
+    this.latencyHint = this.t('建议：延迟上限建议 280~360ms（默认 320ms，Ping 3 次取最小值）；设得过低会误杀可用节点', 'Tip: a latency cap of 280–360 ms is recommended (default 320 ms; 3 pings take the minimum); too low a cap may discard usable nodes.');
     // v1→v2：旧版单一背景图复制进浅色/深色两套（同步完成，避免读到半迁移状态）
     ConfigStore.migrateBgPathsSync();
     this.refreshCustomPaths();
@@ -1042,8 +1150,10 @@ struct Index {
       sourceGroupName: Sources.selectionLabel(this.curFam(), this.curSel()),
       pingTimes: Math.max(1, Math.min(5, this.intOf(this.pingText, d.pingTimes))),
       pingIntervalMs: d.pingIntervalMs,
-      pingTimeoutMs: this.ipVersion === IpVersion.V6 ? 3000 : d.pingTimeoutMs,
+      // Ping 超时：IPv4/IPv6 共用同一设置（此前 V6 硬编码 3000ms，用户改不了）
+      pingTimeoutMs: Math.max(PING_TIMEOUT_MIN_MS, Math.min(PING_TIMEOUT_MAX_MS, this.intOf(this.pingTimeoutText, d.pingTimeoutMs))),
       latencyLimitMs: Math.max(50, Math.min(3000, this.intOf(this.latencyText, d.latencyLimitMs))),
+      maxLossPct: Math.max(0, Math.min(100, this.intOf(this.lossPctText, d.maxLossPct))),
       scanConcurrency: Math.max(1, Math.min(maxScanConcurrency(), this.intOf(this.concurrencyText, d.scanConcurrency))),
       traceHost: d.traceHost,
       tracePath: d.tracePath,
@@ -1061,6 +1171,7 @@ struct Index {
       speedGapMs: d.speedGapMs,
       domain: DnsService.normalize(this.domain),
       domainSampling: true,
+      domainCheck: this.domainCheck,
       regionCode: this.regionCode.trim().toUpperCase(),
       delayWeight: d.delayWeight,
       speedWeight: d.speedWeight,
@@ -1082,14 +1193,14 @@ struct Index {
 
   /** 切换 IPv4/IPv6 时更新建议值；若当前仍是另一协议的默认值，则自动跟随 */
   private maybeAutoSuggest(v6: boolean): void {
-    this.latencyHint = this.t('建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）', 'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
+    this.latencyHint = this.t('建议：延迟上限建议 280~360ms（默认 320ms，Ping 3 次取最小值）；设得过低会误杀可用节点', 'Tip: a latency cap of 280–360 ms is recommended (default 320 ms; 3 pings take the minimum); too low a cap may discard usable nodes.');
     if (v6) {
       this.latencyHint = this.latencyHint;
     }
     this.scheduleScanSave();
   }
 
-  /** 一键应用建议参数（IPv4/IPv6 统一：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s） */
+  /** 恢复默认参数（IPv4/IPv6 统一：采样 3000、并发 30、延迟上限 320ms、Ping 3 次、丢包上限 0%、合格速度 0.1MB/s） */
   /** 参数输入框的当前值（直接读 @State，保证按钮/外部修改能立即回显） */
   private paramValue(field: string): string {
     if (field === 'sample') {
@@ -1101,8 +1212,14 @@ struct Index {
     if (field === 'lat') {
       return this.latencyText;
     }
+    if (field === 'loss') {
+      return this.lossPctText;
+    }
     if (field === 'ping') {
       return this.pingText;
+    }
+    if (field === 'pingTimeout') {
+      return this.pingTimeoutText;
     }
     if (field === 'minSpeed') {
       return this.minSpeedText;
@@ -1130,19 +1247,21 @@ struct Index {
     this.concurrencyText = defaultScanConcurrency().toString();
     this.latencyText = REC_LATENCY_MS.toString();
     this.pingText = REC_PING_TIMES.toString();
+    this.pingTimeoutText = REC_PING_TIMEOUT_MS.toString();
     this.minSpeedText = REC_MIN_SPEED_MBPS.toString();
+    this.lossPctText = '0';
     // 全部写完再换一次 id：TextInput 的 text 只作初值，需重建才能回显被裁截/规范化后的值
     this.cfgRev++;
     try {
       await ConfigStore.save(this.buildConfig());
-      this.toast(this.t('已应用建议参数：采样 3000、并发 30、延迟上限 300ms、Ping 1 次、合格速度 0.1MB/s（IPv4/IPv6 统一）', 'Applied recommended settings: 3000 samples, 30 threads, 300ms latency cap, 1 ping, 0.1MB/s min speed (same for IPv4/IPv6)'));
+      this.toast(this.t('已恢复默认：采样 3000、并发 30、延迟上限 320ms、Ping 3 次/超时 1000ms、连接失败率上限 0%、合格速度 0.1MB/s（IPv4/IPv6 统一）', 'Restored defaults: 3000 samples, 30 threads, 320ms latency cap, 3 pings / 1000ms timeout, 0% max link fail, 0.1MB/s min speed (same for IPv4/IPv6)'));
     } catch (e) {
       const be: BusinessError = e as BusinessError;
-      this.toast(this.t('应用建议失败：保存参数出错（', 'Failed to apply: saving settings failed (') + be.message + ')');
+      this.toast(this.t('恢复默认失败：保存参数出错（', 'Failed to reset: saving settings failed (') + be.message + ')');
     }
   }
 
-  /** 「下载测速」卡的应用建议：只改测速相关参数，扫描参数不动 */
+  /** 「下载测速」卡的恢复默认：只改测速相关参数，扫描参数不动 */
   private async applySpeedSuggestions(): Promise<void> {
     this.speedCountText = REC_SPEED_COUNT.toString();
     this.speedPerRegionText = REC_SPEED_PER_REGION.toString();
@@ -1151,10 +1270,10 @@ struct Index {
     this.cfgRev++;
     try {
       await ConfigStore.save(this.buildConfig());
-      this.toast(this.t('已应用建议：每地址 1 次、窗口 6000ms、地址数 10（地区测速每地区 3 个）', 'Applied recommendations: 1 round per address, 6000ms window, 10 addresses (3 per region for region mode)'));
+      this.toast(this.t('已恢复默认：每地址 1 次、窗口 6000ms、地址数 10（地区测速每地区 3 个）', 'Restored defaults: 1 round per address, 6000ms window, 10 addresses (3 per region for region mode)'));
     } catch (e) {
       const be: BusinessError = e as BusinessError;
-      this.toast(this.t('应用建议失败：保存参数出错（', 'Failed to apply: saving settings failed (') + be.message + ')');
+      this.toast(this.t('恢复默认失败：保存参数出错（', 'Failed to reset: saving settings failed (') + be.message + ')');
     }
   }
 
@@ -1455,6 +1574,7 @@ struct Index {
     this.pcTarget = 0;
     this.pcCandidates = 0;
     this.pcExhausted = false;
+    this.pcFailed = false;
     this.pcMsg = this.t('正在按延迟从低到高检测合格速度…', 'Checking minimum speed in ascending latency order…');
     this.phaseText = this.t('质量预检', 'Quality pre-check');
     const alive = (): boolean => gen === this.scanGen && !myToken.isCancelled();
@@ -1506,6 +1626,13 @@ struct Index {
       this.pcTarget = target;
       this.precheckDone = true;
     };
+    // 每个节点的预检诊断：写进运行日志，让「0 个达标」能看出是网络慢、阈值没生效还是服务端拒绝
+    hooks.onProbeResult = (text: string) => {
+      if (!alive()) {
+        return;
+      }
+      this.addLog(text);
+    };
     try {
       const res: PrecheckResult = await Scanner.stagePrecheck(c, this.pingList.slice(), hooks, myToken);
       if (!alive()) {
@@ -1519,9 +1646,11 @@ struct Index {
       if (res.cancelled) {
         // 取消不算「预检完成」，否则下次点开始测速会直接跳过质量预检
         this.precheckDone = false;
+        this.pcFailed = true;
         this.taskKind = 0;
         this.phaseText = this.t('已停止', 'Stopped');
-        this.pcMsg = this.t('预检已取消', 'Pre-check cancelled');
+        this.pcMsg = this.t('预检已取消：本轮没有进入正式测速，可随时重新点「开始测速」',
+          'Pre-check cancelled: the speed test did not start; tap "Start speed test" again whenever you like');
         this.addLog(this.t('已停止：质量预检未完成', 'Stopped: quality pre-check not finished'));
         AppBackground.release('scan');
         return;
@@ -1529,8 +1658,11 @@ struct Index {
       if (res.list.length === 0) {
         // 0 个达标同样不算完成：保留 0 达标提示，但不给「已预检」资格
         this.precheckDone = false;
+        this.pcFailed = true;
         this.taskKind = 0;
-        this.pcMsg = this.t('预检后没有达标节点', 'No nodes met the target after pre-check');
+        this.pcMsg = this.t('预检失败：检测 ', 'Pre-check failed: checked ') + res.checked.toString() +
+          this.t(' 个，0 个达到合格速度；可调低「合格速度」或检查网络后重试',
+            ' nodes, none reached the minimum speed; lower "Min speed" or check your network, then retry');
         this.phaseText = this.t('预检完成：0 个达标', 'Pre-check complete: 0 met target');
         this.addLog(this.t('质量预检结束：检测 ', 'Quality pre-check finished: checked ') + res.checked.toString() + this.t(' 个，0 个达标；可调低「合格速度」或检查网络', ' nodes, 0 met target; lower "Min speed" or check your network'));
         this.curTab = 1;
@@ -1553,6 +1685,12 @@ struct Index {
       }
       this.precheckActive = false;
       this.scanning = false;
+      this.taskKind = 0;
+      this.pcFailed = true;
+      this.pcMsg = this.t('预检出错：', 'Pre-check error: ') +
+        ((e as BusinessError).message === undefined ? '' : (e as BusinessError).message) +
+        this.t('；本轮没有进入正式测速，可重新点「开始测速」重试',
+          '; the speed test did not start; tap "Start speed test" to retry');
       this.phaseText = this.t('预检出错', 'Pre-check error');
       this.addLog(this.t('质量预检异常：', 'Quality pre-check error: ') + (e as BusinessError).message);
       AppBackground.release('scan');
@@ -1574,6 +1712,8 @@ struct Index {
       this.toast(this.t('请先在「扫描」页完成第一轮筛选', 'Complete round 1 filtering on the "Scan" tab first'));
       return;
     }
+    // 开始预检/测速前留一份快照：停止时若 pingList 变空，用它把结果补回来
+    this.pingBackup = this.pingList.slice();
     if (!this.precheckDone) {
       this.scanGen++;
       const gen: number = this.scanGen;
@@ -1584,13 +1724,26 @@ struct Index {
       AppBackground.hold('scan');
       this.startHeartbeat(gen);
       this.runPrecheck(gen, this.buildConfig(), myToken).catch((e: BusinessError) => {
+        // 这里是最后一道兜底：runPrecheck 内部已有 try/catch，但仍必须复位
+        // precheckActive 与 taskKind，否则按钮会永久停在「预检中…」，
+        // 后续点击还会被 scanning 分支拦下并提示「质量预检进行中」。
+        this.precheckActive = false;
+        this.precheckDone = false;
         this.scanning = false;
+        this.taskKind = 0;
+        this.pcFailed = true;
+        this.pcMsg = this.t('预检出错：', 'Pre-check error: ') +
+          (e.message === undefined ? '' : e.message) +
+          this.t('；本轮没有进入正式测速，可重新点「开始测速」重试',
+            '; the speed test did not start; tap "Start speed test" to retry');
         this.phaseText = this.t('预检出错', 'Pre-check error');
         AppBackground.release('scan');
         this.addLog(this.t('质量预检异常：', 'Quality pre-check error: ') + e.message);
       });
       return;
     }
+    this.precheckActive = false;
+    this.pcFailed = false;
     this.startSpeedTest();
   }
 
@@ -1598,12 +1751,19 @@ struct Index {
     if (this.scanning) {
       return;
     }
-    const base: Candidate[] = (targets !== undefined && targets.length > 0) ? targets : this.pingList;
+    // 传副本进去：Scanner 内部虽然会 slice，但这里挡住「调用方数组被下游改动」这条风险路径
+    const base: Candidate[] = ((targets !== undefined && targets.length > 0) ? targets : this.pingList).slice();
     if (base.length === 0) {
       this.toast(this.t('请先在「扫描」页完成第一轮筛选', 'Complete round 1 filtering on the "Scan" tab first'));
       return;
     }
+    if (this.pingBackup.length === 0) {
+      this.pingBackup = base.slice();
+    }
     this.precheckActive = false;
+    // 新一轮开始先清掉上一轮的完成时间：中途停止时报告会退回「导出时间」，
+    // 绝不能把上一轮的测速时间写进这一轮的报告。
+    this.lastSpeedDoneAt = '';
     const c: ScanConfig = this.buildConfig();
     this.cfg = c;
     ConfigStore.save(c).then(() => {
@@ -1626,6 +1786,8 @@ struct Index {
     AppBackground.hold('speed');
     // 换地区/换模式重测时，必须清空上一轮的速度结果，否则会残留别的地区的节点
     this.speedList = [];
+    // 展开态跟着结果走：上一轮展开的多轮节点不能带到新一轮（N=1 时不该露出稳定性字样）
+    this.expandedSpeedKey = '';
     this.phaseText = this.t('准备测速', 'Preparing speed test');
     this.curTab = 2;
 
@@ -1656,10 +1818,20 @@ struct Index {
         this.addLog(msg);
       }
     };
+    // 进入下载测速前被中止（域名端到端检测全部失败）：记下原因给 .then() 用，
+    // 同时把阶段文案改成「检测失败」，避免用户看到「测速完成」却一个节点都没有。
+    hooks.onAborted = (reason: string, suggestion: string) => {
+      if (!alive()) {
+        return;
+      }
+      this.abortedReason = reason;
+      this.abortedSuggestion = suggestion;
+      this.phaseText = this.t('域名检测失败 · 测速未开始', 'Domain check failed; speed test not started');
+      this.addLog(reason);
+    };
     // 测速页先把「全部待测节点」铺出来，再逐个把状态刷成测速中/完成；
     // 排序留到全部结束再做，避免列表在测速过程中不断上蹿下跳。
-    hooks.onSpeedInit = (targets: Candidate[]) => {
-      if (!alive()) {
+    hooks.onSpeedInit = (targets: Candidate[]) => {      if (!alive()) {
         return;
       }
       this.speedList = targets.slice();
@@ -1685,6 +1857,8 @@ struct Index {
       this.speedList = list;
     };
 
+    this.abortedReason = '';
+    this.abortedSuggestion = '';
     Scanner.runSpeed(c, base, hooks, myToken).then(() => {
       if (gen !== this.scanGen) {
         return;
@@ -1699,9 +1873,26 @@ struct Index {
         return;
       }
       this.scanning = false;
+      if (this.abortedReason.length > 0) {
+        // 域名端到端检测全部失败：这不是「测速完成」，也不能把 speedList 清空当成没结果。
+        // phaseText 已在 onAborted 里写成「域名检测失败 · 测速未开始」；
+        // 这里只补一条可操作建议，然后释放保活。
+        this.phaseText = this.t('域名检测失败 · 测速未开始', 'Domain check failed; speed test not started');
+        this.addLog(this.abortedSuggestion);
+        AppBackground.release('speed');
+        return;
+      }
       this.phaseText = this.t('测速完成', 'Speed test complete');
-      Ranker.apply(this.results, c);
+      // 报告里的「测速时间」取真正跑完的时刻，而不是用户点导出的时刻；
+      // 中途停止不会走到这里，导出时由 Exporter 退回导出时间。
+      this.lastSpeedDoneAt = Exporter.timeText(new Date());
+      const scoreBase: ScoreBase = Ranker.apply(this.results, c);
+      this.scoreBaseDelayMs = scoreBase.minDelayMs;
+      this.scoreBaseSpeedMbps = scoreBase.maxSpeedMbps;
+      this.speedRankRev++;
       this.splitResults(this.results);
+      // 正式测速完成后固化一份历史快照：只写磁盘，不参与当前结果的渲染与排名。
+      this.saveHistory(c);
       this.addLog(this.t('第二轮测速完成，共 ', 'Round 2 speed test complete: ') + this.speedList.length.toString() + this.t(' 个节点', ' nodes'));
       // 开了自动上传就把这批结果推到 edgetunnel 订阅；配置不完整时记一条日志后台跳过，
       // 避免每次测速结束都弹失败提示。
@@ -1735,6 +1926,15 @@ struct Index {
     this.addLog(kind === 2
       ? this.t('用户停止了质量预检', 'User stopped the quality pre-check')
       : (kind === 3 ? this.t('用户停止了测速', 'User stopped the speed test') : this.t('用户停止了扫描', 'User stopped the scan')));
+    // 预检/测速阶段被停止时，第一阶段的结果必须原样保留：
+    // 本轮没有重新扫第一阶段，把筛选结果清掉没有任何依据。
+    // 如果 pingList 在这次停止过程中已经变空，用开始前的快照补回来。
+    if ((kind === 2 || kind === 3) && this.pingList.length === 0 && this.pingBackup.length > 0) {
+      this.pingList = this.pingBackup.slice();
+      this.buildGroups(this.pingList);
+      this.addLog(this.t('已停止：保留第一轮的 ', 'Stopped: kept the ') + this.pingList.length.toString() +
+        this.t(' 个筛选结果', ' round-1 results'));
+    }
     AppBackground.release('scan');
     AppBackground.release('speed');
   }
@@ -1790,12 +1990,29 @@ struct Index {
     }
   }
 
+  /**
+   * 切到后台 / 离开页面：把还压在防抖队列里的设置立刻落盘。
+   * 后台状态下定时器会被挂起，若只靠 aboutToDisappear 兜底，
+   * 「改完设置直接按 home 或返回、随后被系统回收」就会丢掉最后一次输入。
+   */
+  onPageHide(): void {
+    if (this.scanSaveTimer >= 0) {
+      clearTimeout(this.scanSaveTimer);
+      this.scanSaveTimer = -1;
+      ConfigStore.save(this.buildConfig()).then(() => {
+        return;
+      }).catch(() => {
+      });
+    }
+    if (this.etSaveTimer >= 0) {
+      clearTimeout(this.etSaveTimer);
+      this.etSaveTimer = -1;
+      this.flushEtConfig();
+    }
+  }
+
   /** 回到前台：立即用真实计数刷新一次，避免节流定时器在后台被挂起导致界面停在旧进度 */
   onPageShow(): void {
-    if (this.navPillX <= 0) {
-      this.navPillX = this.navTabCenter(this.curTab);
-      this.setPillScale(1.0, 0, 0);
-    }
     this.done = this.doneRaw;
     this.total = this.totalRaw;
     this.passed = this.passedRaw;
@@ -1809,8 +2026,44 @@ struct Index {
     }
   }
 
+  /**
+   * 导出的数据源：本次扫描里「已经进入第三阶段」的全部节点（含测速失败的）。
+   *
+   * 界面列表 speedList 会按合格速度门槛过滤，若导出也用它，就永远看不到
+   * 「测速失败」和「测速不达标」两类样本，也没法解释「界面怎么只剩这么几个」。
+   * CSV 与 TXT 共用这一份数据源，保证同一个节点在两种格式里数值一致；
+   * TXT 的纯 IP 格式会自行跳过测速失败的节点（见 Exporter.toText）。
+   */
+  private speedSource(): Candidate[] {
+    if (this.speedRankRef === this.results
+      && this.speedRankCfgRev === this.cfgRev
+      && this.speedRankRev === this.speedRankRevCache) {
+      return this.speedRankList;
+    }
+    const out: Candidate[] = [];
+    for (let i = 0; i < this.results.length; i++) {
+      const c: Candidate = this.results[i];
+      if (c.stage === Stage.SPEED) {
+        out.push(c);
+      }
+    }
+    out.sort((a: Candidate, b: Candidate) => Ranker.compare(a, b));
+    const map: Map<string, number> = new Map();
+    for (let i = 0; i < out.length; i++) {
+      map.set(out[i].ip + ':' + out[i].port.toString(), i + 1);
+    }
+    this.speedRankRef = this.results;
+    this.speedRankCfgRev = this.cfgRev;
+    this.speedRankRevCache = this.speedRankRev;
+    this.speedRankList = out;
+    this.speedRankMap = map;
+    return out;
+  }
+
   async doExport(fmt: ExportFormat): Promise<void> {
-    if (this.speedList.length === 0) {
+    const src: Candidate[] = this.speedSource();
+    const list: Candidate[] = src.length > 0 ? src : this.speedList;
+    if (list.length === 0) {
       this.toast(this.t('还没有测速结果', 'No speed test results yet'));
       return;
     }
@@ -1821,12 +2074,25 @@ struct Index {
     const opt = defaultExportOptions();
     opt.format = fmt;
     opt.onlyQualified = false;
-    let text: string = '';
-    if (fmt === ExportFormat.CSV) {
-      text = Exporter.toCsv(this.speedList, opt);
-    } else {
-      text = Exporter.toText(this.speedList, opt);
-    }
+    // 同一份 meta 同时喂给 CSV 和 TXT：筛选条件、设定轮数、计分基准只有一个来源，
+    // 否则两种格式各写一套，迟早出现「CSV 写 3 轮、TXT 写 1 轮」这种对不上的情况。
+    const meta: ExportMeta = {
+      pingTimes: this.cfg.pingTimes,
+      pingTimeoutMs: this.cfg.pingTimeoutMs,
+      speedRounds: this.cfg.speedRounds,
+      speedWindowMs: this.cfg.speedWindowMs,
+      appVersion: this.appVersion,
+      scoreBaseDelayMs: this.scoreBaseDelayMs,
+      scoreBaseSpeedMbps: this.scoreBaseSpeedMbps,
+      minSpeedMbps: this.cfg.minSpeedMbps,
+      latencyLimitMs: this.cfg.latencyLimitMs,
+      maxLossPct: this.cfg.maxLossPct,
+      speedConcurrency: this.cfg.speedConcurrency,
+      scanTime: this.lastSpeedDoneAt
+    };
+    const text: string = fmt === ExportFormat.CSV
+      ? Exporter.toCsv(list, opt, meta)
+      : Exporter.toText(list, opt, meta);
     const name: string = Exporter.suggestFileName(fmt, this.cfg);
     try {
       const saved: string = await FileSaver.saveText(this.ctx, name, text);
@@ -1843,6 +2109,395 @@ struct Index {
       this.addLog(this.t('导出失败：', 'Export failed: ') + err.message);
     }
   }
+  // ---------- 测速历史 ----------
+
+  /** 多轮测速（设定轮数 > 1）才显示综合评分与逐轮详情；单轮保持原样式 */
+  isMultiRound(c: Candidate): boolean {
+    return c.speedCfgRounds > 1 || c.speedRounds > 1;
+  }
+
+  private speedKey(c: Candidate): string {
+    return c.ip + ':' + c.port.toString();
+  }
+
+  /** 综合延迟：多轮列表用平均延迟，缺失时退回 Ranker.delayOf */
+  compositeDelayText(c: Candidate): string {
+    let d: number = c.avgLatencyMs;
+    if (!(d > 0)) {
+      d = Ranker.delayOf(c);
+    }
+    if (!(d > 0)) {
+      return '—';
+    }
+    return Math.round(d).toString() + ' ms';
+  }
+
+  /** 当前结果里第 i 轮的实测速度文本（未轮到时为 —） */
+  roundSpeedText(c: Candidate, i: number): string {
+    const arr: string[] = c.speedSamples.length > 0 ? c.speedSamples.split('/') : [];
+    if (i < 0 || i >= arr.length) {
+      return '—';
+    }
+    return arr[i];
+  }
+
+  /** 当前结果里第 i 轮的结果文本（成功 / HTTP 429 / 未读到数据…） */
+  roundStateText(c: Candidate, i: number): string {
+    const arr: string[] = c.speedStates.length > 0 ? c.speedStates.split('/') : [];
+    if (i < 0 || i >= arr.length) {
+      return '';
+    }
+    return arr[i];
+  }
+
+  /**
+   * 真正的测速失败原因（按轮聚合）。只读 speedStates：
+   * c.remark 是跨阶段字段，测速前可能是「预检达标/预估达标」这类通过文案，
+   * 不能拿来当失败原因；只有连轮次数据都没有时才退回 remark。
+   */
+  private speedFailText(c: Candidate): string {
+    const states: string[] = c.speedStates.length > 0 ? c.speedStates.split('/') : [];
+    const parts: string[] = [];
+    for (let i = 0; i < states.length; i++) {
+      const s: string = states[i];
+      if (s.length === 0 || s === '成功' || s === '已取消') {
+        continue;
+      }
+      parts.push('R' + (i + 1).toString() + ' ' + s);
+    }
+    if (parts.length === 0 && states.length === 0 && !c.speedOk && c.remark.length > 0) {
+      return c.remark;
+    }
+    return parts.join(' · ');
+  }
+
+  /** 逐轮明细要渲染的轮次下标（设定 3 轮就固定展示 3 行，失败轮也保留） */
+  private roundIndexes(c: Candidate): number[] {
+    const done: number = c.speedSamples.length > 0 ? c.speedSamples.split('/').length : 0;
+    const n: number = Math.max(done, c.speedCfgRounds);
+    const out: number[] = [];
+    for (let i = 0; i < n; i++) {
+      out.push(i);
+    }
+    return out;
+  }
+
+  /** 该节点在当前结果里的排名（与 CSV 排名同一口径：全部 SPEED 阶段节点按 Ranker.compare） */
+  private speedRank(c: Candidate): number {
+    // 先让缓存就绪，再查一次 Map；命中时不再做「过滤 + 全排序 + 线性查找」。
+    this.speedSource();
+    const key: string = c.ip + ':' + c.port.toString();
+    const hit: number | undefined = this.speedRankMap.get(key);
+    return hit === undefined ? 0 : hit;
+  }
+
+  private speedAvgText(c: Candidate): string {
+    return c.speedAvgMbps > 0 ? c.speedAvgMbps.toFixed(2) + ' MB/s' : '—';
+  }
+
+  private speedEffText(c: Candidate): string {
+    return c.speedMbps > 0 ? c.speedMbps.toFixed(2) + ' MB/s' : '—';
+  }
+
+  private speedColorOf(c: Candidate): string {
+    if (!c.speedOk || c.speedMbps <= 0) {
+      return BAD_C;
+    }
+    return c.speedMbps >= this.cfg.minSpeedMbps ? OK_C : WARN_C;
+  }
+
+  /** 详情统计行：延迟 低/均/高 */
+  private delayTriple(c: Candidate): string {
+    return this.t('最低 ', 'min ') + this.msText(c.minLatencyMs) +
+      this.t(' · 平均 ', ' · avg ') + this.msText(c.avgLatencyMs) +
+      this.t(' · 最高 ', ' · max ') + this.msText(c.maxLatencyMs);
+  }
+
+  private msText(v: number): string {
+    return v > 0 ? Math.round(v).toString() + ' ms' : '—';
+  }
+
+  /** 详情统计行：速度 最低/最高/平均/有效 */
+  private speedQuad(c: Candidate): string {
+    const num = (v: number): string => v > 0 ? v.toFixed(2) : '—';
+    return this.t('最低 ', 'min ') + num(c.speedMinMbps) +
+      this.t(' · 最高 ', ' · max ') + num(c.speedMaxMbps) +
+      this.t(' · 平均 ', ' · avg ') + num(c.speedAvgMbps) +
+      this.t(' · 有效 ', ' · eff ') + num(c.speedMbps);
+  }
+
+  /** 详情统计行：评分 综合/延迟/速度（百分制，与导出同一口径） */
+  private scoreTriple(c: Candidate): string {
+    return this.t('综合 ', 'total ') + Math.round(c.finalScore * 100).toString() +
+      this.t(' · 延迟 ', ' · delay ') + Math.round(c.delayScore * 100).toString() +
+      this.t(' · 速度 ', ' · speed ') + Math.round(c.speedScore * 100).toString();
+  }
+
+  private mbpsText(v: number): string {
+    return v > 0 ? v.toFixed(2) + ' MB/s' : '—';
+  }
+
+  /** 历史详情头部的「当时参数」，全部取自快照，不读当前设置 */
+  private historyParamsText(m: HistoryMeta): string {
+    return this.t('延迟上限 ', 'latency cap ') + m.latencyLimitMs.toString() + 'ms' +
+      this.t(' · 连接失败率上限 ', ' · max failures ') + m.maxLossPct.toString() + '%' +
+      this.t(' · Ping ', ' · ping ') + m.pingTimes.toString() + '×' + m.pingTimeoutMs.toString() + 'ms' +
+      this.t(' · 测速 ', ' · nodes ') + m.speedCount.toString() +
+      this.t(' · 窗口 ', ' · window ') + m.speedWindowMs.toString() + 'ms' +
+      this.t(' · 合格 ', ' · min ') + m.minSpeedMbps.toString() + 'MB/s' +
+      this.t(' · 计分基准 ', ' · base ') + Math.round(m.scoreBaseDelayMs).toString() + 'ms/' +
+      m.scoreBaseSpeedMbps.toFixed(2) + 'MB/s';
+  }
+
+  scoreColor(score: number): string {
+    if (score >= 0.75) {
+      return OK_C;
+    }
+    if (score >= 0.4) {
+      return WARN_C;
+    }
+    return BAD_C;
+  }
+
+  statusColor(status: string): string {
+    if (status.indexOf(this.t('失败', 'failed')) >= 0) {
+      return BAD_C;
+    }
+    if (status.indexOf(this.t('未达标', 'below')) >= 0) {
+      return WARN_C;
+    }
+    return OK_C;
+  }
+
+  /** 老快照可能把「预检达标 / 预估达标」这类阶段备注写进 remark：只展示真正的失败原因 */
+  private isFailureRemark(status: string, remark: string): boolean {
+    if (status.indexOf(this.t('失败', 'failed')) >= 0 || status.indexOf(this.t('部分', 'partial')) >= 0) {
+      return true;
+    }
+    return remark.indexOf('HTTP') >= 0 || remark.indexOf('未读到') >= 0 ||
+      remark.indexOf('数据不足') >= 0 || remark.indexOf('超时') >= 0 ||
+      remark.indexOf('失败') >= 0 || remark.indexOf('取消') >= 0;
+  }
+
+  /** 历史节点地区：存的是 colo 码，展示时再翻译，避免把语言选择固化进快照 */
+  historyRegion(n: HistoryNode): string {
+    if (n.colo.length === 0 || n.colo === 'UNK') {
+      return this.t('未知地区', 'Unknown');
+    }
+    const p: string = Geo.placeZh(n.colo.toUpperCase());
+    return p.length > 0 ? p : n.colo.toUpperCase();
+  }
+
+  /** 把当前 Candidate 拍平成一条历史节点（数值就是界面上/导出里的同一份结果） */
+  private historyNodeOf(c: Candidate, rank: number, cfg: ScanConfig): HistoryNode {
+    const rounds: HistoryRound[] = [];
+    const sp: string[] = c.speedSamples.length > 0 ? c.speedSamples.split('/') : [];
+    const st: string[] = c.speedStates.length > 0 ? c.speedStates.split('/') : [];
+    const lt: string[] = c.speedLatSamples.length > 0 ? c.speedLatSamples.split('/') : [];
+    const ls: string[] = c.speedLossSamples.length > 0 ? c.speedLossSamples.split('/') : [];
+    const total: number = Math.max(sp.length, st.length, lt.length, ls.length);
+    for (let i = 0; i < total; i++) {
+      const sample: string = i < sp.length ? sp[i] : '—';
+      const state: string = i < st.length ? st[i] : '';
+      const latText: string = i < lt.length ? lt[i] : '—';
+      const lossText: string = i < ls.length ? ls[i] : '—';
+      const ok: boolean = sample !== '—' && sample.length > 0 && state === '成功';
+      let mbps: number = 0;
+      if (ok) {
+        const v: number = Number(sample);
+        mbps = Number.isNaN(v) ? 0 : v;
+      }
+      const rs: HistoryRound = {
+        mbps: mbps,
+        ok: ok,
+        state: ok ? '成功' : (state.length > 0 ? state : '失败'),
+        latencyMs: (latText !== '—' && !Number.isNaN(Number(latText))) ? Number(latText) : -1,
+        lossRate: (lossText !== '—' && !Number.isNaN(Number(lossText))) ? Number(lossText) : -1
+      };
+      rounds.push(rs);
+    }
+    let status: string = this.t('未测速', 'not tested');
+    let remark: string = '';
+    if (c.stage === Stage.SPEED) {
+      const cfgRounds: number = c.speedCfgRounds > 0 ? c.speedCfgRounds : rounds.length;
+      if (!c.speedOk || c.speedMbps <= 0) {
+        status = this.t('测速失败', 'failed');
+      } else if (c.speedRounds < cfgRounds) {
+        status = this.t('部分成功（', 'partial (') + c.speedRounds.toString() + '/' +
+          cfgRounds.toString() + this.t(' 轮）', ' rounds)');
+      } else if (c.speedMbps < cfg.minSpeedMbps) {
+        status = this.t('未达标', 'below target');
+      } else {
+        status = this.t('测速成功', 'success');
+      }
+      // 只把失败轮的原因写进「说明」，不再沿用 ping 阶段的 remark（那会是「预估达标」之类与测速无关的文案）
+      const reasons: string[] = [];
+      for (let i = 0; i < rounds.length; i++) {
+        if (!rounds[i].ok && rounds[i].state.length > 0 && reasons.indexOf(rounds[i].state) < 0) {
+          reasons.push(rounds[i].state);
+        }
+      }
+      remark = reasons.join(' / ');
+    } else {
+      remark = c.remark;
+    }
+    const n: HistoryNode = {
+      ip: c.ip,
+      port: c.port,
+      version: c.version,
+      colo: c.colo,
+      minLatencyMs: c.minLatencyMs,
+      avgLatencyMs: c.avgLatencyMs,
+      maxLatencyMs: c.maxLatencyMs,
+      lossRate: c.lossRate,
+      pingSent: c.pingSent,
+      pingRecv: c.pingRecv,
+      speedMinMbps: c.speedMinMbps,
+      speedMaxMbps: c.speedMaxMbps,
+      speedAvgMbps: c.speedAvgMbps,
+      speedEffMbps: c.speedMbps,
+      successRounds: c.speedRounds,
+      cfgRounds: c.speedCfgRounds > 0 ? c.speedCfgRounds : cfg.speedRounds,
+      linkOk: c.linkOk,
+      linkTries: c.linkTries,
+      stabilityScore: c.stabilityScore,
+      delayScore: c.delayScore,
+      speedScore: c.speedScore,
+      finalScore: c.finalScore,
+      rank: rank,
+      status: status,
+      remark: remark,
+      rounds: rounds
+    };
+    return n;
+  }
+
+  /**
+   * 正式测速完成后写历史：只落盘，不改 this.results / speedList，
+   * 也不触发排名重算（分数、排名都是本轮 Ranker.apply 的结果）。
+   */
+  private saveHistory(cfg: ScanConfig): void {
+    if (!this.historyReady) {
+      return;
+    }
+    const list: Candidate[] = this.speedSource();
+    if (list.length === 0) {
+      return;
+    }
+    const nodes: HistoryNode[] = [];
+    let okCount: number = 0;
+    for (let i = 0; i < list.length; i++) {
+      const c: Candidate = list[i];
+      if (c.speedOk && c.speedMbps > 0) {
+        okCount++;
+      }
+      nodes.push(this.historyNodeOf(c, i + 1, cfg));
+    }
+    const id: string = new Date().getTime().toString();
+    const meta: HistoryMeta = {
+      id: id,
+      time: this.lastSpeedDoneAt.length > 0 ? this.lastSpeedDoneAt : Exporter.timeText(new Date()),
+      appVersion: this.appVersion,
+      nodeCount: nodes.length,
+      okCount: okCount,
+      failCount: nodes.length - okCount,
+      cfgRounds: cfg.speedRounds,
+      latencyLimitMs: cfg.latencyLimitMs,
+      maxLossPct: cfg.maxLossPct,
+      pingTimes: cfg.pingTimes,
+      pingTimeoutMs: cfg.pingTimeoutMs,
+      speedCount: cfg.speedCount,
+      speedWindowMs: cfg.speedWindowMs,
+      minSpeedMbps: cfg.minSpeedMbps,
+      scoreBaseDelayMs: this.scoreBaseDelayMs,
+      scoreBaseSpeedMbps: this.scoreBaseSpeedMbps,
+      delayWeight: cfg.delayWeight,
+      speedWeight: cfg.speedWeight
+    };
+    const rec: HistoryRecord = { meta: meta, nodes: nodes };
+    // 下一帧再写：历史落盘无论耗时多少，都不能卡住本轮结果的首次渲染
+    setTimeout(() => {
+      const ok: boolean = HistoryStore.save(rec);
+      if (ok) {
+        this.historyList = HistoryStore.loadIndex();
+        this.loadTrend();
+        this.addLog(this.t('已保存测速记录：', 'Speed record saved: ') + meta.time);
+      } else if (HistoryStore.getLimit() <= 0) {
+        // 上限为 0 是用户主动关闭历史，不是写盘失败
+        this.addLog(this.t('历史保存已关闭，本轮结果未保存', 'History saving is off; this result was not saved'));
+      } else {
+        this.addLog(this.t('测速记录保存失败（不影响本轮结果）', 'Failed to save record (result unaffected)'));
+      }
+    }, 0);
+  }
+
+  /** 进入历史 Tab 时刷新摘要（文件是唯一数据源；当前结果不会写回历史） */
+  private refreshHistory(): void {
+    if (!this.historyReady) {
+      return;
+    }
+    try {
+      this.historyList = HistoryStore.loadIndex();
+      this.loadTrend();
+    } catch (e) {
+      this.addLog(this.t('历史记录读取失败', 'Failed to read history'));
+    }
+  }
+
+  /** 走势取最近最多 12 条记录的第 1 名节点：延迟 + 实际平均速度 */
+  private loadTrend(): void {
+    const lat: number[] = [];
+    const spd: number[] = [];
+    const tms: string[] = [];
+    const n: number = Math.min(12, this.historyList.length);
+    for (let i = n - 1; i >= 0; i--) {
+      const rec: HistoryRecord | null = HistoryStore.read(this.historyList[i].id);
+      if (rec === null || rec.nodes.length === 0) {
+        continue;
+      }
+      const top: HistoryNode = rec.nodes[0];
+      const l: number = top.avgLatencyMs > 0 ? top.avgLatencyMs : top.minLatencyMs;
+      lat.push(l > 0 ? l : 0);
+      spd.push(top.speedAvgMbps > 0 ? top.speedAvgMbps : 0);
+      tms.push(this.trendClock(rec.meta.time));
+    }
+    this.trendLat = lat;
+    this.trendSpd = spd;
+    this.trendTime = tms;
+    setTimeout(() => {
+      this.drawTrend(0);
+      this.drawTrend(1);
+    }, 80);
+  }
+
+  /** "2026-11-14 09:20:57" → "09:20"；异常返回空串 */
+  private trendClock(t: string): string {
+    if (t.length >= 16) {
+      return t.substring(11, 16);
+    }
+    return t;
+  }
+
+  /** 走势里最后一次有效值（没有则 -1） */
+  private trendLatest(which: number): number {
+    const arr: number[] = which === 0 ? this.trendLat : this.trendSpd;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i] > 0) {
+        return arr[i];
+      }
+    }
+    return -1;
+  }
+
+  /** 「最新 12 ms / — / 34.5 MB/s」 */
+  private trendLatestText(which: number): string {
+    const v: number = this.trendLatest(which);
+    if (v <= 0) {
+      return '—';
+    }
+    return this.trendAxis(v, which) + (which === 0 ? ' ms' : ' MB/s');
+  }
+
   // ---------- 主题色 ----------
   bg1(): string {
     return this.dark ? '#09090B' : '#F3F5FA';
@@ -1894,6 +2549,30 @@ struct Index {
       return '—';
     }
     return Math.round(d).toString() + ' ms';
+  }
+
+  /** 丢包率文案：分母是真实发出的探测次数；尚未探测显示 — */
+  lossLabel(c: Candidate): string {
+    if (c.pingSent <= 0) {
+      return this.t('连接失败 —', 'link fail —');
+    }
+    return this.t('连接失败 ', 'link fail ') + Math.round(c.lossRate * 100).toString() + '%';
+  }
+
+  /** 地区文案：带旗帜（未知地区只显示文字） */
+  regionLabel(c: Candidate): string {
+    if (c.colo.length === 0 || c.colo === 'UNK') {
+      return this.t('未知地区', 'Unknown region');
+    }
+    return Geo.flag(c.colo) + ' ' + Geo.placeZh(c.colo);
+  }
+
+  /** 测速文案：未测速或速度为 0 时显示 — */
+  speedLabel(c: Candidate): string {
+    if (c.speedMbps <= 0) {
+      return '—';
+    }
+    return c.speedMbps.toFixed(2) + ' MB/s';
   }
 
   build() {
@@ -2095,25 +2774,8 @@ struct Index {
       const w: number = newV.width as number;
       if (w > 0 && Math.abs(w - this.winW) > 1) {
         this.winW = w;
-        this.navPillX = this.navTabCenter(this.curTab);
       }
     })
-  }
-
-  @Builder Header() {
-    Column() {
-      Text('CFLark')
-        .fontSize(26)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(this.txt())
-      Text(this.t('Cloudflare 智能优选 · v', 'Cloudflare smart selection · v') + this.appVersion)
-        .fontSize(12)
-        .fontColor(this.txt3())
-        .margin({ top: 2 })
-    }
-    .alignItems(HorizontalAlign.Start)
-    .width('100%')
-    .padding({ left: 20, right: 20 })
   }
 
   /** 全局进度区：扫描 / 筛选 / 测速三页共用同一套视觉（纤细、无卡片容器） */
@@ -2373,34 +3035,6 @@ struct Index {
     return this.t('自适应', 'Adaptive');
   }
 
-  /**
-   * 底部胶囊的系统沉浸材质。
-   * 注意：这里刻意不使用 colorInvert，也不给白色 lightEffect —— 之前正是这两项
-   * 让「等级越高、材质越厚」时反而整条导航越拉越白（浅色底 + 白色高光叠加）。
-   * 现在改成带一点页面底色的深/浅中性 tint，厚度只影响通透度，不影响白度。
-   */
-  private tabBarMaterial(): uiMaterial.Material {
-    // 缓存：避免每次 rebuild 都 new 一个材质对象（切档卡顿的主因）
-    const key: string = (this.matSupported() ? '1' : '0') + '|' + (this.globalImmersion ? '1' : '0') + '|' +
-      this.matType.toString() + '|' + this.matLevel.toString() + '|' + (this.dark ? '1' : '0');
-    if (this.matCacheKey === key) {
-      return this.matCached;
-    }
-    this.matCacheKey = key;
-    if (!this.matSupported() || !this.globalImmersion || this.matType === 2) {
-      this.matCached = uiMaterial.Material.empty;
-      return this.matCached;
-    }
-    const opt: uiMaterial.ImmersiveOptions = {
-      style: this.styleOfLevel(),
-      materialColor: this.dark ? 'rgba(14,16,22,0.42)' : 'rgba(228,233,244,0.18)',
-      applyShadow: true,
-      interactive: true,
-      lightEffect: { color: this.dark ? '#26FFFFFF' : '#33FFFFFF' }
-    };
-    this.matCached = new uiMaterial.ImmersiveMaterial(opt);
-    return this.matCached;
-  }
 
   // ===== HDS 系统材质（对标 OpenAuthenticator） =====
 
@@ -2438,42 +3072,8 @@ struct Index {
     return { materialType: this.hdsMatType(), materialLevel: this.hdsMatLevel() };
   }
 
-  private measuredCardHeight(cardId: string): number {
-    const h: number | undefined = this.measuredCardHeights.get(cardId);
-    return h === undefined ? 0 : h;
-  }
 
-  private updateMeasuredCardHeight(cardId: string, area: Area): void {
-    const h: number = area.height as number;
-    if (h <= 0 || Math.abs(h - this.measuredCardHeight(cardId)) <= 0.5) {
-      return;
-    }
-    const next: Map<string, number> = new Map(this.measuredCardHeights);
-    next.set(cardId, h);
-    this.measuredCardHeights = next;
-  }
 
-  /** 材质条高度 = 卡片高度；宽度横向多撑出两倍高度，让圆角端点落在裁剪区外（OA 1839-1845） */
-  private immersionBarHeight(h: number): number {
-    return h;
-  }
-
-  private immersionExpandedWidth(h: number): number {
-    return Math.max(this.winW, 400) + this.immersionBarHeight(h) * 2;
-  }
-
-  /** 卡片系统材质层：HdsTabs 悬浮 bar + systemMaterialEffect（OA 1676-1717） */
-  private floatStyle(lightC: string): HdsTabsFloatingStyle {
-    const st: HdsTabsFloatingStyle = {
-      barBottomMargin: 0,
-      systemMaterialEffect: this.systemMatParams(),
-      gradientMask: { maskColor: '#09999999' }
-    };
-    if (lightC.length > 0) {
-      st.lightColor = lightC;
-    }
-    return st;
-  }
 
   /** 真实导航栏的官方沉浸光感样式：底距避开手势区，左右各留 20vp */
   private navFloatStyle(): HdsTabsFloatingStyle {
@@ -2494,45 +3094,6 @@ struct Index {
       st.lightColor = this.accent();
     }
     return st;
-  }
-
-  @Builder ImmersionMaterialLayer(cardHeight: number, cardRadius: number, lightC: string) {
-    Stack({ alignContent: Alignment.Center }) {
-      HdsTabs() {
-        TabContent() {
-        }
-        .backdropBlur(0)
-        .tabBar(this.ImmersionMaterialContent(cardHeight))
-        .clip(false)
-      }
-      .width(this.immersionExpandedWidth(cardHeight))
-      .height(cardHeight)
-      .barWidth(this.immersionExpandedWidth(cardHeight))
-      .barHeight(this.immersionBarHeight(cardHeight))
-      .barOverlap(true)
-      .barPosition(BarPosition.End)
-      .barBackgroundStyle({ maskColor: '#00000000' })
-      .barBackgroundBlurStyle(BlurStyle.NONE)
-      .barFloatingStyle(this.floatStyle(lightC))
-      .backgroundColor(Color.Transparent)
-      .hitTestBehavior(HitTestMode.None)
-      .clip(false)
-    }
-    .width('100%')
-    .height(cardHeight)
-    .borderRadius(cardRadius)
-    .clip(true)
-    .backgroundColor(Color.Transparent)
-    .hitTestBehavior(HitTestMode.None)
-    .zIndex(0)
-  }
-
-  @Builder ImmersionMaterialContent(cardHeight: number) {
-    Stack()
-      .width(this.immersionExpandedWidth(cardHeight))
-      .height(this.immersionBarHeight(cardHeight))
-      .backgroundColor(Color.Transparent)
-      .hitTestBehavior(HitTestMode.None)
   }
 
   /** 材质档位 -> 沉浸材质厚度：精致更厚、柔和中等、平滑更薄；自适应跟随设备等级 */
@@ -2566,30 +3127,8 @@ struct Index {
     return new uiMaterial.ImmersiveMaterial(opt);
   }
 
-  /** 导航栏静止态材质：薄玻璃（THIN）；拖动中由调用方传 undefined */
-  private navMaterial(): uiMaterial.Material {
-    if (!this.shouldUseCardMaterial()) {
-      return uiMaterial.Material.empty;
-    }
-    const opt: uiMaterial.ImmersiveOptions = {
-      style: uiMaterial.ImmersiveStyle.THIN,
-      materialColor: Color.Transparent,
-      colorInvert: this.dark,
-      applyShadow: false,
-      interactive: false
-    };
-    return new uiMaterial.ImmersiveMaterial(opt);
-  }
 
-  /** 卡片系统材质层：组件级 systemMaterial，直接铺满卡片（不再用 HdsTabs 悬浮 bar） */
-  /**
-   * 历史上这里放的是 systemMaterial 承载层。实测 systemMaterial 在内容区（Stack/Column）不生效
-   * （真机日志：Material inactive: out of scope），而且 .height('100%') 在 Scroll 内会按可视区解析，
-   * 把卡片撑高、在页面底部留下大片空白。材质已改由卡片自身的 backgroundBlurStyle + 渐变底色实现，
-   * 因此这里保留空实现，只为兼容既有调用点。
-   */
 
-  /** 光感等级对卡片厚度的影响：等级越高卡片越实、阴影越深 */
   /**
    * 卡片底色不透明度。
    * 叠加自定义背景图时（底图细节多）整体抬高 scrim，保证正文/次要文字可读；
@@ -2653,13 +3192,6 @@ struct Index {
     return 'Thick';
   }
 
-  /** 底部胶囊宽度（vp） */
-  private tabBarW(): number {
-    if (this.winW >= 900) {
-      return 460;
-    }
-    return this.winW > 240 ? Math.min(320, this.winW * 0.80) : 300;
-  }
 
 
 
@@ -2843,10 +3375,10 @@ struct Index {
       this.phaseText = this.t(readyZh, readyEn);
     }
     const hint: string = this.latencyHint;
-    if (hint.length === 0 || hint.indexOf('260~320') >= 0) {
+    if (hint.length === 0 || hint.indexOf('280~360') >= 0) {
       this.latencyHint = this.t(
-        '建议：延迟上限建议 260~320ms（默认 300ms；两次 ping 下 220ms 偏低，容易误杀可用节点）',
-        'Tip: a latency cap of 260–320 ms is recommended (default 300 ms; 220 ms with two pings is too low and may discard usable nodes).');
+        '建议：延迟上限建议 280~360ms（默认 320ms，Ping 3 次取最小值）；设得过低会误杀可用节点',
+        'Tip: a latency cap of 280–360 ms is recommended (default 320 ms; 3 pings take the minimum); too low a cap may discard usable nodes.');
     }
   }
 
@@ -3066,16 +3598,6 @@ struct Index {
     return [[this.accent(), 0.0], [this.accentPale(), 1.0]];
   }
 
-  /** 导航胶囊左边界与宽度（vp，窗口坐标） */
-  private navStackLeft(): number {
-    const w: number = Math.min(360, this.winW - 48);
-    return (this.winW - w) / 2;
-  }
-
-  private navStackWidth(): number {
-    return Math.min(360, this.winW - 48);
-  }
-
   /** 主题色 + 透明度 → rgba 字符串 */
   private accentRgba(alpha: number): string {
     const c: string = this.accent();
@@ -3085,65 +3607,6 @@ struct Index {
     return 'rgba(' + r.toString() + ',' + g.toString() + ',' + b.toString() + ',' + alpha.toFixed(2) + ')';
   }
 
-  /** 宽柔光带：中心为触摸位置（只在交互期间渲染，静止时不画） */
-  private glowBand(): Array<[ResourceColor, number]> {
-    const p: number = Math.max(0.06, Math.min(0.94, this.navGlowPct / 100));
-    const spread: number = 0.10 + 0.04 * this.navStretch;
-    const lo: number = Math.max(0.0, p - spread);
-    const hi: number = Math.min(1.0, p + spread);
-    return [[this.accentRgba(0.0), 0.0], [this.accentRgba(0.06), lo], [this.accentRgba(0.16), p],
-      [this.accentRgba(0.06), hi], [this.accentRgba(0.0), 1.0]];
-  }
-
-  /** 窄亮芯 */
-  private glowCore(): Array<[ResourceColor, number]> {
-    const p: number = Math.max(0.04, Math.min(0.96, this.navGlowPct / 100));
-    const spread: number = 0.035 + 0.02 * this.navStretch;
-    const lo: number = Math.max(0.0, p - spread);
-    const hi: number = Math.min(1.0, p + spread);
-    return [[this.accentRgba(0.0), 0.0], [this.accentRgba(0.20), lo], [this.accentRgba(0.20), p],
-      [this.accentRgba(0.12), hi], [this.accentRgba(0.0), 1.0]];
-  }
-
-  /** 跟手：拖拽过程中光斑位置由系统响应式弹簧跟随（不是逐帧手搓） */
-  private navDragFollow(pct: number, stretch: number): void {
-    animateTo({ curve: curves.responsiveSpringMotion(0.6, 0.84) }, () => {
-      this.navGlowPct = pct;
-      this.navStretch = stretch;
-    });
-  }
-
-  /** 离手：弹回当前选中项，随后光效淡出（系统弹簧，无定时器） */
-  private navDragRelease(): void {
-    const anchor: number = (this.curTab + 0.5) / 4 * 100;
-    animateTo({
-      curve: curves.springMotion(0.36, 0.72),
-      onFinish: () => {
-        if (!this.navDrag) {
-          animateTo({ duration: 180, curve: Curve.EaseOut }, () => {
-            this.navGlowOn = false;
-            this.navStretch = 0;
-          });
-        }
-      }
-    }, () => {
-      this.navGlowPct = anchor;
-      this.navStretch = 0;
-    });
-  }
-
-  // ===== 方案 A：悬浮导航高亮胶囊拖拽（参数逐字采用华为官方技术设计文档）=====
-  /** 胶囊内可拖动区宽度（vp）：去掉左右各 6 的内边距 */
-  private navInnerW(): number {
-    const w: number = this.navStackWidth() - 12;
-    return w < 120 ? 120 : w;
-  }
-
-  private navTabW(): number {
-    return this.navInnerW() / 4;
-  }
-
-  /** 第 i 个页签中心 x（相对胶囊左边缘） */
   /** 平板三列：单列宽度（内容区宽 - 两个列间距后三等分） */
   /** 单列页（筛选/测速）在平板上居中限宽 900vp，避免内容铺到屏幕两端 */
   private pageSidePad(): number {
@@ -3164,218 +3627,9 @@ struct Index {
     return this.tabColW() * 2 + 14;
   }
 
-  private navTabCenter(i: number): number {
-    let k: number = i;
-    if (k < 0) {
-      k = 0;
-    }
-    if (k > 3) {
-      k = 3;
-    }
-    return 6 + this.navTabW() * (k + 0.5);
-  }
-
-  /** 高亮胶囊宽度 */
-  private navPillW(): number {
-    return this.navTabW() * 0.82;
-  }
-
-  /** 拖动边界：首/末页签中心之间（不滑进圆角端帽） */
-  private navClampPill(x: number): number {
-    const lo: number = this.navTabCenter(0);
-    const hi: number = this.navTabCenter(3);
-    if (x < lo) {
-      return lo;
-    }
-    if (x > hi) {
-      return hi;
-    }
-    return x;
-  }
-
-  /** 越界阻力：溢出位移按 pow(overflow, 0.6) 压缩，越拉越难拉（官方区间 0.5–0.7） */
-  private clampWithResistance(x: number, lo: number, hi: number): number {
-    const exp: number = 0.6;
-    if (x < lo) {
-      return lo - Math.pow(lo - x, exp);
-    }
-    if (x > hi) {
-      return hi + Math.pow(x - hi, exp);
-    }
-    return x;
-  }
-
-  /** 离手吸附到最近页签 */
-  private navNearestTab(x: number): number {
-    let best: number = 0;
-    let bestD: number = 1000000;
-    for (let i = 0; i < 4; i++) {
-      const d: number = Math.abs(this.navTabCenter(i) - x);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    return best;
-  }
-
-  /** 单一数据源：所有形变只改这三个数，避免多个 animateTo 抢同一属性 */
-  private setPillScale(s: number, flatness: number, yDeform: number): void {
-    let ss: number = s;
-    if (ss < 1.12) {
-      ss = 1.12;
-    }
-    if (ss > 1.85) {
-      ss = 1.85;
-    }
-    let f: number = flatness;
-    if (f < 0) {
-      f = 0;
-    }
-    if (f > 0.2) {
-      f = 0.2;
-    }
-    let y: number = yDeform;
-    if (y < -0.15) {
-      y = -0.15;
-    }
-    if (y > 0.15) {
-      y = 0.15;
-    }
-    this.navPillS = ss;
-    this.navPillFlat = f;
-    this.navPillY = y;
-  }
-
-  /** scaleX = s × (1 + flatness) */
-  private navPillScaleX(): number {
-    return this.navPillS * (1 + this.navPillFlat);
-  }
-
-  /** scaleY = s × (1 - flatness + yDeform) */
-  private navPillScaleY(): number {
-    return this.navPillS * (1 - this.navPillFlat + this.navPillY);
-  }
-
-  /** 光斑位置跟随胶囊中心 */
-  private syncNavGlow(x: number): void {
-    const p: number = x / this.navInnerW() * 100;
-    this.navGlowPct = p < 2 ? 2 : (p > 98 ? 98 : p);
-  }
-
-  private navPanStart(e: GestureEvent): void {
-    this.navPillDragging = true;
-    this.navGlowOn = true;
-    this.navStartX = this.navPillX;
-    this.navLastWX = e.offsetX;
-    this.navLastMs = Date.now();
-    this.navVelMs = 0;
-    this.syncNavGlow(this.navPillX);
-  }
-
-  private navPanUpdate(e: GestureEvent): void {
-    const lo: number = this.navTabCenter(0);
-    const hi: number = this.navTabCenter(3);
-    const target: number = this.clampWithResistance(this.navStartX + e.offsetX, lo, hi);
-    const now: number = Date.now();
-    const dt: number = now - this.navLastMs;
-    if (dt > 0) {
-      this.navVelMs = Math.abs(e.offsetX - this.navLastWX) / dt;
-    }
-    this.navLastWX = e.offsetX;
-    this.navLastMs = now;
-    // 官方公式：s = max(1.12, 1 + min(0.85, dist/55))
-    const dist: number = Math.abs(target - this.navStartX);
-    const s: number = Math.max(1.12, 1 + Math.min(0.85, dist / 55));
-    // flatness = 0.2 × min(1, vel/1.5)
-    const flat: number = 0.2 * Math.min(1, this.navVelMs / 1.5);
-    // yDeform = clamp(-offsetY/200, -0.15, 0.15)
-    let yd: number = -e.offsetY / 200;
-    if (yd < -0.15) {
-      yd = -0.15;
-    }
-    if (yd > 0.15) {
-      yd = 0.15;
-    }
-    // §1.7 位置直接赋值保证跟手；形变走 responsiveSpringMotion(0.32, 0.6) 平滑
-    animateTo({ curve: curves.responsiveSpringMotion(0.32, 0.6) }, () => {
-      this.setPillScale(s, flat, yd);
-    });
-    this.navPillX = target;
-    this.syncNavGlow(target);
-  }
-
-  private navPanEnd(): void {
-    const idx: number = this.navNearestTab(this.navClampPill(this.navPillX));
-    const target: number = this.navTabCenter(idx);
-    const fast: boolean = this.navVelMs > 0.6;
-    const slow: boolean = this.navVelMs < 0.15;
-    this.navPillDragging = false;
-    // 光效：离手立即淡出，不挂在位置回弹的 onFinish 上
-    animateTo({ duration: 130, curve: Curve.EaseOut }, () => {
-      this.navGlowOn = false;
-    });
-    if (fast) {
-      // 快速甩动：先挤压
-      animateTo({ curve: curves.springMotion(0.25, 0.5) }, () => {
-        this.setPillScale(1.34, 0.2, 0);
-      });
-      // 再回弹并吸附
-      animateTo({ curve: curves.springMotion(1.0, 0.7), delay: 90 }, () => {
-        this.navPillX = target;
-        this.setPillScale(1.0, 0, 0);
-      });
-    } else if (slow) {
-      animateTo({ curve: curves.springMotion(1.0, 0.7) }, () => {
-        this.navPillX = target;
-        this.setPillScale(1.0, 0, 0);
-      });
-    } else {
-      animateTo({ curve: curves.springMotion(0.32, 0.6) }, () => {
-        this.navPillX = target;
-        this.setPillScale(1.0, 0, 0);
-      });
-    }
-    if (idx !== this.curTab) {
-      this.anyScrollY = 0;
-      if (this.showBackTop) {
-        this.showBackTop = false;
-      }
-      // 走统一入口，让 Tabs 真正切页（不要只改 curTab）
-      this.curTab = idx;
-    }
-    this.syncNavGlow(target);
-  }
-
   /** 底部悬浮导航：原生 Tabs（隐藏系统页签）作页面宿主，导航层只负责切页，不做拖动、不做柔光 */
 
-  /** 导航胶囊玻璃：深色更薄、浅色更厚，保证两套主题都能读出层次 */
-  /** 悬浮控件受光渐变：与 FloatingNav 的 ② 光感层同源 */
-  private floatSheen(): Array<[ResourceColor, number]> {
-    return [
-      [this.dark ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.46)', 0.0],
-      [this.dark ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.16)', 0.42],
-      [this.dark ? 'rgba(0,0,0,0.12)' : 'rgba(15,23,42,0.06)', 1.0]
-    ];
-  }
 
-  private navGlassStyle(): BlurStyle {
-    const e: number = this.effLevel();
-    if (e < 0) {
-      return BlurStyle.NONE;
-    }
-    if (e === 0) {
-      return this.matType === 1 ? BlurStyle.COMPONENT_ULTRA_THICK : BlurStyle.COMPONENT_THICK;
-    }
-    if (e === 1) {
-      return BlurStyle.COMPONENT_REGULAR;
-    }
-    return BlurStyle.COMPONENT_THIN;
-  }
-  /** 玻璃外缘：浅色用亮白高光描边，深色用低对比白线 */
-  private navGlassBorder(): string {
-    return this.dark ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.85)';
-  }
   /** 悬浮小控件的底色：不做白纱，改成贴近底部导航的「微暗玻璃」，并跟随卡片通透度 */
   private floatTint(): Array<[ResourceColor, number]> {
     // 与卡片板块完全同源：cardTint 已内置「卡片通透度」系数，滑杆会同时影响卡片与悬浮件
@@ -3401,11 +3655,6 @@ struct Index {
     return this.cardShadowColor();
   }
   /** 单个页签：选中时只加一层淡色圆角底 + 主题色图标/文字，不做发光 */
-  /** 选中光：中心亮、四周完全渐隐的径向柔光（没有矩形边界） */
-  private navSelGlow(): Array<[ResourceColor, number]> {
-    const hi: number = this.dark ? 0.30 : 0.34;
-    return [[this.accentRgba(hi), 0.0], [this.accentRgba(0.0), 1.0]];
-  }
 
 
   // ——————————————————— 候选来源：分组模型接线 ———————————————————
@@ -3586,22 +3835,18 @@ struct Index {
     if (this.showBackTop) {
       this.showBackTop = false;
     }
-    // 点击切页不扫光：光带只在拖动交互时出现
-    this.navGlowOn = false;
-    this.navStretch = 0;
-    this.navGlowPct = (index + 0.5) / 4 * 100;
+    if (index === 3) {
+      this.refreshHistory();
+    }
+    if (this.curTab !== index) {
+      this.tabsCtrl.changeIndex(index);
+    }
     animateTo({ curve: curves.springMotion(0.55, 0.82) }, () => {
       this.curTab = index;
-      this.navPillX = this.navTabCenter(index);
-      this.setPillScale(1.0, 0, 0);
+      this.navSel = index;
     });
   }
 
-  /** 导航栏宽度：手机取屏宽 - 48，平板/2in1 上限 360vp */
-  private navBarW(): number {
-    const w: number = this.winW > 0 ? this.winW : 360;
-    return Math.min(360, w - 48);
-  }
 
   /** 页面底部避让：导航 62 + 悬浮 12 + 系统手势区 + 16 余量（只加一次，避免双重留白） */
   /**
@@ -3720,6 +3965,9 @@ struct Index {
     if (index === 2) {
       return $r('sys.symbol.bolt');
     }
+    if (index === 3) {
+      return $r('sys.symbol.clock');
+    }
     return $r('sys.symbol.gearshape');
   }
 
@@ -3743,12 +3991,8 @@ struct Index {
     .justifyContent(FlexAlign.Center)
     .onClick(() => {
       // HDS 的 onChange 要等页签切换动画结束才回调（实测滞后 1~2s），
-      // 这里点击时先把选中态落下去，图标/文字颜色立即响应；后续 onChange 仍是权威值。
-      if (this.navSel !== index) {
-        this.navSel = index;
-        this.navPillX = this.navTabCenter(index);
-        this.setPillScale(1.0, 0, 0);
-      }
+      // 这里点击时直接把页面切过去；onChange 随后仍会以真实索引再同步一次。
+      this.switchTab(index);
     })
   }
 
@@ -3761,23 +4005,24 @@ struct Index {
         Scroll(this.scanScroller) {
           Row() {
             Column({ space: 20 }) {
-              Row({ space: 20 }) {
+              Flex({ direction: FlexDirection.Row, alignItems: ItemAlign.Stretch }) {
                 Column({ space: 20 }) {
                   this.CardSource()
                   this.CardParam()
                 }
                 .layoutWeight(1)
+                .margin({ right: 10 })
                 .alignItems(HorizontalAlign.Start)
 
                 Column({ space: 20 }) {
                   this.CardSpeed()
-                  this.CardLog(false, 240, true)
+                  this.CardLogFlex()
                 }
                 .layoutWeight(1)
+                .margin({ left: 10 })
                 .alignItems(HorizontalAlign.Start)
               }
               .width('100%')
-              .alignItems(VerticalAlign.Top)
             }
             .width('100%')
             .padding({ left: 20, right: 20, top: this.contentTop(), bottom: this.pageBottomPad() })
@@ -3985,59 +4230,11 @@ struct Index {
     .width('100%')
     }
     
-    @Builder FieldRow(label: string, value: string, onChange: (v: string) => void) {
-    Row() {
-    Text(label)
-    .fontSize(13)
-    .fontColor(this.txt2())
-    .width(110)
-    TextInput({ text: value })
-    .id('fr-' + label + '-' + this.cfgRev.toString())
-    .layoutWeight(1)
-    .height(40)
-    .fontSize(13)
-    .fontColor(this.txt())
-    .backgroundColor(this.inputBg())
-    .borderRadius(10)
-    .onChange(onChange)
-    }
-    .width('100%')
-    .margin({ top: 8 })
-    }
-    
     // ---- 统一控件尺寸 token（vp）：chip / 按钮 / 输入框内边距 ----
     private readonly CHIP_H: number = 34;
     private readonly CHIP_R: number = 9;
     private readonly CHIP_FS: number = 12;
     private readonly BTN_H: number = 38;
-    
-    @Builder SegRow(label: string, items: string[], current: number, onPick: (i: number) => void) {
-    Row() {
-    Text(label)
-    .fontSize(13)
-    .fontColor(this.txt2())
-    .width(110)
-    Row() {
-    ForEach(items, (item: string, index: number) => {
-    Text(item)
-    .fontSize(this.CHIP_FS)
-    .fontColor(current === index ? '#FFFFFF' : this.txt2())
-    .textAlign(TextAlign.Center)
-    .layoutWeight(1)
-    .height(this.CHIP_H)
-    .backgroundColor(current === index ? this.accentFill() : this.soft())
-    .borderRadius(this.CHIP_R)
-    .margin({ right: index === items.length - 1 ? 0 : 6 })
-    .onClick(() => {
-    onPick(index);
-    })
-    }, (item: string, index: number) => item + '#' + index.toString())
-    }
-    .layoutWeight(1)
-    }
-    .width('100%')
-    .margin({ top: 8 })
-    }
     
     @Builder SourceHint() {
     Text(this.sourceHintText())
@@ -4995,17 +5192,8 @@ struct Index {
         .width('100%')
         .margin({ top: 8 })
 
-        Text(this.t('Cloudflare 只支持这几个 TLS 端口。', 'Cloudflare only supports these TLS ports.'))
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .width('100%')
-          .margin({ top: 8 })
-
         this.SourceHint()
       }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('src', a);
-      })
       .width('100%')
       .padding(16)
       }
@@ -5045,25 +5233,6 @@ struct Index {
   }
 
   /** 卡片内折叠条：默认收起，收起时只占一行，展开后露出低频参数与参数说明 */
-  @Builder AdvRow(open: boolean, onTap: () => void) {
-    Row() {
-      Text(open ? this.t('收起高级选项', 'Hide advanced options') : this.t('高级选项', 'Advanced options'))
-        .fontSize(12)
-        .fontColor(this.txt2())
-      Blank()
-      Text(open ? this.t('收起', 'Collapse') : this.t('展开', 'Expand'))
-        .fontSize(12)
-        .fontColor(this.accentText())
-    }
-    .width('100%')
-    .height(38)
-    .padding({ left: 12, right: 12 })
-    .backgroundColor(this.soft())
-    .borderRadius(10)
-    .margin({ top: 10 })
-    .onClick(onTap)
-  }
-
   /** 功能说明入口：与「快速筛选参数」原有样式一致（28×28 胶囊底 + 强调色感叹号） */
   @Builder InfoDot(key: string) {
     Text('ⓘ')
@@ -5201,10 +5370,11 @@ struct Index {
             .layoutWeight(1)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          // 说明入口固定在卡片右上角，与「应用建议」不再重复
+          // 说明入口固定在卡片右上角
           this.InfoDot(HELP_FILTER)
         }
         .width('100%')
+        .alignItems(VerticalAlign.Center)
 
         // 两列两组：左列「采样数 / 并发线程」，右列「延迟上限 / Ping 次数」；
         // 宽屏与手机同一结构（宽屏靠这两行把左列拉高，与右列底部对齐）
@@ -5243,13 +5413,38 @@ struct Index {
         .width('100%')
         .margin({ top: 10 })
 
-        // 合格速度直接展示；右侧空位放「应用建议」，与输入框底边对齐
+        // 第 3 行：合格速度 / 丢包率上限（三行两列，手机上也不挤）
         Row({ space: 10 }) {
           this.ParamCell(this.t('合格速度 MB/s', 'Min speed MB/s'), 'minSpeed', 'speed-ms-' + this.cfgRev.toString(), false, (v: string) => {
             this.minSpeedText = v;
             this.scheduleScanSave();
           })
-          Text(this.t('应用建议', 'Apply'))
+          this.ParamCell(this.t('连接失败率上限 %', 'Max link fail %'), 'loss', 'loss-' + this.cfgRev.toString(), true, (v: string) => {
+            this.lossPctText = v;
+            this.scheduleScanSave();
+          })
+        }
+        .width('100%')
+        .margin({ top: 10 })
+
+        // 合格速度的取值说明：常驻小字，避免用户填了 999 才发现被按 100 处理
+        Text(this.t('合格速度有效范围 0–100，超过 100 按 100 处理；填 0 表示不做速度淘汰。',
+          'Valid range 0–100; values above 100 are clamped to 100. 0 disables speed filtering.'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .maxLines(2)
+          .textAlign(TextAlign.Start)
+          .width('100%')
+          .margin({ top: 4 })
+
+        // 第 4 行：Ping 超时（只作用于第一阶段 TCP 建连；trace / 预检 / 下载测速各走自己的超时）
+        Row({ space: 10 }) {
+          this.ParamCell(this.t('Ping 超时 ms', 'Ping timeout ms'), 'pingTimeout', 'ping-to-' + this.cfgRev.toString(), true, (v: string) => {
+            this.pingTimeoutText = v;
+            this.scheduleScanSave();
+          })
+          // 「恢复默认」跟随最后一个参数，样式与「下载测速」卡的同名按钮一致
+          Text(this.t('恢复默认', 'Reset'))
             .fontSize(12)
             .fontColor(this.accentText())
             .textAlign(TextAlign.Center)
@@ -5266,9 +5461,6 @@ struct Index {
         .alignItems(VerticalAlign.Bottom)
         .margin({ top: 10 })
       }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('param', a);
-      })
       .width('100%')
       .padding(16)
       }
@@ -5367,7 +5559,7 @@ struct Index {
                 this.speedWindowText = v;
                 this.scheduleScanSave();
               })
-            Text(this.t('应用建议', 'Apply'))
+            Text(this.t('恢复默认', 'Reset'))
               .fontSize(12)
               .fontColor(this.accentText())
               .textAlign(TextAlign.Center)
@@ -5384,15 +5576,62 @@ struct Index {
           .alignItems(VerticalAlign.Bottom)
           .margin({ top: 10 })
 
+          // 测速域名与「解析测试」同一行，输入框不再独占一大行
           Row({ space: 10 }) {
             this.ParamCell(this.t('测速域名（可选）', 'Test domain (optional)'), 'domain', 'spd-domain-' + this.cfgRev.toString(), false,
               (v: string) => {
                 this.domain = v;
                 this.scheduleScanSave();
               })
+            Text(this.t('解析测试', 'Resolve test'))
+              .fontSize(12)
+              .fontColor(this.accentText())
+              .textAlign(TextAlign.Center)
+              .height(38)
+              .padding({ left: 14, right: 14 })
+              .backgroundColor(this.soft())
+              .borderRadius(10)
+              .constraintSize({ minWidth: 84 })
+              .onClick(() => {
+                this.doResolve();
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Bottom)
+          .margin({ top: 10 })
+
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text(this.t('域名端到端检测', 'Domain end-to-end check'))
+                .fontSize(13)
+                .fontColor(this.txt())
+              Text(this.t('开启后，正式测速前用该域名对入选节点逐个做一次 HTTPS 请求；需同时填写有效域名，否则不执行', 'When on, each selected node gets one HTTPS request to this domain before the speed test; requires a valid domain, otherwise skipped'))
+                .fontSize(10)
+                .fontColor(this.txt3())
+                .maxLines(2)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.domainCheck })
+              .selectedColor(this.accent())
+              .onChange((on: boolean) => {
+                this.domainCheck = on;
+                this.scheduleScanSave();
+                if (on && !DnsService.isValidDomain(this.domain)) {
+                  this.toast(this.t('已开启域名端到端检测：请先填写有效域名，否则本次不会执行', 'End-to-end check enabled: fill in a valid domain, otherwise it will be skipped'));
+                }
+              })
           }
           .width('100%')
           .margin({ top: 10 })
+
+          if (this.domainCheck && !DnsService.isValidDomain(this.domain)) {
+            Text(this.t('未填写有效域名：开关虽开，本次也不会执行端到端检测（原有 CF 官方测速不受影响）', 'No valid domain: the switch is on but the end-to-end check will be skipped (the CF speed test itself is unaffected)'))
+              .fontSize(10)
+              .fontColor(OK_C)
+              .width('100%')
+              .margin({ top: 4 })
+          }
 
           if (this.speedScope === SpeedScope.REGION) {
             Text(this.t('地区码：', 'Region code: ') + (this.regionCode.length > 0 ? this.regionCode : this.t('未设置（在「筛选」页填写）', 'not set (fill it on the Filter page)')))
@@ -5402,29 +5641,16 @@ struct Index {
               .margin({ top: 10 })
           }
 
-          Row({ space: 8 }) {
-            Text(this.t('解析测试', 'Resolve test'))
-              .fontSize(12)
-              .fontColor(this.accentText())
-              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-              .backgroundColor(this.soft())
-              .borderRadius(9)
-              .onClick(() => {
-                this.doResolve();
-              })
+          if (this.domainInfoText.length > 0) {
             Text(this.domainInfoText)
               .fontSize(11)
               .fontColor(this.txt3())
-              .layoutWeight(1)
+              .width('100%')
+              .margin({ top: 6 })
           }
-          .width('100%')
-          .margin({ top: 10 })
 
         }
       }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('speed', a);
-      })
       .width('100%')
       .padding(16)
       }
@@ -5781,9 +6007,6 @@ struct Index {
     .linearGradient({ angle: 145, colors: this.cardTint() })
     .borderRadius(20)
     .border({ width: 1, color: this.cardBorderColor() })
-    .onAreaChange((_o: Area, a: Area) => {
-      this.updateMeasuredCardHeight('mat', a);
-    })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
     .margin({ bottom: 12 })
   }
@@ -5969,9 +6192,6 @@ struct Index {
       .padding(16)
     }
     .width('100%')
-    .onAreaChange((_o: Area, a: Area) => {
-      this.updateMeasuredCardHeight('appbg', a);
-    })
     .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
     .linearGradient({ angle: 145, colors: this.cardTint() })
@@ -6079,12 +6299,36 @@ struct Index {
         .width('100%')
         .margin({ top: 14 })
         .alignItems(VerticalAlign.Center)
+        Row({ space: 8 }) {
+          Column({ space: 3 }) {
+            Text(this.t('历史保存数量', 'History limit'))
+              .fontSize(14)
+              .fontColor(this.txt())
+            Text(this.t('0 条关闭自动保存，已有记录保留；30/50 只留最近记录',
+              '0 disables auto-save and keeps old runs; 30/50 keeps recent ones'))
+              .fontSize(10)
+              .fontColor(this.txt3())
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          ForEach([0, 30, 50], (n: number) => {
+            Text(n === 0 ? this.t('关闭', 'off') : n.toString())
+              .fontSize(11)
+              .fontColor(this.histLimit === n ? '#FFFFFFFF' : this.txt2())
+              .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+              .backgroundColor(this.histLimit === n ? this.accent() : this.soft())
+              .borderRadius(8)
+              .onClick(() => {
+                this.applyHistoryLimit(n);
+              })
+          }, (n: number) => 'hl' + n.toString())
+        }
+        .width('100%')
+        .margin({ top: 14 })
+        .alignItems(VerticalAlign.Center)
       }
       .padding(16)
       .width('100%')
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('rt', a);
-      })
       .width('100%')
       .padding(16)
       .alignItems(HorizontalAlign.Start)
@@ -6118,7 +6362,7 @@ struct Index {
           .fontSize(11)
           .fontColor(this.txt3())
           .margin({ top: 6 })
-        Text(this.t('TCP 筛选 → 数据中心 → 下载测速 → 加权排序，支持域名端到端校验与 edgetunnel 订阅上传。', 'TCP filter → data center → download speed test → weighted ranking, with end-to-end domain validation and edgetunnel subscription uploads.'))
+        Text(this.t('TCP 筛选 → 数据中心 → 下载测速 → 加权排序；支持可选的域名端到端校验（需在测速设置中开启）与 edgetunnel 订阅上传。', 'TCP filter → data center → download speed test → weighted ranking; optional end-to-end domain validation (enable it in the speed test settings) and edgetunnel subscription uploads.'))
           .fontSize(11)
           .fontColor(this.txt3())
           .lineHeight(17)
@@ -6234,9 +6478,6 @@ struct Index {
           .fontColor(this.txt3())
           .lineHeight(16)
           .margin({ top: 6 })
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('about', a);
-      })
       .width('100%')
       .padding(16)
     }
@@ -6336,9 +6577,6 @@ struct Index {
       }
       .padding(16)
       .width('100%')
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('diag', a);
-      })
       .width('100%')
       .alignItems(HorizontalAlign.Start)
     }
@@ -6359,7 +6597,7 @@ struct Index {
    * 语言切换时销毁并重建，保证所有已渲染文案立即切换。
    */
   @Builder TabsCore() {
-    HdsTabs({ index: this.curTab, barPosition: BarPosition.End }) {
+    HdsTabs({ index: this.curTab, barPosition: BarPosition.End, controller: this.tabsCtrl }) {
       TabContent() {
         Column() {
           this.ScanPage()
@@ -6383,14 +6621,22 @@ struct Index {
         .width('100%')
         .height('100%')
       }.tabBar(this.TabItem(this.t('测速', 'Speed test'), 2))
-TabContent() {
-  Column() {
 
-    this.SettingsPage()
-  }
-  .width('100%')
-  .height('100%')
-}.tabBar(this.TabItem(this.t('设置', 'Settings'), 3))
+      TabContent() {
+        Column() {
+          this.HistoryPage()
+        }
+        .width('100%')
+        .height('100%')
+      }.tabBar(this.TabItem(this.t('历史', 'History'), 3))
+
+      TabContent() {
+        Column() {
+          this.SettingsPage()
+        }
+        .width('100%')
+        .height('100%')
+      }.tabBar(this.TabItem(this.t('设置', 'Settings'), 4))
     }
     .width('100%')
     .height('100%')
@@ -6420,8 +6666,10 @@ TabContent() {
       }
       this.curTab = index;
       this.navSel = index;
-      this.navPillX = this.navTabCenter(index);
-      this.setPillScale(1.0, 0, 0);
+      // 历史页每次进入都从文件刷新摘要，避免显示别处已经删除的旧条目
+      if (index === 3) {
+        this.refreshHistory();
+      }
     })
   }
 
@@ -6737,9 +6985,8 @@ TabContent() {
             .backgroundColor(this.soft())
             .onClick(() => {
               this.showChangelogDialog = false;
-              this.curTab = 3;
-              this.navSel = 3;
-              this.navPillX = this.navTabCenter(3);
+              this.curTab = 4;
+              this.navSel = 4;
               setTimeout(() => {
                 this.openChangelog();
               }, 60);
@@ -6878,7 +7125,12 @@ TabContent() {
       this.srcMgrBack();
       return true;
     }
-    if (this.winW < 900 && this.curTab === 3 && this.settingsSub >= 0) {
+    // 历史详情是二级页：系统返回手势先回历史列表
+    if (this.curTab === 3 && this.histOpenRecord !== null) {
+      this.closeHistoryDetail();
+      return true;
+    }
+    if (this.winW < 900 && this.curTab === 4 && this.settingsSub >= 0) {
       this.closeSub();
       return true;
     }
@@ -7134,20 +7386,24 @@ TabContent() {
               this.SettingsMenu()
             }
             .width('100%')
-            .padding({ left: 8, right: 8, top: this.contentTop(), bottom: this.pageBottomPad() })
+            .padding({ left: 8, right: 8, top: Math.max(this.contentTop(), LG_TOP_BAND + 6), bottom: this.pageBottomPad() })
           }
           .width(300)
           .height('100%')
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
           .align(Alignment.TopStart)
+          .linearGradientBlur(LG_BLUR_MAX, {
+            fractionStops: this.lgStops(this.settingsVpH),
+            direction: GradientDirection.Bottom
+          })
 
           Scroll(this.settingsScroller) {
             Column({ space: 12 }) {
               this.CatBody()
             }
             .width('100%')
-            .padding({ left: 14, right: 14, top: this.contentTop(), bottom: this.pageBottomPad() })
+            .padding({ left: 14, right: 14, top: Math.max(this.contentTop(), LG_TOP_BAND + 6), bottom: this.pageBottomPad() })
             .alignItems(HorizontalAlign.Start)
           }
           .layoutWeight(1)
@@ -7155,6 +7411,16 @@ TabContent() {
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
           .align(Alignment.TopStart)
+          .linearGradientBlur(LG_BLUR_MAX, {
+            fractionStops: this.lgStops(this.settingsVpH),
+            direction: GradientDirection.Bottom
+          })
+          .onAreaChange((_o: Area, n: Area) => {
+            const h: number = Number(n.height);
+            if (h > 0 && Math.abs(h - this.settingsVpH) > 0.5) {
+              this.settingsVpH = h;
+            }
+          })
           .onScroll(() => {
             this.onPageScroll(this.settingsScroller);
           })
@@ -7256,21 +7522,6 @@ TabContent() {
       .fontColor(this.etPos === idx ? '#FFFFFF' : this.txt2())
       .onClick(() => {
         this.etPos = idx;
-        this.saveEtConfig();
-      })
-  }
-
-  @Builder EtTopChip(label: string, value: number) {
-    Text(label)
-      .fontSize(this.CHIP_FS)
-      .textAlign(TextAlign.Center)
-      .layoutWeight(1)
-      .height(this.CHIP_H)
-      .borderRadius(9)
-      .backgroundColor(this.etTopN === value ? this.accentFill() : this.soft())
-      .fontColor(this.etTopN === value ? '#FFFFFF' : this.txt2())
-      .onClick(() => {
-        this.etTopN = value;
         this.saveEtConfig();
       })
   }
@@ -7507,9 +7758,6 @@ TabContent() {
   
         }
       }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('upload', a);
-      })
       .width('100%')
       .alignItems(HorizontalAlign.Start)
     }
@@ -7562,9 +7810,6 @@ TabContent() {
         this.CardTitle(this.t('运行日志', 'Logs'), $r('sys.symbol.doc_text'))
         this.LogContent(bodyH)
       }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('log', a);
-      })
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .padding(fill ? 0 : 16)
@@ -7580,6 +7825,59 @@ TabContent() {
     }
   }
     
+
+  /** 宽屏专用：日志卡填满右列剩余高度，底边与左列参数卡齐平（不依赖测量回调） */
+  @Builder CardLogFlex() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
+        this.CardTitle(this.t('运行日志', 'Logs'), $r('sys.symbol.doc_text'))
+        this.LogContentFlex()
+      }
+      .width('100%')
+      .height('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(16)
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .backgroundBlurStyle(this.cardBlurStyle(), { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
+    .borderRadius(20)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+  }
+
+  @Builder LogContentFlex() {
+    if (this.logs.length === 0) {
+      Text(this.t('暂无日志', 'No logs yet'))
+        .fontSize(12)
+        .fontColor(this.txt3())
+        .margin({ top: 8 })
+    } else {
+      Scroll(this.logScroller) {
+        Column() {
+          ForEach(this.logs, (line: string, index: number) => {
+            Text(line)
+              .fontSize(11)
+              .lineHeight(17)
+              .fontColor(this.txt3())
+              .width('100%')
+              .margin({ top: 4 })
+          }, (line: string, index: number) => index.toString() + '#' + line)
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .margin({ top: 6 })
+      .align(Alignment.TopStart)
+      .scrollBar(BarState.On)
+      .scrollBarWidth(3)
+      .scrollBarColor(this.dark ? 'rgba(255,255,255,0.35)' : 'rgba(15,23,42,0.28)')
+      .edgeEffect(EdgeEffect.None)
+    }
+  }
 
   @Builder GroupRow(g: RegionGroup) {
     Column() {
@@ -7609,16 +7907,42 @@ TabContent() {
       if (this.expandedColos.indexOf(g.colo) >= 0) {
         Column() {
           ForEach(g.items, (c: Candidate) => {
-            Row() {
-              Text(Exporter.endpoint(c, true))
-                .fontSize(12)
-                .fontColor(this.txt2())
-                .layoutWeight(1)
-              Text(this.delayText(c))
-                .fontSize(12)
-                .fontColor(OK_C)
+            Column() {
+              Row() {
+                Text(Exporter.endpoint(c, true))
+                  .fontSize(12)
+                  .fontColor(this.txt2())
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .width('100%')
+
+              Flex({ wrap: FlexWrap.Wrap }) {
+                Text(this.regionLabel(c))
+                  .fontSize(11)
+                  .fontColor(this.txt3())
+                  .maxLines(1)
+                  .margin({ right: 8 })
+                Text(this.delayText(c))
+                  .fontSize(11)
+                  .fontColor(OK_C)
+                  .maxLines(1)
+                  .margin({ right: 8 })
+                Text(this.lossLabel(c))
+                  .fontSize(11)
+                  .fontColor(this.txt3())
+                  .maxLines(1)
+                  .margin({ right: 8 })
+                Text(this.speedLabel(c))
+                  .fontSize(11)
+                  .fontColor(this.txt3())
+                  .maxLines(1)
+              }
+              .width('100%')
+              .margin({ top: 3 })
             }
             .width('100%')
+            .alignItems(HorizontalAlign.Start)
             .padding({ top: 8, bottom: 8 })
             .onClick(() => {
               this.copyIp(c.ip);
@@ -7677,13 +8001,15 @@ TabContent() {
         .width('100%')
         .margin({ bottom: 10 })
     
-        if (this.precheckActive || (this.precheckDone && this.pcMsg.length > 0)) {
+        // 只要 pcMsg 有内容就展示：预检失败/取消/异常同样要看得见结果，
+        // 不能因为 precheckDone=false 就把「0 个达标」这类结论藏起来。
+        if (this.precheckActive || this.pcMsg.length > 0) {
         Column() {
         this.ProgressStrip(1)
         if (this.pcMsg.length > 0) {
         Text(this.pcMsg)
-        .fontSize(10)
-        .fontColor(this.txt3())
+        .fontSize(11)
+        .fontColor(this.pcFailed ? '#C0392B' : this.txt2())
         .margin({ top: 6 })
         }
         }
@@ -7734,9 +8060,6 @@ TabContent() {
               .padding({ top: 60, bottom: 30 })
             }
       }
-      .onAreaChange((_o: Area, a: Area) => {
-        this.updateMeasuredCardHeight('ping', a);
-      })
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .padding(16)
@@ -7814,7 +8137,7 @@ TabContent() {
             .backgroundColor(this.accentRgba(0.12))
             .borderRadius(9)
             .onClick(() => {
-              this.doExport(ExportFormat.PLAIN_SPEED);
+              this.doExport(ExportFormat.REPORT);
             })
           Text(this.t('导出 CSV', 'Export CSV'))
             .fontSize(12)
@@ -7872,14 +8195,48 @@ TabContent() {
         .width('100%')
         .margin({ bottom: 10 })
 
+        // 「只看达标」只影响这一屏的渲染：失败/未达标的节点仍在 speedList 里，
+        // 导出、评分、排序都不受这个开关影响。
+        if (this.speedList.length > 0) {
+          Row({ space: 8 }) {
+            Text(this.t('只看达标', 'Qualified only'))
+              .fontSize(12)
+              .fontColor(this.txt2())
+              .layoutWeight(1)
+            Text(this.t('已达标 ', 'qualified ') + this.qualifiedCount().toString() + '/' +
+              this.speedList.length.toString())
+              .fontSize(11)
+              .fontColor(this.txt3())
+            Toggle({ type: ToggleType.Switch, isOn: this.onlyQualified })
+              .selectedColor(this.accent())
+              .onChange((on: boolean) => {
+                this.onlyQualified = on;
+              })
+          }
+          .width('100%')
+          .height(34)
+          .padding({ left: 4, right: 4 })
+          .margin({ bottom: 10 })
+        }
+
         if (this.speedList.length === 0) {
           Column() {
-            Text(this.t('还没有测速结果', 'No speed test results yet'))
+            // 域名端到端检测失败时，这里必须说清「是检测没过，测速没开始」，
+            // 而不是笼统的「还没有测速结果」——否则用户会以为流程卡住了。
+            Text(this.abortedReason.length > 0
+              ? this.t('域名检测失败，测速未开始', 'Domain check failed; speed test not started')
+              : this.t('还没有测速结果', 'No speed test results yet'))
               .fontSize(15)
-              .fontColor(this.txt2())
-            Text(this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection'))
+              .fontColor(this.abortedReason.length > 0 ? '#C0392B' : this.txt2())
+              .textAlign(TextAlign.Center)
+              .padding({ left: 16, right: 16 })
+            Text(this.abortedReason.length > 0
+              ? this.abortedSuggestion
+              : this.t('回到「扫描」页开始优选', 'Go to the "Scan" tab to start selection'))
               .fontSize(12)
               .fontColor(this.txt3())
+              .textAlign(TextAlign.Center)
+              .padding({ left: 16, right: 16 })
               .margin({ top: 6 })
           }
           .width('100%')
@@ -7904,18 +8261,34 @@ TabContent() {
           offsetY: this.cardShadowY()
         })
         .margin({ bottom: 12 })
-        GridRow({
-          columns: { sm: 12, md: 12, lg: 12 },
-          gutter: { x: 14, y: 0 },
-          breakpoints: { value: ['600vp', '900vp'], reference: BreakpointsReference.WindowSize }
-        }) {
-          ForEach(this.speedList, (c: Candidate, index: number) => {
-            GridCol({ span: { sm: 12, md: 6, lg: 4 } }) {
-              this.SpeedRow(c, index)
+        // 两列各自独立成列（瀑布流式），展开一张卡不会把邻列卡片撑高
+        if (this.winW >= 700) {
+          Row({ space: 14 }) {
+            Column() {
+              ForEach(this.speedColumn(0), (c: Candidate) => {
+                this.NodeCard(this.vmOfCandidate(c, this.speedIndexOf(c)))
+              }, (c: Candidate) => this.speedCardKey(c))
             }
-          }, (c: Candidate, index: number) => 's#' + index.toString() + '#' + c.ip + ':' + c.port.toString())
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            Column() {
+              ForEach(this.speedColumn(1), (c: Candidate) => {
+                this.NodeCard(this.vmOfCandidate(c, this.speedIndexOf(c)))
+              }, (c: Candidate) => this.speedCardKey(c))
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Top)
+        } else {
+          // 单列也用 speedList 下标（speedStates 的真索引），不能直接用 ForEach 的
+          // 可见列表 index —— 开「只看达标」后两者不一致，徽标会串到别的节点上。
+          ForEach(this.visibleSpeedList(), (c: Candidate) => {
+            this.NodeCard(this.vmOfCandidate(c, this.speedIndexOf(c)))
+          }, (c: Candidate) => this.speedCardKey(c))
         }
-        .width('100%')
 
 
       }
@@ -8028,20 +8401,9 @@ TabContent() {
       }
       (arr as Candidate[]).push(c);
     }
-    // 组内整理：先按城市（colo）聚拢，同城再按综合成绩从高到低。
-    // 只按成绩排会让同一国家的不同城市交替出现，订阅里看起来很乱。
-    for (let g = 0; g < order.length; g++) {
-      const row: Candidate[] | undefined = groups.get(order[g]);
-      if (row === undefined) {
-        continue;
-      }
-      (row as Candidate[]).sort((a: Candidate, b: Candidate): number => {
-        if (a.colo !== b.colo) {
-          return a.colo < b.colo ? -1 : 1;
-        }
-        return b.finalScore - a.finalScore;
-      });
-    }
+    // 组内不再二次排序：沿用 speedList 的 canonical 顺序（Ranker：层级 → finalScore → 速度 → 延迟），
+    // 这样界面、CSV 与上传的节点顺序一致；族内顺序仍是 IPv4 全部在前、IPv6 在后。
+
     const nodes: string[] = [];
     for (let g = 0; g < order.length; g++) {
       const code: string = order[g];
@@ -8107,8 +8469,24 @@ TabContent() {
     return cfg;
   }
 
-  /** 改动即落盘，下次启动不用重填 */
+  /**
+   * 改动后延迟落盘，下次启动不用重填。
+   * 订阅上传配置有 16 个字段，输入框每敲一个字符都会调用这里；
+   * 若每次都立即 flush，就是「一个字符一次磁盘写」。用 500ms 防抖合并，
+   * 页面退出时由 aboutToDisappear 兜底 flush，不会丢最后一次输入。
+   */
   saveEtConfig(): void {
+    if (this.etSaveTimer >= 0) {
+      clearTimeout(this.etSaveTimer);
+    }
+    this.etSaveTimer = setTimeout(() => {
+      this.etSaveTimer = -1;
+      this.flushEtConfig();
+    }, 500);
+  }
+
+  /** 立即落盘订阅上传配置（退出页面、防抖兜底时调用） */
+  flushEtConfig(): void {
     ConfigStore.saveEdgeTunnel(this.currentEtConfig()).catch((e: BusinessError) => {
       this.addLog(this.t('保存订阅上传配置失败：', 'Failed to save subscription upload settings: ') + e.message);
     });
@@ -8263,6 +8641,92 @@ TabContent() {
     }
     return this.t('未知错误（错误码 ', 'Unknown error (code ') + code.toString() + '）';
   }
+  /**
+   * 结果卡片右侧的速度文案：达到「合格速度」的显示速度，低于门槛的追加「未达标」，
+   * 让大家看得出这个节点虽然测出了数字，但没达到自己设的门槛。
+   * 门槛用本轮扫描配置的快照（this.cfg），避免读取输入框实时值造成口径漂移。
+   */
+  /**
+   * 「只看达标」开关：只影响测速页这一屏的渲染，不改 this.speedList，
+   * 也不影响 CSV/TXT 导出、评分与排序。
+   */
+  @State onlyQualified: boolean = false;
+
+  /** 达标节点数（与 speedCardLabel 用同一判定：有有效速度且达到本轮门槛） */
+  qualifiedCount(): number {
+    const minSpeed: number = this.cfg.minSpeedMbps;
+    let n: number = 0;
+    for (let i = 0; i < this.speedList.length; i++) {
+      const c: Candidate = this.speedList[i];
+      if (c.verdict === Verdict.SPEEDED && c.speedOk && c.speedMbps > 0 && c.speedMbps >= minSpeed) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /** 测速页实际渲染的列表：开启「只看达标」时只给达标节点，其余原样返回 */
+  visibleSpeedList(): Candidate[] {
+    if (!this.onlyQualified) {
+      return this.speedList;
+    }
+    const out: Candidate[] = [];
+    const minSpeed: number = this.cfg.minSpeedMbps;
+    for (let i = 0; i < this.speedList.length; i++) {
+      const c: Candidate = this.speedList[i];
+      if (c.verdict === Verdict.SPEEDED && c.speedOk && c.speedMbps > 0 && c.speedMbps >= minSpeed) {
+        out.push(c);
+      }
+    }
+    return out;
+  }
+
+  /** 两列瀑布流：按奇偶取出第 p 列（0=左列，1=右列） */
+  private speedColumn(p: number): Candidate[] {
+    const all: Candidate[] = this.visibleSpeedList();
+    const out: Candidate[] = [];
+    for (let i = 0; i < all.length; i++) {
+      if (i % 2 === p) {
+        out.push(all[i]);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 节点在 speedList 里的下标 —— 也就是 speedStates 的下标。
+   *
+   * 注意必须查 speedList 而不是 visibleSpeedList：speedStates 是 onSpeedInit/onSpeedTick
+   * 按 Scanner 给出的 targets 顺序写的，和 speedList 一一对应；visibleSpeedList 在
+   * 「只看达标」开启时是过滤后的子集，用它取下标会让「待测/测速中」徽标错位到别的节点上。
+   */
+  private speedIndexOf(c: Candidate): number {
+    const all: Candidate[] = this.speedList;
+    for (let i = 0; i < all.length; i++) {
+      if (all[i] === c) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** 卡片 key 必须包含评分、轮数与复测状态，否则完成时组件不会重建 */
+  private speedCardKey(c: Candidate): string {
+    return 's#' + c.ip + ':' + c.port.toString() + '#' +
+      c.speedCfgRounds.toString() + '/' + c.speedRounds.toString() + '#' + (c.speedOk ? '1' : '0') +
+      '#' + Math.round(c.finalScore * 100).toString() +
+      '#' + (this.retestKey === c.ip + ':' + c.port.toString() ? 'r' : 'i') +
+      '#' + c.speedAvgMbps.toFixed(2) + '/' + c.speedMinMbps.toFixed(2) + '/' + c.speedMaxMbps.toFixed(2);
+  }
+
+  speedCardLabel(c: Candidate): string {
+    const base: StabilityInfo = Ranker.info(c);
+    if (c.verdict === Verdict.SPEEDED && c.speedMbps >= 0.01 && c.speedMbps < this.cfg.minSpeedMbps) {
+      return base.text + this.t(' 未达标', ' below target');
+    }
+    return base.text;
+  }
+
   splitResults(list: Candidate[]): void {
     const ping: Candidate[] = [];
     const speed: Candidate[] = [];
@@ -8272,23 +8736,16 @@ TabContent() {
         ping.push(c);
       }
       if (c.stage === Stage.SPEED) {
-        // 合格速度：低于门槛的测速结果直接剔除（失败的仍保留以说明原因）
-        if (c.verdict === Verdict.SPEEDED && c.speedMbps < this.minSpeedValue()) {
-          // 淘汰，不进入结果列表
-        } else {
-          speed.push(c);
-        }
+        // 进入第三阶段的节点一律保留：测速失败的节点同样要能看到 IP、延迟、丢包、
+        // 失败原因和「已完成轮次 / 设定轮次」，不能因为速度为空就从结果里消失。
+        // 「是否达到合格速度」只影响视觉标注与订阅上传，不影响是否留下记录；
+        // 排序仍走 Ranker.compare（失败节点 speedMbps=0，自然排在成功节点之后）。
+        speed.push(c);
       }
     }
     ping.sort((a: Candidate, b: Candidate) => Ranker.delayOf(a) - Ranker.delayOf(b));
-    speed.sort((a: Candidate, b: Candidate) => {
-      const sa: number = a.verdict === Verdict.SPEEDED ? a.speedMbps : -1;
-      const sb: number = b.verdict === Verdict.SPEEDED ? b.speedMbps : -1;
-      if (sb !== sa) {
-        return sb - sa;
-      }
-      return Ranker.delayOf(a) - Ranker.delayOf(b);
-    });
+    // 界面 / CSV / 上传统一使用 Ranker 的 canonical 顺序
+    speed.sort((a: Candidate, b: Candidate) => Ranker.compare(a, b));
     this.pingList = ping;
     this.speedList = speed;
     this.speedStates = [];
@@ -9191,111 +9648,1083 @@ TabContent() {
    * 测速页单行：先把全部待测节点铺出来（灰「待测」），
    * 轮到它时变「测速中…」（主色），测完换成速度结果（绿/红）。
    */
-  @Builder SpeedRow(c: Candidate, index: number) {
+  // ===== 历史记录页（独立 Tab，位于测速与设置之间）=====
+
+  @Builder HistoryPage() {
+    Scroll(this.histScroller) {
+      Column() {
+        Row().width('100%').height(px2vp(this.statusBarPx) + 66).hitTestBehavior(HitTestMode.None)
+        if (this.histOpenRecord !== null) {
+          this.HistoryDetailPage(this.histOpenRecord as HistoryRecord)
+        } else {
+          Column() {
+            this.HistoryHeaderCard()
+            this.HistoryListBody()
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+        }
+      }
+      .width('100%')
+      .padding({ left: this.pageSidePad(), right: this.pageSidePad(), top: 12, bottom: this.pageBottomPad() })
+      .constraintSize({ maxWidth: 1600 })
+    }
+    .width('100%')
+    .height('100%')
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
+    .linearGradientBlur(LG_BLUR_MAX, {
+      fractionStops: this.lgStops(this.histVpH),
+      direction: GradientDirection.Bottom
+    })
+    .onAreaChange((_o: Area, n: Area) => {
+      const h: number = Number(n.height);
+      if (h > 0 && Math.abs(h - this.histVpH) > 0.5) {
+        this.histVpH = h;
+      }
+    })
+    .onScroll(() => {
+      this.onPageScroll(this.histScroller);
+    })
+  }
+
+  // ===== 共享节点卡片：当前测速结果与历史快照共用同一套展示 =====
+
+  /** 实际执行到的轮数（配置轮数兜底，避免配置为 0 时表格空白） */
+  private roundCount(c: Candidate): number {
+    if (c.speedCfgRounds > 0) {
+      return c.speedCfgRounds;
+    }
+    return c.speedSamples.length > 0 ? c.speedSamples.split('/').length : 0;
+  }
+
+  /** 把 Candidate 的逐轮字符串拆成表格行（含本轮延迟/丢包；旧数据缺失时给 -1） */
+  private roundsOfCandidate(c: Candidate): RoundVM[] {
+    const sp: string[] = c.speedSamples.length > 0 ? c.speedSamples.split('/') : [];
+    const st: string[] = c.speedStates.length > 0 ? c.speedStates.split('/') : [];
+    const lt: string[] = c.speedLatSamples.length > 0 ? c.speedLatSamples.split('/') : [];
+    const ls: string[] = c.speedLossSamples.length > 0 ? c.speedLossSamples.split('/') : [];
+    const total: number = Math.max(sp.length, st.length, lt.length, ls.length, this.roundCount(c));
+    const out: RoundVM[] = [];
+    for (let i = 0; i < total; i++) {
+      const r: RoundVM = new RoundVM();
+      r.index = i + 1;
+      const state: string = i < st.length ? st[i] : '';
+      const sample: string = i < sp.length ? sp[i] : '—';
+      const lat: string = i < lt.length ? lt[i] : '—';
+      const loss: string = i < ls.length ? ls[i] : '—';
+      r.state = state.length > 0 ? state : '—';
+      r.ok = state === '成功';
+      r.mbps = (r.ok && sample !== '—' && !Number.isNaN(Number(sample))) ? Number(sample) : 0;
+      r.latencyMs = (lat !== '—' && !Number.isNaN(Number(lat))) ? Number(lat) : -1;
+      r.lossRate = (loss !== '—' && !Number.isNaN(Number(loss))) ? Number(loss) : -1;
+      out.push(r);
+    }
+    return out;
+  }
+
+  /**
+   * 当前测速结果 → 卡片视图模型。
+   *
+   * index 必须是该节点在 speedList 里的下标（用 speedIndexOf(c) 取），
+   * 不能用可见列表的迭代下标 —— 两者在「只看达标」时不一致，会造成
+   * 「待测/测速中」徽标错位。
+   */
+  private vmOfCandidate(c: Candidate, index: number): NodeVM {
+    const vm: NodeVM = new NodeVM();
+    vm.key = c.ip + ':' + c.port.toString();
+    vm.ip = c.ip;
+    vm.port = c.port;
+    vm.version = c.version;
+    vm.place = this.regionLabel(c);
+    vm.multi = this.isMultiRound(c);
+    vm.history = false;
+    vm.minDelay = c.minLatencyMs;
+    vm.avgDelay = c.avgLatencyMs;
+    vm.maxDelay = c.maxLatencyMs;
+    vm.lossRate = c.lossRate;
+    vm.stability = c.speedCfgRounds > 1 ? c.stabilityScore : -1;
+    vm.speedMin = c.speedMinMbps;
+    vm.speedMax = c.speedMaxMbps;
+    vm.speedAvg = c.speedAvgMbps;
+    vm.speedEff = c.speedMbps;
+    vm.okRounds = c.speedRounds;
+    vm.cfgRounds = c.speedCfgRounds;
+    vm.rank = this.speedRank(c);
+    vm.delayScore = c.delayScore;
+    vm.speedScore = c.speedScore;
+    vm.finalScore = c.finalScore;
+    vm.statusText = this.speedCardLabel(c);
+    vm.failText = this.speedFailText(c);
+    vm.rounds = this.roundsOfCandidate(c);
+    vm.pending = this.isSpeedPending(index);
+    vm.pendingText = index < this.speedStates.length && this.speedStates[index] === 1
+      ? this.t('测速中…', 'Testing…') : this.t('待测', 'Pending');
+    vm.retesting = this.retestKey === vm.key;
+    return vm;
+  }
+
+  /** 历史快照节点 → 同一套卡片视图模型（只读，复测结果不回写快照） */
+  private vmOfHistory(n: HistoryNode): NodeVM {
+    const vm: NodeVM = new NodeVM();
+    vm.key = n.ip + ':' + n.port.toString();
+    vm.ip = n.ip;
+    vm.port = n.port;
+    vm.version = n.version;
+    vm.place = this.historyRegion(n);
+    vm.multi = n.cfgRounds > 1 || n.successRounds > 1 || n.rounds.length > 1;
+    vm.history = true;
+    vm.minDelay = n.minLatencyMs;
+    vm.avgDelay = n.avgLatencyMs;
+    vm.maxDelay = n.maxLatencyMs;
+    vm.lossRate = n.lossRate;
+    // 历史稳定性优先用当时存下的握手次数现算：1.4.5 之前的快照按旧平滑公式存成 80 分，
+    // 直接读 stabilityScore 会和新记录（同情况 100 分）混在一起，量纲不一致。
+    if (n.cfgRounds > 1) {
+      if (typeof n.linkTries === 'number' && typeof n.linkOk === 'number' && n.linkTries > 0) {
+        vm.stability = Math.round((n.linkOk + 1) / (n.linkTries + 1) * 100);
+      } else {
+        vm.stability = typeof n.stabilityScore === 'number' ? n.stabilityScore : -1;
+      }
+    } else {
+      vm.stability = -1;
+    }
+    vm.speedMin = n.speedMinMbps;
+    vm.speedMax = n.speedMaxMbps;
+    vm.speedAvg = n.speedAvgMbps;
+    vm.speedEff = n.speedEffMbps;
+    vm.okRounds = n.successRounds;
+    vm.cfgRounds = n.cfgRounds;
+    vm.rank = n.rank;
+    vm.delayScore = n.delayScore;
+    vm.speedScore = n.speedScore;
+    vm.finalScore = n.finalScore;
+    vm.statusText = n.status;
+    vm.rounds = [];
+    const fails: string[] = [];
+    for (let i = 0; i < n.rounds.length; i++) {
+      const r0: HistoryRound = n.rounds[i];
+      const r: RoundVM = new RoundVM();
+      r.index = i + 1;
+      r.mbps = r0.mbps;
+      r.ok = r0.ok;
+      r.state = r0.state;
+      r.latencyMs = r0.latencyMs === undefined ? -1 : r0.latencyMs;
+      r.lossRate = r0.lossRate === undefined ? -1 : r0.lossRate;
+      if (!r0.ok) {
+        fails.push('R' + r.index.toString() + ' ' + r0.state);
+      }
+      vm.rounds.push(r);
+    }
+    vm.failText = fails.join(' · ');
+    vm.retesting = this.retestKey === vm.key;
+    return vm;
+  }
+
+  private nodeExpanded(vm: NodeVM): boolean {
+    return vm.history ? this.histNodeKey === vm.key : this.expandedSpeedKey === vm.key;
+  }
+
+  private toggleNodeDetail(vm: NodeVM): void {
+    if (vm.history) {
+      this.histNodeKey = this.histNodeKey === vm.key ? '' : vm.key;
+    } else {
+      this.expandedSpeedKey = this.expandedSpeedKey === vm.key ? '' : vm.key;
+    }
+  }
+
+  /** 单节点复测：只跑这一个节点，结果写回当前结果集；历史快照永不修改 */
+  private async retestNode(ip: string, port: number, version: number): Promise<void> {
+    const key: string = ip + ':' + port.toString();
+    if (this.scanning || this.retestKey.length > 0) {
+      this.toast(this.t('已有测速任务在运行，请稍后再试', 'A speed test is already running'));
+      return;
+    }
+    let target: Candidate | null = null;
+    for (let i = 0; i < this.results.length; i++) {
+      if (this.results[i].ip === ip && this.results[i].port === port) {
+        target = this.results[i];
+        break;
+      }
+    }
+    if (target === null) {
+      const fresh: Candidate = Scanner.makeCandidate(ip, port, version);
+      fresh.stage = Stage.SPEED;
+      this.results.push(fresh);
+      this.speedRankRev++;
+      target = fresh;
+    }
+    this.retestKey = key;
+    const cfg: ScanConfig = this.buildConfig();
+    const token: CancellationToken = new CancellationToken();
+    const hooks: ScanHooks = new ScanHooks();
+    hooks.onLog = (msg: string) => {
+      this.addLog(msg);
+    };
+    try {
+      await Scanner.runSpeed(cfg, [target], hooks, token);
+      Ranker.apply(this.results, cfg);
+      // 复测改的是同一个 Candidate 对象的分数，results 引用与 cfgRev 都没变，
+      // 必须显式 +1，否则 speedSource() 会命中旧缓存，界面名次停在复测前。
+      this.speedRankRev++;
+      this.speedList = this.speedSource();
+      this.toast(this.t('复测完成', 'Retest finished') + '：' + this.t('结果已更新到「测速」页', 'result updated on the Speed tab'));
+    } catch (e) {
+      const be: BusinessError = e as BusinessError;
+      this.addLog(this.t('单节点复测失败：', 'Node retest failed: ') + be.message);
+      this.toast(this.t('复测失败', 'Retest failed'));
+    }
+    this.retestKey = '';
+  }
+
+  /** 逐轮表格：表头只出现一次，每轮一行，列宽固定按权重分配 */
+  @Builder RoundTable(vm: NodeVM) {
     Column() {
       Row() {
-        Text(Exporter.endpoint(c, true))
+        Text(this.t('轮次', 'Round')).fontSize(9).fontColor(this.txt3()).layoutWeight(0.9)
+        Text(this.t('延迟', 'Latency')).fontSize(9).fontColor(this.txt3()).layoutWeight(1.4).textAlign(TextAlign.End)
+        Text(this.t('连接', 'Link')).fontSize(9).fontColor(this.txt3()).layoutWeight(1.1).textAlign(TextAlign.End)
+        Text(this.t('速度 MB/s', 'MB/s')).fontSize(9).fontColor(this.txt3()).layoutWeight(1.4).textAlign(TextAlign.End)
+        Text(this.t('状态', 'State')).fontSize(9).fontColor(this.txt3()).layoutWeight(2.0).textAlign(TextAlign.End)
+      }
+      .width('100%')
+      .padding({ top: 2, bottom: 4 })
+      .border({ width: { bottom: 1 }, color: this.cardBorderColor() })
+
+      ForEach(vm.rounds, (r: RoundVM) => {
+        Row() {
+          Text(this.t('第 ', 'R') + r.index.toString() + this.t(' 轮', ''))
+            .fontSize(10)
+            .fontColor(this.txt2())
+            .layoutWeight(0.9)
+          Text(r.latencyMs >= 0 ? Math.round(r.latencyMs).toString() + ' ms' : '—')
+            .fontSize(10)
+            .fontColor(r.latencyMs >= 0 ? this.txt2() : this.txt3())
+            .layoutWeight(1.4)
+            .textAlign(TextAlign.End)
+          Text(r.lossRate >= 0 ? Math.round(r.lossRate).toString() + '%' : '—')
+            .fontSize(10)
+            .fontColor(r.lossRate > 0 ? WARN_C : (r.lossRate >= 0 ? this.txt2() : this.txt3()))
+            .layoutWeight(1.1)
+            .textAlign(TextAlign.End)
+          Text(r.ok ? r.mbps.toFixed(2) : '—')
+            .fontSize(10)
+            .fontColor(r.ok ? this.txt() : this.txt3())
+            .layoutWeight(1.4)
+            .textAlign(TextAlign.End)
+          Text(r.state)
+            .fontSize(10)
+            .fontColor(r.ok ? OK_C : BAD_C)
+            .layoutWeight(2.0)
+            .textAlign(TextAlign.End)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .width('100%')
+        .padding({ top: 4, bottom: 4 })
+      }, (r: RoundVM) => 'rt' + r.index.toString() + '_' + r.state + '_' + r.mbps.toFixed(2))
+    }
+    .width('100%')
+  }
+
+  /** 共享节点卡：当前结果与历史快照的唯一展示入口 */
+  @Builder NodeCard(vm: NodeVM) {
+    Column() {
+      Row({ space: 8 }) {
+        if (vm.multi) {
+          Text('#' + vm.rank.toString())
+            .fontSize(10)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.accentText())
+            .textAlign(TextAlign.Center)
+            .constraintSize({ minWidth: 30 })
+            .height(20)
+            .padding({ left: 5, right: 5 })
+            .backgroundColor(this.accentRgba(0.14))
+            .borderRadius(6)
+        }
+        Text(vm.version === 6 ? '[' + vm.ip + ']:' + vm.port.toString() : vm.ip + ':' + vm.port.toString())
           .fontSize(14)
           .fontWeight(FontWeight.Medium)
           .fontColor(this.txt())
           .maxLines(1)
-        Blank()
-        if (this.isSpeedPending(index)) {
-          Text(index < this.speedStates.length && this.speedStates[index] === 1 ? this.t('测速中…', 'Testing…') : this.t('待测', 'Pending'))
-            .fontSize(13)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(index < this.speedStates.length && this.speedStates[index] === 1 ? this.accent() : this.txt3())
-        } else {
-          Text(Ranker.info(c).text)
-            .fontSize(14)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Ranker.info(c).color)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        if (vm.multi) {
+          Text(Math.round(vm.finalScore * 100).toString() + this.t(' 分', ' pts'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.scoreColor(vm.finalScore))
+            .maxLines(1)
         }
       }
       .width('100%')
 
-      Row() {
-        Text(this.coloText(c))
+      Row({ space: 10 }) {
+        Text(vm.place)
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(this.delayOfVm(vm))
+          .fontSize(11)
+          .fontColor(vm.minDelay >= 0 ? OK_C : this.txt3())
+          .maxLines(1)
+        Text(this.lossOfVm(vm))
           .fontSize(11)
           .fontColor(this.txt3())
           .maxLines(1)
         Blank()
-        Text(this.isSpeedPending(index) ? '' : this.delayText(c))
-          .fontSize(11)
-          .fontColor(Ranker.delayOf(c) >= 0 ? OK_C : this.txt3())
-      }
-      .width('100%')
-      .margin({ top: 4 })
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-    .padding(16)
-    // 与全站卡片同源：材质 / 背景模糊 / tint 渐变 / 描边全部复用同一套取色
-    .backgroundBlurStyle(this.cardBlurStyle(),
-      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
-    .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
-    .borderRadius(20)
-    .border({ width: 1, color: this.cardBorderColor() })
-    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    .margin({ bottom: 10 })
-    .onClick(() => {
-      this.copyIp(c.ip);
-    })
-  }
-
-  @Builder ResultRow(c: Candidate) {
-    Column() {
-      Row() {
-        Text(Exporter.endpoint(c, true))
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.txt())
-          .maxLines(1)
-        Blank()
-        Text(this.delayText(c))
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Ranker.delayOf(c) >= 0 ? OK_C : this.txt3())
-      }
-      .width('100%')
-
-      Row() {
-        Text(this.coloText(c))
-          .fontSize(11)
-          .fontColor(this.txt3())
-          .maxLines(1)
-        Blank()
-        Text(Ranker.info(c).text)
-          .fontSize(11)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Ranker.info(c).color)
+        if (vm.pending) {
+          Text(vm.pendingText)
+            .fontSize(12)
+            .fontColor(this.accent())
+            .maxLines(1)
+        } else if (vm.multi) {
+          Text(this.t('平均 ', 'avg ') + vm.speedAvg.toFixed(2) + ' MB/s')
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.speedColorOfVm(vm))
+            .maxLines(1)
+        } else {
+          Text(vm.statusText)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.statusColor(vm.statusText))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
       }
       .width('100%')
       .margin({ top: 4 })
 
-      if (Ranker.detail(c).length > 0) {
-        Text(Ranker.detail(c))
+      Row({ space: 8 }) {
+        Text(vm.retesting ? this.t('复测中…', 'testing…') : this.t('复测', 'retest'))
+          .fontSize(10)
+          .fontColor(vm.retesting ? this.txt3() : this.accentText())
+          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+          .backgroundColor(this.accentRgba(0.12))
+          .borderRadius(6)
+          .onClick(() => {
+            if (!vm.retesting) {
+              this.retestNode(vm.ip, vm.port, vm.version);
+            }
+          })
+        Text(this.t('复制地址', 'copy'))
+          .fontSize(10)
+          .fontColor(this.accentText())
+          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+          .backgroundColor(this.soft())
+          .borderRadius(6)
+          .onClick(() => {
+            this.copyIp(vm.ip);
+          })
+        Blank()
+        if (vm.multi && !this.nodeExpanded(vm)) {
+          Text(this.t('每轮 ▾', 'rounds ▾'))
+            .fontSize(10)
+            .fontColor(this.accentText())
+            .onClick(() => {
+              this.toggleNodeDetail(vm);
+            })
+        }
+        if (vm.multi && this.nodeExpanded(vm)) {
+          Text(this.t('收起 ▴', 'less ▴'))
+            .fontSize(10)
+            .fontColor(this.accentText())
+            .onClick(() => {
+              this.toggleNodeDetail(vm);
+            })
+        }
+      }
+      .width('100%')
+      .margin({ top: 6 })
+
+      if (this.nodeExpanded(vm)) {
+        Divider()
+          .color(this.cardBorderColor())
+          .margin({ top: 8, bottom: 6 })
+        this.RoundTable(vm)
+        if (vm.failText.length > 0) {
+          Text(this.t('失败轮 ', 'failed ') + vm.failText)
+            .fontSize(10)
+            .fontColor(BAD_C)
+            .width('100%')
+            .margin({ top: 6 })
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        Text(this.t('评分 ', 'score ') + this.scoreQuadVm(vm) +
+          this.t(' · 成功 ', ' · ok ') + vm.okRounds.toString() + '/' +
+          (vm.cfgRounds > 0 ? vm.cfgRounds : vm.okRounds).toString())
           .fontSize(10)
           .fontColor(this.txt3())
           .width('100%')
-          .margin({ top: 3 })
+          .margin({ top: 2 })
       }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding(16)
-    // 与全站卡片同源：材质 / 背景模糊 / tint 渐变 / 描边全部复用同一套取色
+    .padding(14)
+    .backgroundColor(Color.Transparent)
+    .backgroundBlurStyle(this.cardBlurStyle(),
+      { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+    .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
+    .borderRadius(16)
+    .border({ width: 1, color: this.cardBorderColor() })
+    .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+    .margin({ bottom: 8 })
+    .onClick(() => {
+      // 单轮保持原交互：点卡片复制 IP；多轮用「每轮」展开，避免误触
+      if (!vm.multi) {
+        this.copyIp(vm.ip);
+      }
+    })
+  }
+
+  // ---- 视图模型的格式化小工具（与 Candidate 版本保持同一口径） ----
+
+  private delayOfVm(vm: NodeVM): string {
+    const d: number = vm.minDelay > 0 ? vm.minDelay : vm.avgDelay;
+    if (d <= 0) {
+      return '—';
+    }
+    return Math.round(d).toString() + ' ms';
+  }
+
+  private compositeDelayOfVm(vm: NodeVM): string {
+    const d: number = vm.avgDelay > 0 ? vm.avgDelay : vm.minDelay;
+    if (d <= 0) {
+      return '—';
+    }
+    return Math.round(d).toString() + ' ms';
+  }
+
+  private lossOfVm(vm: NodeVM): string {
+    if (vm.lossRate < 0) {
+      return this.t('连接失败 —', 'link fail —');
+    }
+    return this.t('连接失败 ', 'link fail ') + vm.lossRate.toFixed(0) + '%';
+  }
+
+  private speedColorOfVm(vm: NodeVM): string {
+    if (!vm.multi) {
+      return vm.speedEff > 0 ? OK_C : BAD_C;
+    }
+    if (vm.okRounds <= 0 || vm.speedEff <= 0) {
+      return BAD_C;
+    }
+    const minSpeed: number = this.cfg.minSpeedMbps;
+    return vm.speedEff < minSpeed ? WARN_C : OK_C;
+  }
+
+  private delayTripleVm(vm: NodeVM): string {
+    const lo: string = vm.minDelay >= 0 ? Math.round(vm.minDelay).toString() : '—';
+    const av: string = vm.avgDelay >= 0 ? Math.round(vm.avgDelay).toString() : '—';
+    const hi: string = vm.maxDelay >= 0 ? Math.round(vm.maxDelay).toString() : '—';
+    return this.t('最低 ', 'low ') + lo + this.t(' · 平均 ', ' · avg ') + av +
+      this.t(' · 最高 ', ' · high ') + hi + ' ms';
+  }
+
+  private speedQuadVm(vm: NodeVM): string {
+    return this.t('最低 ', 'low ') + vm.speedMin.toFixed(2) +
+      this.t(' · 最高 ', ' · high ') + vm.speedMax.toFixed(2) +
+      this.t(' · 平均 ', ' · avg ') + vm.speedAvg.toFixed(2) +
+      this.t(' · 有效 ', ' · eff ') + vm.speedEff.toFixed(2);
+  }
+
+  private scoreTripleVm(vm: NodeVM): string {
+    return this.t('综合 ', 'overall ') + Math.round(vm.finalScore * 100).toString() +
+      this.t(' · 延迟 ', ' · delay ') + Math.round(vm.delayScore * 100).toString() +
+      this.t(' · 速度 ', ' · speed ') + Math.round(vm.speedScore * 100).toString();
+  }
+
+  /** 丢包评分 = 100 − 丢包率（仅展示，不改综合评分公式） */
+  private lossScoreOfVm(vm: NodeVM): number {
+    if (vm.lossRate < 0) {
+      return -1;
+    }
+    const v: number = 100 - vm.lossRate;
+    return Math.max(0, Math.min(100, v));
+  }
+
+  private scoreQuadVm(vm: NodeVM): string {
+    const st: string = vm.stability >= 0
+      ? Math.round(vm.stability).toString() : this.t('样本不足', 'n/a');
+    return this.scoreTripleVm(vm) + this.t(' · 稳定性 ', ' · stability ') + st;
+  }
+
+  // ===== 历史记录：每次测速一张卡片，展开后复用 NodeCard =====
+
+  private openHistoryRecord(h: HistorySummary): void {
+    const rec: HistoryRecord | null = HistoryStore.read(h.id);
+    if (rec === null) {
+      this.toast(this.t('记录读取失败', 'Failed to read record'));
+      return;
+    }
+    this.histOpenId = h.id;
+    this.histOpenRecord = rec;
+    this.histNodeKey = '';
+    this.histScroller.scrollEdge(Edge.Top);
+  }
+
+  private closeHistoryDetail(): void {
+    this.histOpenId = '';
+    this.histOpenRecord = null;
+    this.histNodeKey = '';
+  }
+
+  /** 历史详情两列：按奇偶取出第 p 列 */
+  private histColumn(rec: HistoryRecord, p: number): HistoryNode[] {
+    const out: HistoryNode[] = [];
+    for (let i = 0; i < rec.nodes.length; i++) {
+      if (i % 2 === p) {
+        out.push(rec.nodes[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 忽略 0（缺失）后的最小/最大值；全缺省返回 [0,1] */
+  private trendRange(arr: number[]): number[] {
+    let mn: number = 0;
+    let mx: number = 0;
+    let any: boolean = false;
+    for (let i = 0; i < arr.length; i++) {
+      const v: number = arr[i];
+      if (v <= 0) {
+        continue;
+      }
+      if (!any) {
+        mn = v;
+        mx = v;
+        any = true;
+      } else {
+        if (v < mn) {
+          mn = v;
+        }
+        if (v > mx) {
+          mx = v;
+        }
+      }
+    }
+    if (!any) {
+      return [0, 1];
+    }
+    if (mx - mn < 0.0001) {
+      mx = mn + 1;
+    }
+    return [mn, mx];
+  }
+
+  /**
+   * 走势：延迟与速度各自一张独立折线图（0=延迟，1=速度）。
+   * 每张图带纵轴刻度（各自量程）与横轴时间；最新一次直接标出数值。
+   */
+  private drawTrend(which: number): void {
+    const arr: number[] = which === 0 ? this.trendLat : this.trendSpd;
+    const w: number = which === 0 ? this.trendWLat : this.trendWSpd;
+    const n: number = arr.length;
+    if (w <= 0 || n < 1) {
+      return;
+    }
+    const h: number = 112;
+    const padL: number = 42;
+    const padR: number = 12;
+    const padT: number = 18;
+    const padB: number = 20;
+    const plotW: number = w - padL - padR;
+    const plotH: number = h - padT - padB;
+    const step: number = n > 1 ? plotW / (n - 1) : 0;
+    const ctx: CanvasRenderingContext2D = which === 0 ? this.trendCtxLat : this.trendCtxSpd;
+    ctx.clearRect(0, 0, w, h);
+    const r: number[] = this.trendRange(arr);
+    const span: number = r[1] - r[0];
+    const labelColor: string = this.dark ? 'rgba(255,255,255,0.52)' : 'rgba(15,23,42,0.52)';
+
+    // 纵轴：3 条刻度线 + 数值（各自量程）
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = this.dark ? 'rgba(255,255,255,0.09)' : 'rgba(15,23,42,0.08)';
+    ctx.fillStyle = labelColor;
+    ctx.font = '9vp sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let g = 0; g <= 2; g++) {
+      const y: number = padT + plotH * g / 2;
+      const v: number = r[1] - span * g / 2;
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(w - padR, y);
+      ctx.stroke();
+      ctx.fillText(this.trendAxis(v, which), padL - 6, y);
+    }
+
+    // 横轴：首/中/末三个时间点
+    ctx.textBaseline = 'top';
+    if (this.trendTime.length >= n) {
+      ctx.textAlign = 'left';
+      ctx.fillText(this.trendTime[0], padL, h - 16);
+      if (n >= 4) {
+        ctx.textAlign = 'center';
+        ctx.fillText(this.trendTime[Math.floor((n - 1) / 2)], padL + plotW / 2, h - 16);
+      }
+      if (n > 1) {
+        ctx.textAlign = 'right';
+        ctx.fillText(this.trendTime[n - 1], w - padR, h - 16);
+      }
+    }
+
+    // 折线
+    this.drawTrendSeries(ctx, arr, which === 0 ? OK_C : this.accent(), padL, padT, plotH, step);
+
+    // 最新一次：把数值直接写在最后一个点旁
+    let last: number = -1;
+    for (let i = n - 1; i >= 0; i--) {
+      if (arr[i] > 0) {
+        last = i;
+        break;
+      }
+    }
+    if (last < 0) {
+      return;
+    }
+    const lx: number = padL + step * last;
+    const ly: number = padT + (1 - (arr[last] - r[0]) / span) * plotH;
+    const text: string = this.trendAxis(arr[last], which) + (which === 0 ? ' ms' : ' MB/s');
+    ctx.font = '10vp sans-serif';
+    ctx.fillStyle = which === 0 ? OK_C : this.accent();
+    ctx.textBaseline = 'bottom';
+    if (lx > w - 84) {
+      ctx.textAlign = 'right';
+      ctx.fillText(text, w - padR, Math.max(ly - 5, 10));
+    } else {
+      ctx.textAlign = 'left';
+      ctx.fillText(text, lx + 5, Math.max(ly - 5, 10));
+    }
+  }
+
+  /** 纵轴刻度文字：延迟取整、速度按大小保留 1–2 位 */
+  private trendAxis(v: number, which: number): string {
+    if (v <= 0) {
+      return '0';
+    }
+    if (which === 0) {
+      return v.toFixed(0);
+    }
+    return v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  }
+
+  private trendWidth(which: number): number {
+    return which === 0 ? this.trendWLat : this.trendWSpd;
+  }
+
+  private setTrendWidth(which: number, w: number): void {
+    if (which === 0) {
+      this.trendWLat = w;
+    } else {
+      this.trendWSpd = w;
+    }
+  }
+
+  private drawTrendSeries(ctx: CanvasRenderingContext2D, arr: number[], color: string,
+    padL: number, padT: number, plotH: number, step: number): void {
+    const r: number[] = this.trendRange(arr);
+    const span: number = r[1] - r[0];
+    let started: boolean = false;
+    ctx.beginPath();
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] <= 0) {
+        started = false;
+        continue;
+      }
+      const x: number = padL + step * i;
+      const t: number = (arr[i] - r[0]) / span;
+      const y: number = padT + (1 - t) * plotH;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = color;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] <= 0) {
+        continue;
+      }
+      const x: number = padL + step * i;
+      const t: number = (arr[i] - r[0]) / span;
+      const y: number = padT + (1 - t) * plotH;
+      ctx.beginPath();
+      ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+  }
+
+  private trendQ(v: number): string {
+    if (v <= 0) {
+      return '—';
+    }
+    return v >= 10 ? v.toFixed(0) : v.toFixed(2);
+  }
+
+  private confirmDeleteHistory(id: string): void {
+    AlertDialog.show({
+      title: this.t('删除这条记录？', 'Delete this record?'),
+      message: this.t('只删除选中的这一次测速，其他历史不受影响。', 'Only this run is deleted; other records stay.'),
+      primaryButton: {
+        value: this.t('取消', 'Cancel'),
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: this.t('删除', 'Delete'),
+        fontColor: BAD_C,
+        action: () => {
+          HistoryStore.remove(id);
+          this.historyList = HistoryStore.loadIndex();
+          if (this.histOpenId === id) {
+            this.histOpenId = '';
+            this.histOpenRecord = null;
+          }
+          this.toast(this.t('已删除该记录', 'Record deleted'));
+        }
+      }
+    });
+  }
+
+  private confirmClearHistory(): void {
+    AlertDialog.show({
+      title: this.t('清空全部历史记录？', 'Clear all history?'),
+      message: this.t('会删除全部历史记录文件，测速参数与当前结果不受影响，且无法恢复。',
+        'All history files are deleted. Settings and current results are unaffected; this cannot be undone.'),
+      primaryButton: {
+        value: this.t('取消', 'Cancel'),
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: this.t('清空', 'Clear'),
+        fontColor: BAD_C,
+        action: () => {
+          HistoryStore.clearAll();
+          this.historyList = [];
+          this.histOpenId = '';
+          this.histOpenRecord = null;
+          this.toast(this.t('历史记录已清空', 'History cleared'));
+        }
+      }
+    });
+  }
+
+  @Builder HistoryListBody() {
+    if (this.historyList.length === 0) {
+      Column() {
+        Text(this.t('还没有历史记录', 'No history yet'))
+          .fontSize(14)
+          .fontColor(this.txt2())
+        Text(this.histLimit === 0
+          ? this.t('当前已关闭自动保存，可在「设置 > 运行与网络」重新开启',
+            'Auto-save is off; enable it in Settings > Runtime & network')
+          : this.t('完成一次正式测速后会自动保存', 'Each completed run is saved automatically'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .margin({ top: 6 })
+          .textAlign(TextAlign.Center)
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor(this.soft())
+      .borderRadius(16)
+      .border({ width: 1, color: this.cardBorderColor() })
+      .padding({ top: 36, bottom: 36 })
+    } else {
+      Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.SpaceBetween }) {
+        ForEach(this.historyList, (h: HistorySummary) => {
+          Column() {
+            Row({ space: 8 }) {
+              Text(h.time)
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.txt())
+                .layoutWeight(1)
+                .maxLines(1)
+              Text(h.cfgRounds.toString() + this.t(' 轮', ' rounds'))
+                .fontSize(10)
+                .fontColor(this.txt3())
+              Text('›')
+                .fontSize(12)
+                .fontColor(this.txt3())
+            }
+            .width('100%')
+
+            Text(this.t('节点 ', 'nodes ') + h.nodeCount.toString() +
+              this.t(' · 成功 ', ' · ok ') + h.okCount.toString() +
+              this.t(' / 失败 ', ' / fail ') + h.failCount.toString())
+              .fontSize(11)
+              .fontColor(this.txt3())
+              .width('100%')
+              .margin({ top: 3 })
+            if (h.topEndpoint.length > 0) {
+              Text(this.t('第 1 名 ', 'Top ') + h.topEndpoint + ' · ' +
+                Math.round(h.topScore * 100).toString() + this.t(' 分', ' pts'))
+                .fontSize(10)
+                .fontColor(this.txt3())
+                .margin({ top: 3 })
+                .width('100%')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+          }
+          .width(this.historyCardWidth())
+          .alignItems(HorizontalAlign.Start)
+          .padding(14)
+          .backgroundBlurStyle(this.cardBlurStyle(),
+            { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+          .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
+          .borderRadius(16)
+          .border({ width: 1, color: this.cardBorderColor() })
+          .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+          .margin({ bottom: 10 })
+          .onClick(() => {
+            this.openHistoryRecord(h);
+          })
+        }, (h: HistorySummary) => 'hh' + h.id)
+      }
+      .width('100%')
+    }
+  }
+
+  /** 历史列表顶卡：标题/条数/清空/保存上限 + 最优节点走势 */
+  @Builder HistoryHeaderCard() {
+    Column() {
+      Row({ space: 8 }) {
+        Text(this.t('历史记录', 'History'))
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.txt())
+        Blank()
+        Text(this.historyList.length.toString() + this.t(' 条', ' runs'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+        if (this.historyList.length > 0) {
+          Text(this.t('清空', 'Clear'))
+            .fontSize(11)
+            .fontColor(BAD_C)
+            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+            .backgroundColor(this.soft())
+            .borderRadius(6)
+            .onClick(() => {
+              this.confirmClearHistory();
+            })
+        }
+      }
+      .width('100%')
+
+      Text(this.t('保存上限 ', 'Keep ') +
+        (this.histLimit === 0 ? this.t('关闭', 'off') : this.histLimit.toString() + this.t(' 条', ' runs')) +
+        this.t(' · 可在「设置 > 运行」调整', ' · change in Settings'))
+        .fontSize(9)
+        .fontColor(this.txt3())
+        .width('100%')
+        .margin({ top: 4 })
+
+      if (this.trendLat.length > 0) {
+        this.HistoryTrend()
+      } else {
+        Text(this.t('完成两次以上测速后，这里显示最优节点的延迟与速度走势',
+          'Trends appear after two or more runs'))
+          .fontSize(10)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 10 })
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(14)
     .backgroundBlurStyle(this.cardBlurStyle(),
       { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
     .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
     .borderRadius(20)
     .border({ width: 1, color: this.cardBorderColor() })
     .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
-    .margin({ bottom: 10 })
-    .onClick(() => {
-      this.copyIp(c.ip);
-    })
+    .margin({ bottom: 12 })
   }
+
+  /** 单条走势：which=0 延迟、which=1 速度；各自独立量程与画布，互不交叉 */
+  @Builder HistoryTrendBlock(which: number) {
+    Column({ space: 4 }) {
+      Row({ space: 6 }) {
+        Column().width(6).height(6).borderRadius(3)
+          .backgroundColor(which === 0 ? OK_C : this.accent())
+        Text((which === 0 ? this.t('延迟 ', 'Latency ') : this.t('速度 ', 'Speed ')) +
+          this.trendQ(this.trendRange(which === 0 ? this.trendLat : this.trendSpd)[0]) + '–' +
+          this.trendQ(this.trendRange(which === 0 ? this.trendLat : this.trendSpd)[1]) +
+          (which === 0 ? ' ms' : ' MB/s'))
+          .fontSize(9)
+          .fontColor(this.txt3())
+      }
+      .width('100%')
+
+      Canvas(which === 0 ? this.trendCtxLat : this.trendCtxSpd)
+        .width('100%')
+        .height(112)
+        .onReady(() => {
+          this.drawTrend(which);
+        })
+        .onAreaChange((_old: Area, now: Area) => {
+          const w: number = Number(now.width);
+          if (w > 0 && Math.abs(w - this.trendWidth(which)) > 0.5) {
+            this.setTrendWidth(which, w);
+            this.drawTrend(which);
+          }
+        })
+    }
+    .width('100%')
+  }
+
+  /** 走势：延迟、速度两张独立折线图，上下排列 */
+  @Builder HistoryTrend() {
+    Column({ space: 10 }) {
+      this.HistoryTrendBlock(0)
+      this.HistoryTrendBlock(1)
+    }
+    .width('100%')
+    .margin({ top: 10 })
+  }
+
+  /** 历史详情：二级页（顶部信息卡 + 节点卡片，无外层大卡、无清空） */
+  @Builder HistoryDetailPage(rec: HistoryRecord) {
+    Column() {
+      Row({ space: 10 }) {
+        Text('‹')
+          .fontSize(22)
+          .fontColor(this.accentText())
+          .width(30)
+          .height(30)
+          .textAlign(TextAlign.Center)
+          .borderRadius(15)
+          .backgroundColor(this.soft())
+          .accessibilityText(this.t('返回历史记录', 'Back to history'))
+          .onClick(() => {
+            this.closeHistoryDetail();
+          })
+        Text(this.t('历史记录', 'History'))
+          .fontSize(17)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.txt())
+        Blank()
+      }
+      .width('100%')
+      .padding({ top: 4, bottom: 10 })
+
+      Column() {
+        Row({ space: 8 }) {
+          Text(rec.meta.time)
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.txt())
+            .layoutWeight(1)
+            .maxLines(1)
+          Text(this.t('删除这条记录', 'Delete this record'))
+            .fontSize(10)
+            .fontColor(BAD_C)
+            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .backgroundColor(this.soft())
+            .borderRadius(6)
+            .onClick(() => {
+              this.confirmDeleteHistory(rec.meta.id);
+            })
+        }
+        .width('100%')
+
+        Text(this.t('节点 ', 'nodes ') + rec.meta.nodeCount.toString() +
+          this.t(' · 成功 ', ' · ok ') + rec.meta.okCount.toString() +
+          this.t(' / 失败 ', ' / fail ') + rec.meta.failCount.toString() +
+          this.t(' · 每节点 ', ' · ') + rec.meta.cfgRounds.toString() + this.t(' 轮', ' rounds'))
+          .fontSize(11)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 3 })
+
+        Text(this.historyParamsText(rec.meta))
+          .fontSize(9)
+          .fontColor(this.txt3())
+          .width('100%')
+          .margin({ top: 4 })
+          .maxLines(3)
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(14)
+      .backgroundBlurStyle(this.cardBlurStyle(),
+        { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT })
+      .linearGradient({ angle: 145, colors: this.cardTintOr(false) })
+      .borderRadius(20)
+      .border({ width: 1, color: this.cardBorderColor() })
+      .shadow({ radius: this.cardShadowR(), color: this.cardShadowColor(), offsetX: 0, offsetY: this.cardShadowY() })
+      .margin({ bottom: 12 })
+
+      if (this.winW >= 700) {
+        Row({ space: 14 }) {
+          Column() {
+            ForEach(this.histColumn(rec, 0), (n: HistoryNode) => {
+              this.NodeCard(this.vmOfHistory(n))
+            }, (n: HistoryNode) => 'hd' + rec.meta.id + '_' + n.ip + '_' + n.port.toString())
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+
+          Column() {
+            ForEach(this.histColumn(rec, 1), (n: HistoryNode) => {
+              this.NodeCard(this.vmOfHistory(n))
+            }, (n: HistoryNode) => 'hd' + rec.meta.id + '_' + n.ip + '_' + n.port.toString() + '_b')
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Top)
+      } else {
+        ForEach(rec.nodes, (n: HistoryNode) => {
+          this.NodeCard(this.vmOfHistory(n))
+        }, (n: HistoryNode) => 'hd' + rec.meta.id + '_' + n.ip + '_' + n.port.toString())
+      }
+    }
+    .width('100%')
+  }
+
+  /** 保存上限 0/30/50：立即生效、持久化；0 只关闭保存，不删旧记录 */
+  private async applyHistoryLimit(n: number): Promise<void> {
+    const v: number = (n === 0 || n === 30 || n === 50) ? n : 50;
+    this.histLimit = v;
+    HistoryStore.setLimit(v);
+    HistoryStore.trimToLimit();
+    ConfigStore.saveHistoryLimit(v);
+    this.historyList = HistoryStore.loadIndex();
+    if (this.histOpenId.length > 0 && HistoryStore.read(this.histOpenId) === null) {
+      this.histOpenId = '';
+      this.histOpenRecord = null;
+      this.histNodeKey = '';
+    }
+    this.addLog(v === 0
+      ? this.t('历史保存已关闭（已有记录保留，可手动清空）', 'History saving off (existing records kept)')
+      : this.t('历史保存上限已设为 ', 'History limit set to ') + v.toString() + this.t(' 条', ' runs'));
+  }
+
+  /** 平板两列、手机单列 */
+  private historyCardWidth(): string {
+    return this.winW < 840 ? '100%' : '48.6%';
+  }
+
 
   /** 对当前结果前 5 条手动补测速（可选操作） */
 }

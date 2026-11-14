@@ -492,16 +492,6 @@ export class Geo {
     return String.fromCodePoint(base + a) + String.fromCodePoint(base + b);
   }
 
-  /** 大区中文名，未知返回空串 */
-  static regionZh(colo: string): string {
-    const g: GeoInfo | null = Geo.lookup(colo);
-    if (g === null) {
-      return '';
-    }
-    const zh: string | undefined = REGION_ZH.get(g.region);
-    return zh === undefined ? g.region : zh;
-  }
-
   /** 已收录数据中心数量 */
   static size(): number {
     return Geo.ensure().size;

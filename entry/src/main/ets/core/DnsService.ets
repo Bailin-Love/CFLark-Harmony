@@ -73,71 +73,6 @@ export class DnsService {
     }
   }
 
-  /**
-   * 用 DoH 解析域名（Cloudflare JSON API）
-   * @param domain 域名
-   * @param dohUrl DoH 端点，空则用 https://cloudflare-dns.com/dns-query
-   */
-  static async resolveDoh(domain: string, dohUrl: string): Promise<DomainInfo> {
-    const host: string = DnsService.normalize(domain);
-    const info: DomainInfo = DnsService.empty(host);
-    if (host.length === 0) {
-      info.error = '域名不能为空';
-      return info;
-    }
-    const endpoint: string = dohUrl.length > 0 ? dohUrl : 'https://cloudflare-dns.com/dns-query';
-    const sep: string = endpoint.indexOf('?') >= 0 ? '&' : '?';
-    const url: string = endpoint + sep + 'name=' + host + '&type=A';
-    let session: rcp.Session | null = null;
-    try {
-      const cfg: rcp.SessionConfiguration = {
-        requestConfiguration: {
-          transfer: { timeout: { connectMs: 5000, transferMs: 5000 } }
-        }
-      };
-      session = rcp.createSession(cfg);
-      const req: rcp.Request = new rcp.Request(url, 'GET');
-      const resp: rcp.Response = await session.fetch(req);
-      if (resp.statusCode !== 200 || resp.body === undefined) {
-        info.error = 'DoH 返回 ' + resp.statusCode;
-        return info;
-      }
-      const text: string = new util.TextDecoder('utf-8').decodeToString(new Uint8Array(resp.body));
-      const root: DohResponse = JSON.parse(text) as DohResponse;
-      const answers: DohAnswer[] = root.Answer === undefined ? [] : root.Answer;
-      const ips: string[] = [];
-      for (let i = 0; i < answers.length; i++) {
-        const a: DohAnswer = answers[i];
-        if (a.type === 1 && a.data !== undefined) {
-          ips.push(a.data);
-        }
-      }
-      info.ips = ips;
-      info.ok = ips.length > 0;
-      if (!info.ok) {
-        info.error = 'DoH 无 A 记录';
-      }
-      for (let i = 0; i < ips.length; i++) {
-        if (IpUtil.isCloudflareIp(ips[i])) {
-          info.isCloudflare = true;
-          break;
-        }
-      }
-      return info;
-    } catch (e) {
-      const err: BusinessError = e as BusinessError;
-      info.error = 'DoH 失败(' + err.code + ')';
-      return info;
-    } finally {
-      if (session !== null) {
-        try {
-          session.close();
-        } catch (e) {
-        }
-      }
-    }
-  }
-
   /** 清洗用户输入的域名：去协议/路径/空格/末尾点 */
   static normalize(input: string): string {
     let s: string = input.trim();
@@ -182,18 +117,4 @@ export class DnsService {
     }
     return true;
   }
-}
-
-/** DoH JSON 响应 */
-interface DohResponse {
-  Status: number;
-  Answer: DohAnswer[];
-}
-
-/** DoH 单条答案 */
-interface DohAnswer {
-  name: string;
-  type: number;
-  TTL: number;
-  data: string;
 }

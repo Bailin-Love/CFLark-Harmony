@@ -7,8 +7,9 @@
  *  - MB/s = body / 1024 / 1024 / 实际耗时
  *
  * 我们改用 rcp 的流式下载 + 每请求 dnsRules：URL 仍然是 https://<host>/...，
- * 由 dnsRules 把该 host 指到候选 IP，于是 SNI 与 Host 天然正确，
- * 而且 host 可以换成用户自己的域名（用户要求：域名在测速阶段生效，可填可不填）。
+ * 由 dnsRules 把该 host 指到候选 IP，于是 SNI 与 Host 天然正确。
+ * 注意：下载测速的 host 固定为 speed.cloudflare.com（用户域名一般没有 /__down 端点，
+ * 绑上去只会 404），自定义域名只用于解析采样与可选的端到端检测。
  *
  * 注意：一个样本必须一个 Session（同 Session 复用连接会串台，实测过）。
  */
@@ -16,10 +17,23 @@ import { rcp } from '@kit.RemoteCommunicationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { SpeedResult } from './Types';
 
+/**
+ * 一次下载至少要拿到这么多字节，才认为「测到了有效样本」。
+ *
+ * 为什么需要它：原来只有 bytes <= 0 才判失败，于是服务器回一个几百字节的
+ * 错误页、或连接刚建立就断，只要收到 1 个字节就算「测速成功」，速度算出来是
+ * 0.000x MB/s，看起来像「节点极慢」，实际是「根本没测到东西」。
+ *
+ * 这个阈值不判断快慢（低速仍是有效的测速结果），只判断「有没有真的发生下载」：
+ * 4 KB 连一个 TCP 窗口都填不满，不构成速度样本。按最短窗口 1600ms 折算，
+ * 相当于要求 ≥ 2.5 KB/s（≈0.0025 MB/s），远低于任何可用节点的速度。
+ */
+const MIN_VALID_BYTES: number = 4096;
+
 export interface SpeedTarget {
   ip: string;
   port: number;
-  /** 测速使用的域名（Host / SNI） */
+  /** 测速使用的域名（Host / SNI），当前固定为 speed.cloudflare.com */
   host: string;
   /** 完整下载 URL，host 必须与上面的 host 一致 */
   url: string;
@@ -45,6 +59,8 @@ export class SpeedTest {
     // 首字节时间：用「首字节→结束」的有效下载时长算速度，
     // 避免 TLS 握手/建连时间被摊进小窗口，导致预检低估。
     let firstAt: number = 0;
+    // 下载响应状态码；0 = 没拿到（统计窗口提前截断时 fetch 会被 cancel 抛出）
+    let statusCode: number = 0;
 
     const finish = (ok: boolean, err: string): SpeedResult => {
       let elapsed: number = endAt > 0 ? endAt - started : Date.now() - started;
@@ -65,7 +81,8 @@ export class SpeedTest {
         maxMbps: avg,
         bytes: bytes,
         costMs: elapsed,
-        error: err
+        error: err,
+        statusCode: statusCode
       };
       return r;
     };
@@ -134,7 +151,8 @@ export class SpeedTest {
       }, 120);
 
       try {
-        await session.fetch(req);
+        const resp: rcp.Response = await session.fetch(req);
+        statusCode = resp.statusCode;
       } catch (e) {
         // 主动 cancel 会抛错，用 stopped 区分：窗口内自然结束也是 cancel 结束的
       } finally {
@@ -143,8 +161,16 @@ export class SpeedTest {
       if (endAt === 0) {
         endAt = Date.now();
       }
+      // 判定顺序：先排除「完全没数据」，再看响应是否成功，最后要求样本量足够。
+      // 刻意不按速度淘汰——低速是真实测速结果，第三阶段必须如实记录。
       if (bytes <= 0) {
         return finish(false, '未读到数据');
+      }
+      if (statusCode > 0 && (statusCode < 200 || statusCode >= 300)) {
+        return finish(false, 'HTTP ' + statusCode.toString());
+      }
+      if (bytes < MIN_VALID_BYTES) {
+        return finish(false, '数据不足（' + bytes.toString() + ' 字节）');
       }
       return finish(true, '');
     } catch (e) {

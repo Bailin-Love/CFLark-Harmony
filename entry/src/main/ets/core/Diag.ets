@@ -276,10 +276,10 @@ export class Diag {
         lines.push('补充：固定地址的同 /48 邻居也全部不可连 —— 只有固定服务地址可用，应直接用 AAAA 解析出的服务地址。');
       }
     } else {
-      const slow: boolean = fixedLines[0].ok && fixedLines[0].rttMs > 220;
+      const slow: boolean = fixedLines[0].ok && fixedLines[0].rttMs > 320;
       lines.push('固定与随机地址均可连（随机成功 ' + randOk.toString() + '/' + randLines.length.toString() + '）。');
       if (slow) {
-        lines.push('注意固定地址 RTT=' + fixedLines[0].rttMs.toString() + 'ms 高于当前延迟门槛 220ms，正式扫描可能因门槛过严而 0 通过。');
+        lines.push('注意固定地址 RTT=' + fixedLines[0].rttMs.toString() + 'ms 高于默认延迟门槛 320ms（以扫描页设置为准），正式扫描可能因门槛过严而 0 通过。');
       }
       lines.push('建议再回扫描页做一次 IPv6 正式扫描，对比「通过数 / 超时数 / 延迟超限数」。');
     }

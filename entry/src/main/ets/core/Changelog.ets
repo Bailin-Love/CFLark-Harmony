@@ -32,6 +32,112 @@ export interface ChangelogEntry {
 export class Changelog {
   private static readonly DATA: ChangelogEntry[] = [
     {
+      version: '1.4.5',
+      date: '2026-11-14',
+      items: [
+        {
+          kind: ChangeKind.NEW,
+          zh: '多轮测速和单节点复测：把「每地址次数」设为 2 或 3，结果卡展开后能看到逐轮表格——轮次、延迟、连接、速度与当轮结果，失败轮直接写明原因。每张卡还能单独复测，只测这一个节点，不影响其它结果，也不写入历史。',
+          en: 'Multi-round tests and per-node retest: set Rounds per address to 2 or 3 and each result card expands into a round-by-round table with latency, link, speed and that round’s outcome, including the reason when a round fails. Every card also has its own Retest button that tests only that node, leaves the rest of the batch untouched and never writes to history.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '历史记录：新增第 5 个「历史」页签。每次完整测速自动存一份快照，包含时间、参数、逐轮数据和排名，重启应用后仍在。点开记录看全部节点，再点节点看逐轮；详情页可删除本条，列表可清空。保存上限在设置里选关闭、30 或 50 条。',
+          en: 'History: a fifth History tab keeps a full snapshot of every completed run — time, settings, per-round data and ranking — and the records survive a restart. Open a run to see all of its nodes, then open a node for its rounds; delete one run from its detail page or clear everything from the list. The keep limit (off, 30 or 50 runs) lives in Settings.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '历史走势：历史页顶部新增两张走势图，延迟与速度各用自己的刻度和时间轴，不再共用一套坐标交叉。数据取每次记录的第 1 名节点，最新值直接标在最后一个点旁边。',
+          en: 'History trends: two charts now sit at the top of History, one for latency and one for speed, each with its own scale and time axis instead of sharing a single plot. They follow the top node of each saved run, and the latest value is written next to the last point.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '完整报告和更全的 CSV：「导出 TXT」改为完整报告，包含测速概况、节点统计表、逐轮明细和可复制地址四段。CSV 扩到 28 列，补上有效速度、逐轮速度与结果、稳定性和三项评分，中文表头，Excel 打开不乱码。',
+          en: 'Full report and a richer CSV: Export TXT now writes a full report with a run summary, a node table, per-round details and a copy-ready address list. CSV grows to 28 columns with effective speed, per-round speed and outcome, stability and the three scores; headers stay in Chinese and Excel opens the file cleanly.'
+        },
+        {
+          kind: ChangeKind.NEW,
+          zh: '三维评分：综合评分改为延迟、稳定性、速度三项。只测一轮时看延迟和速度，轮数越多稳定性分量越大，三轮及以上占两成。稳定性只看每轮测速时目标能不能连上，429 或没下到数据这类下载失败不算连接失败。',
+          en: 'Three-part scoring: the overall score now weighs latency, stability and speed. With one round it uses latency and speed; more rounds give stability a larger share, up to 20% at three rounds or more. Stability only counts whether the connection succeeded in each speed round — a failed download (429, no data) does not count against it.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '多轮卡片更紧凑，平板两列各排各的：多轮卡片只留三行关键信息；平板两列改为独立排列，展开一张卡只撑高它自己那一列，不会再把旁边那张一起拉高。',
+          en: 'Tighter multi-round cards and independent tablet columns: multi-round cards keep three key lines, and the two tablet columns now flow independently, so expanding a card only grows its own column instead of stretching the one beside it.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '「丢包」改称「连接失败」：卡片显示连接失败百分比，逐轮表格的「连接」列写该轮结果，筛选页叫「连接失败率上限」。默认 0%，即一次探测失败就淘汰；调高可以放宽，100% 等于关闭这项筛选。',
+          en: 'Packet loss is now called link failure: cards show the failure percentage, the round table has a Link column, and the filter is Max link fail %. It defaults to 0%, so a single failed probe drops the node; raise it to relax the filter, or set 100% to turn it off.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: 'Ping 超时与默认参数：Ping 超时现在可以调（300–10000 ms，默认 1000 ms），只影响 TCP 建连。新装默认 Ping 3 次、延迟上限 320 ms；第一轮会比以前多花一点时间，换来更可信的延迟和连接失败率。',
+          en: 'Ping timeout and new defaults: Ping timeout is now adjustable (300–10000 ms, default 1000 ms) and only affects the TCP connect. Fresh installs default to 3 pings and a 320 ms latency cap; the first round takes a little longer than before, but its latency and link-failure figures are more trustworthy.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '域名检测改为可选：域名端到端检测变成可选开关，默认关闭；只有打开并填了有效域名，才会在正式测速前逐个验证入选节点。下载测速固定走 speed.cloudflare.com，自定义域名不能下载时不会再误判。',
+          en: 'The domain check is now optional: the end-to-end domain check is an optional switch, off by default. Only when it is on and a valid domain is filled in does it verify each selected node before the speed test. Downloads always go to speed.cloudflare.com, so a custom domain that cannot serve downloads no longer causes false failures.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '只看达标：测速页新增「只看达标」开关和已达标 N/M 计数。打开后只显示达到合格速度的节点，评分、排序和导出都不受影响。',
+          en: 'Qualified only: the Speed tab has a Qualified only switch with a counted N/M total. Turn it on to show only nodes that reach the minimum speed; scores, order and exports stay exactly the same.'
+        },
+        {
+          kind: ChangeKind.IMPROVE,
+          zh: '订阅上传排序：订阅上传时，同一地区内固定把 IPv4 排在 IPv6 前面；追加内容也会重新排序，自定义行和订阅链接原样保留，不会丢行，也不会被拆散。',
+          en: 'Subscription upload order: when uploading a subscription, IPv4 lines now come before IPv6 within each region. Appended content is re-sorted too, while custom lines and links are kept exactly as they are and never dropped or split.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: 'IPv6 Ping 次数与延迟门槛：修好 IPv6「Ping 3 次只跑 1 次」——删掉了「首包够快就提前结束」，现在按设定次数测完（第一次连接就超时仍会提前结束）；IPv6 也不再单独放宽延迟上限，与 IPv4 用同一个值。',
+          en: 'IPv6 probe count and latency cap: fixed IPv6 running only one of the three pings by removing the early exit for a fast first reply, so every configured probe now runs (a first connection timeout still stops the rest). IPv6 also no longer gets a higher latency cap of its own and uses the same value as IPv4.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '下载失败不再算成功：HTTP 429、其它非 2xx 状态码，或只下到不足 4096 字节，现在都判失败并写明原因（状态码或字节数），不再显示成「测速成功、速度 0」。',
+          en: 'Failed downloads no longer count as successes: HTTP 429, another non-2xx status or fewer than 4096 bytes received is now a failure with the reason shown (status code or byte count), instead of a successful test at 0 MB/s.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '域名检测 421 与失败提示：域名检测遇到 HTTP 421 现在判失败，表示这台服务器不为该域名服务。所有节点都没通过时，结果页会写「域名检测失败，测速未开始」并给出下一步建议，不再显示「测速完成」。',
+          en: 'Domain check 421 and failure state: HTTP 421 from the domain check is now a failure, meaning the server does not serve that domain. If no node passes the check, the result page says the domain check failed and the speed test never started, with a next step, instead of claiming the test finished.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '失败节点保留、原因准确：下载测速失败的节点以前会从列表里消失，现在保留卡片并标「未达标」或失败原因；失败轮只写该轮真实原因，不再出现「失败原因：预检达标」这种错位文案。',
+          en: 'Failed nodes stay and reasons are accurate: nodes that fail the download stage no longer vanish from the list — they stay as cards marked below target or with the real reason. A failed round now shows its own reason, so a failed round is no longer labelled as passing the pre-check.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '停止测速保留结果：点「停止」后，筛选页不再把已通过的节点数清成 0，第一轮的结果和统计都留在页面上。',
+          en: 'Stopping keeps results: stopping a speed test no longer wipes the first-round results, so the Filter tab keeps the number of nodes that passed instead of dropping to 0 and those results and stats stay on screen.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '评分刷新与页签切换：修好两处界面问题——多轮卡片的评分在测速完成或单节点复测后不刷新，数字停在旧值；底部页签偶尔点一次不切页，需要再点一次。',
+          en: 'Score refresh and tab switching: fixed two UI issues — a multi-round card’s score could stay at its old value after a run or a retest, and the bottom tab occasionally ignored a tap until you tapped it again.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '导出可读性：失败节点不再导出 0 分或 0 速度，改为留空或「—」。CSV 把「成功轮数」和「设定轮数」拆成两个整数列，避免 1/1 被 Excel 当成日期。',
+          en: 'Cleaner exports: failed nodes are no longer exported with 0 score or 0 speed — the fields stay empty or show a dash. In CSV, successful and configured rounds are now two integer columns, so 1/1 is no longer read as a date by Excel.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '补齐候选网段：候选池补上此前整段遗漏的 104.24.0.0/14（含 1024 个 /24），可抽到的官方 IPv4 地址范围更大。',
+          en: 'Missing range restored: the candidate pool now includes the previously omitted 104.24.0.0/14 range — 1,024 more /24 blocks — so random sampling can reach addresses that were out of reach before.'
+        },
+        {
+          kind: ChangeKind.FIX,
+          zh: '预检失败有说明：质量预检失败时会说明卡在哪一步、为什么没通过，不再只有一句没头没尾的提示，进度也不会一直挂着。',
+          en: 'Pre-check failures explained: when the quality pre-check fails, the screen now says which step it stopped at and why, instead of a vague one-liner, and the progress state no longer gets stuck.'
+        }
+      ]
+    },
+    {
       version: '1.4.3',
       date: '2026-10-31',
       items: [
@@ -411,10 +517,6 @@ export class Changelog {
   /** 新→旧排序的全部本地记录 */
   static entries(): ChangelogEntry[] {
     return Changelog.DATA;
-  }
-
-  static count(): number {
-    return Changelog.DATA.length;
   }
 
   /** 取指定版本（接受带 v 前缀） */
